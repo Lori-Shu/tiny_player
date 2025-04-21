@@ -1,38 +1,169 @@
 mod decode {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex, RwLock},
+        thread::{self, sleep},
+        time::Duration,
+    };
 
-    use ffmpeg_next::{codec::Context, format, frame::Video, media::Type, software::scaling::Flags};
+    use ffmpeg_next::{
+        codec::Context, format, frame::Video, media::Type, packet::Mut, software::scaling::Flags, util::range::Range
+    };
 
-    
-
-
-    struct TinyDecoder {}
+    pub struct TinyDecoder {
+        format_input: Option<Arc<Mutex<ffmpeg_next::format::context::Input>>>,
+        video_decoder: Option<Arc<RwLock<ffmpeg_next::decoder::Video>>>,
+        audio_decoder: Option<Arc<RwLock<ffmpeg_next::decoder::Audio>>>,
+        scaler_ctx: Option<Arc<RwLock<ffmpeg_next::software::scaling::Context>>>,
+        resampler_ctx: Option<Arc<RwLock<ffmpeg_next::software::resampling::Context>>>,
+        video_frame_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_next::frame::Video>>>,
+        audio_frame_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_next::frame::Audio>>>,
+        packet_demux_thread_handler: Option<thread::JoinHandle<()>>,
+        packet_demux_thread_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_next::packet::Packet>>>,
+        process_change_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        process_change_target_timestamp: std::sync::Arc<std::sync::atomic::AtomicI64>,
+        frame_decode_thread_handler: Option<thread::JoinHandle<()>>,
+        frame_decode_thread_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
     impl TinyDecoder {
-        fn receive_and_process_decoded_frames(&self,decoder: &mut ffmpeg_next::decoder::Video,scale_ctx:&mut ffmpeg_next::software::scaling::Context)->Result<(),ffmpeg_next::Error>{
-                let mut decoded = Video::empty();
-                loop{
-                if  decoder.receive_frame(&mut decoded).is_ok() {
-                    let mut rgb_frame = Video::empty();
-                    scale_ctx.run(&decoded, &mut rgb_frame)?;
-                //     save_file(&rgb_frame, frame_index).unwrap();
-                //     frame_index += 1;
-                }else{
-                        break;
-                }
-                }
-                return Ok(());
+        fn new() -> Self {
+            ffmpeg_next::init().unwrap();
+            return Self {
+                format_input: None,
+                video_decoder: None,
+                audio_decoder: None,
+                scaler_ctx: None,
+                resampler_ctx: None,
+                video_frame_cache_vec: std::sync::Arc::new(RwLock::new(vec![])),
+                audio_frame_cache_vec: std::sync::Arc::new(RwLock::new(vec![])),
+                packet_demux_thread_handler: None,
+                packet_demux_thread_stop_flag: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
+                process_change_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                process_change_target_timestamp: std::sync::Arc::new(
+                    std::sync::atomic::AtomicI64::new(0),
+                ),
+                frame_decode_thread_handler: None,
+                frame_decode_thread_stop_flag: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
+                packet_cache_vec: std::sync::Arc::new(RwLock::new(vec![])),
+            };
         }
-        fn format(&self) {
-                ffmpeg_next::init().unwrap();
-                let path = Path::new("hello.mp4");
-                 let format_input=format::input(path).unwrap();
-                 let video_stream = format_input.streams().best(Type::Video).unwrap();
-                //  let stream_index = stream.index();
-                 let decoder_ctx = Context::from_parameters(video_stream.parameters()).unwrap();
-                let mut video_obj = decoder_ctx.decoder().video().unwrap();
-                let mut scale_ctx = ffmpeg_next::software::scaler(format::Pixel::RGBA,Flags::BILINEAR,(video_obj.width(),video_obj.height()),(video_obj.width(),video_obj.height()) ).unwrap();
-                let mut frame_index=0;
-                
+
+        fn set_file_path_and_init_par(&mut self, file_path: &Path) {
+            let mut format_input = format::input(file_path).unwrap();
+            let video_stream = format_input
+                .streams()
+                .best(Type::Video)
+                .unwrap();
+            let audio_stream = format_input
+                .streams()
+                .best(Type::Audio)
+                .unwrap();
+        
+            let video_decoder_ctx = Context::from_parameters(video_stream.parameters()).unwrap();
+            let audio_decoder_ctx = Context::from_parameters(audio_stream.parameters()).unwrap();
+            let mut video_decoder = video_decoder_ctx.decoder().video().unwrap();
+            self.scaler_ctx = Some(Arc::new(RwLock::new(
+                ffmpeg_next::software::scaler(
+                    format::Pixel::RGBA,
+                    Flags::BILINEAR,
+                    (video_decoder.width(), video_decoder.height()),
+                    (video_decoder.width(), video_decoder.height()),
+                )
+                .unwrap())),
+            );
+            let mut audio_decoder = audio_decoder_ctx.decoder().audio().unwrap();
+            self.resampler_ctx = Some(Arc::new(RwLock::new(
+                ffmpeg_next::software::resampler(
+                    (
+                        audio_decoder.format(),
+                        audio_decoder.channel_layout(),
+                        audio_decoder.rate(),
+                    ),
+                    (
+                        format::Sample::I16(format::sample::Type::Packed),
+                        audio_decoder.channel_layout(),
+                        48000,
+                    ),
+                )
+                .unwrap())),
+            );
+            self.video_decoder=Some(Arc::new(RwLock::new(video_decoder)));
+            self.audio_decoder=Some(Arc::new(RwLock::new(audio_decoder)));
+            self.format_input=Some(Arc::new(Mutex::new(format_input)));
+        }
+        fn packet_demux_process(
+            packet_demux_thread_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+         format_input: Arc<Mutex<ffmpeg_next::format::context::Input>>,
+            packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_next::packet::Packet>>>,
+            process_change_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            process_change_target_timestamp: std::sync::Arc<std::sync::atomic::AtomicI64>,
+        ) {
+            loop {
+                if packet_demux_thread_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let mut cache_len = 0;
+                {
+                    let rw_lock_read_guard = packet_cache_vec.read().unwrap();
+                    cache_len = rw_lock_read_guard.len();
+                }
+                if cache_len >= 100 {
+                    sleep(Duration::from_millis(100));
+                }
+                if process_change_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        let time = process_change_target_timestamp
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        {
+                                let mut lock_guard = format_input.lock().unwrap();
+                        let time_base = 
+                            lock_guard.streams()
+                            .best(Type::Video)
+                            .unwrap()
+                            .time_base()
+                            .1 as i64;
+                        lock_guard
+                            .seek(
+                                time,
+                                std::ops::Range {
+                                    start: (time - time_base),
+                                    end: (time + time_base),
+                                },
+                            )
+                            .unwrap();
+                        }
+                    process_change_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                {
+                        let mut lock_guard = format_input.lock().unwrap();
+                        let (stream, packet) = lock_guard.packets().next().unwrap();
+                    {
+                        let mut rw_lock_write_guard1 = packet_cache_vec.write().unwrap();
+                        rw_lock_write_guard1.push(packet);
+                    }
+                }
+            }
+        }
+        fn start_process_threads(&mut self) {
+                let mut packet_demux_thread_stop_flag= self.packet_demux_thread_stop_flag.clone();
+                let mut format_input=self.format_input.as_ref().unwrap().clone();
+                let mut packet_cache_vec=self.packet_cache_vec.clone();
+                let mut process_change_flag= self.process_change_flag.clone();
+                let mut process_change_target_timestamp=self.process_change_target_timestamp.clone();
+
+            self.packet_demux_thread_handler = Some(thread::spawn(move | | {
+                Self::packet_demux_process(
+                   packet_demux_thread_stop_flag,
+                    format_input,
+                    packet_cache_vec,
+                    process_change_flag,
+                    process_change_target_timestamp
+                );
+            }));
         }
     }
 }
