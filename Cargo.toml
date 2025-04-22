@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 ffmpeg-next = "7.1.0"
+rodio="0.20.1"
+bytemuck = "1.22.0"
