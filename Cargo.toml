@@ -7,3 +7,8 @@ edition = "2024"
 ffmpeg-next = "7.1.0"
 rodio="0.20.1"
 bytemuck = "1.22.0"
+eframe = "0.31.1"
+egui_extras = {version="0.31.1",features = ["all_loaders"]}
+image = {version="0.25.6",features = ["jpeg","png"]}
+egui = "0.31.1"
+rfd = "0.15.3"

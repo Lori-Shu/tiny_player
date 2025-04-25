@@ -6,13 +6,15 @@
     };
 
     use ffmpeg_next::{
-        codec::Context, format, frame::Video, media::Type, packet::Mut, software::scaling::Flags,
-        util::range::Range,
+        codec::Context, format::{self, Pixel}, frame::Video, media::Type,
     };
 
     pub struct TinyDecoder {
         video_stream_index: usize,
         audio_stream_index: usize,
+        frame_time_base:i32,
+        video_frame_rate:i32,
+        audio_frame_rate:i32,
         format_input: Option<Arc<Mutex<ffmpeg_next::format::context::Input>>>,
         video_decoder: Option<Arc<Mutex<ffmpeg_next::decoder::Video>>>,
         audio_decoder: Option<Arc<Mutex<ffmpeg_next::decoder::Audio>>>,
@@ -34,6 +36,9 @@
             return Self {
                 video_stream_index: 0,
                 audio_stream_index: 0,
+                frame_time_base:0,
+                video_frame_rate:0,
+                audio_frame_rate:0,
                 format_input: None,
                 video_decoder: None,
                 audio_decoder: None,
@@ -66,14 +71,20 @@
             let video_decoder_ctx = ffmpeg_next::codec::Context::from_parameters(video_stream.parameters()).unwrap();
             let audio_decoder_ctx = ffmpeg_next::codec::Context::from_parameters(audio_stream.parameters()).unwrap();
             let mut video_decoder = video_decoder_ctx.decoder().video().unwrap();
+            println!("video decoder width=={} height=={}",video_decoder.width(),video_decoder.height());
+            self.frame_time_base=video_stream.time_base().1;
+            println!("time_base==={}",self.frame_time_base);
+            self.video_frame_rate=video_stream.avg_frame_rate().0;
+            println!("video_frame_rate==={}",self.video_frame_rate);
+            self.audio_frame_rate=audio_stream.avg_frame_rate().1;
+            println!("audio_frame_rate==={}",self.audio_frame_rate);
             self.scaler_ctx = Some(
-                ffmpeg_next::software::scaler(
-                    format::Pixel::RGBA,
-                    Flags::BILINEAR,
+                ffmpeg_next::software::converter(
                     (video_decoder.width(), video_decoder.height()),
-                    (video_decoder.width(), video_decoder.height()),
+                    video_decoder.format(),
+                    Pixel::RGBA
                 )
-                .unwrap(),
+                .unwrap()
             );
             let mut audio_decoder = audio_decoder_ctx.decoder().audio().unwrap();
             self.resampler_ctx = Some(
@@ -111,8 +122,8 @@
                     let rw_lock_read_guard = packet_cache_vec.read().unwrap();
                     cache_len = rw_lock_read_guard.len();
                 }
-                if cache_len >= 100 {
-                    sleep(Duration::from_millis(100));
+                if cache_len >= 1000 || cache_len==0 {
+                    sleep(Duration::from_millis(10));
                 }
                 if process_change_flag.load(std::sync::atomic::Ordering::Acquire) {
                     let time =
@@ -166,8 +177,8 @@
                     let mut guard = video_frame_cache_vec.read().unwrap();
                     frame_vec_len = guard.len();
                 }
-                if frame_vec_len >= 1000 {
-                    sleep(Duration::from_millis(100));
+                if frame_vec_len >= 1000 || frame_vec_len==0 {
+                    sleep(Duration::from_millis(10));
                 }
                 let mut front_packet = ffmpeg_next::Packet::empty();
                 {
@@ -189,7 +200,7 @@
                                     .receive_frame(&mut video_frame_tmp) {
                                         break;
                                     }
-                                {
+                                { 
                                     let mut rw_lock_write_guard1 =
                                         video_frame_cache_vec.write().unwrap();
                                     rw_lock_write_guard1.push(video_frame_tmp);
@@ -259,5 +270,43 @@
                 }
                 resampler_ctx.run(&raw_frame, &mut res).unwrap();
                 return Some(res);
+        }
+                pub fn get_one_video_play_frame(&mut self)->Option<ffmpeg_next::frame::Video>{
+                        let start = std::time::Instant::now();
+                let scaler_ctx=self.scaler_ctx.as_mut().unwrap();
+                let mut res=ffmpeg_next::frame::Video::empty();
+                let mut return_val=None;
+                {
+                        let mut rw_lock_write_guard = self.video_frame_cache_vec.write().unwrap();
+                        if rw_lock_write_guard.len()>0 {
+                                let raw_frame=rw_lock_write_guard.remove(0);
+                                // println!("raw_frame height======={}",raw_frame.height());
+                                // println!("scaler input format==={},frame format==={}",scaler_ctx.input().format==Pixel::YUV420P,raw_frame.format()==Pixel::YUV420P);
+                                scaler_ctx.run(&raw_frame, &mut res).unwrap();
+                                
+                                return_val=Some(res);
+                        }
+                }
+                let end = std::time::Instant::now();
+                // println!("get video frame consume time==={}",(end-start).as_millis());
+                return return_val;
+        }
+        pub fn get_input_par(&self)-> Option<Arc<Mutex<ffmpeg_next::format::context::Input>>>{
+                if self.format_input.is_none() {
+                        return None;
+                }
+                return Some(self.format_input.as_ref().unwrap().clone());
+        }
+        pub fn get_resampler(&self)-> &ffmpeg_next::software::resampling::Context{
+                return self.resampler_ctx.as_ref().unwrap();
+        }
+        pub fn get_time_base(&self)-> i32{
+                return self.frame_time_base;
+        }
+        pub fn get_video_frame_rate(&self)->i32{
+                return self.video_frame_rate;
+        }
+        pub fn get_audio_frame_rate(&self)->i32{
+                return self.audio_frame_rate;
         }
     }

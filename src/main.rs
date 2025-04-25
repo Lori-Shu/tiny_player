@@ -1,19 +1,16 @@
-use audio_play::AudioPlayer;
+use appui::AppUi;
 
 mod decode;
 mod audio_play;
+mod appui;
 fn main() {
     println!("Hello, world!");
-    let mut tiny_decoder = decode::TinyDecoder::new();
-    let mut audio_player=audio_play::AudioPlayer::new();
-    audio_player.init_device();
-    tiny_decoder.set_file_path_and_init_par(std::path::Path::new("D:/Downloads/全职高手第二季12.mp4"));
-    tiny_decoder.start_process_threads();
-    loop{
-    if let Some(frame)=tiny_decoder.get_one_audio_play_frame() {
-        audio_player.play_raw_data_from_audio_frame(frame);
-    }
-}
-    let mut str=String::new();
-    std::io::stdin().read_line(&mut str).unwrap();
+    let mut tiny_app_ui=appui::AppUi::new();
+    tiny_app_ui.init_appui_and_resources();
+    let options=eframe::NativeOptions::default();
+//     println!("shader_version==={}",options.shader_version.unwrap().clone().version_declaration());
+    eframe::run_native("tiny player", options,Box::new(|cc|{
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        return Ok(Box::new(tiny_app_ui));
+    })).unwrap();
 }
