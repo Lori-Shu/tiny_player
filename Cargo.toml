@@ -12,3 +12,5 @@ egui_extras = {version="0.31.1",features = ["all_loaders"]}
 image = {version="0.25.6",features = ["jpeg","png"]}
 egui = "0.31.1"
 rfd = "0.15.3"
+simple_logger = "5.0.0"
+log = "0.4.27"
