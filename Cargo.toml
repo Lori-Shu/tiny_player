@@ -2,15 +2,20 @@
 name = "tiny_player"
 version = "0.0.1"
 edition = "2024"
+description="a tiny video player"
+license="GPL-3.0"
+authors=["Lori-Shu"]
 
 [dependencies]
-ffmpeg-next = "7.1.0"
+ffmpeg-the-third = "3.0.2"
 rodio="0.20.1"
 bytemuck = "1.22.0"
-eframe = "0.31.1"
 egui_extras = {version="0.31.1",features = ["all_loaders"]}
 image = {version="0.25.6",features = ["jpeg","png"]}
+eframe = {version="0.31.1",features=["wgpu"]}
 egui = "0.31.1"
 rfd = "0.15.3"
 simple_logger = "5.0.0"
 log = "0.4.27"
+time = "0.3.41"
+[package.metadata.wix]
