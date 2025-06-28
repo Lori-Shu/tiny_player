@@ -43,21 +43,26 @@ impl AudioPlayer {
      */
     pub fn sync_play_time(&self) {
         let sink = self.sink.as_ref().unwrap();
-        if sink.len() > 30 {
-            // warn!("pos:{}",millis);
-            sink.set_speed(1.05);
-        }
         if sink.len() < 10 {
             sink.set_speed(1.0);
+        } else {
+            // warn!("pos:{}",millis);
+            sink.set_speed(1.05);
         }
     }
     pub fn change_volumn(&self) {
         let sink = self.sink.as_ref().unwrap();
         sink.set_volume(self.current_volumn);
     }
-    pub fn source_queue_skip_to_end(&self){
+    pub fn source_queue_skip_to_end(&self) {
         let sink = self.sink.as_ref().unwrap();
         sink.clear();
         sink.play();
+    }
+    pub fn pause_play(&self){
+        self.sink.as_ref().unwrap().pause();
+    }
+    pub fn continue_play(&self){
+        self.sink.as_ref().unwrap().play();
     }
 }
