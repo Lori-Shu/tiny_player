@@ -1,22 +1,25 @@
 use std::time::Duration;
 
 use log::warn;
-
+pub enum SyncState {
+    Slower,
+    Faster,
+}
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
     stream: Option<rodio::OutputStream>,
     handle: Option<rodio::OutputStreamHandle>,
-    time_stamp_vec: Vec<i64>,
     pub current_volumn: f32,
+    pts: i64,
 }
 impl AudioPlayer {
     pub fn new() -> Self {
         return Self {
+            pts: 0,
             current_volumn: 1.0,
             stream: None,
             handle: None,
             sink: None,
-            time_stamp_vec: vec![],
         };
     }
     pub fn init_device(&mut self) {
@@ -36,6 +39,7 @@ impl AudioPlayer {
 
         let sink = self.sink.as_ref().unwrap();
         sink.append(source);
+        warn!("sink len{}",sink.len());
     }
     /*
     one audio source time is about 21 millisecond,if the len is beyond about 10 source,
@@ -43,11 +47,30 @@ impl AudioPlayer {
      */
     pub fn sync_play_time(&self) {
         let sink = self.sink.as_ref().unwrap();
-        if sink.len() < 10 {
+        let len = sink.len();
+        
+        if len <= 1 {
             sink.set_speed(1.0);
         } else {
-            // warn!("pos:{}",millis);
-            sink.set_speed(1.05);
+            sink.set_speed(1.02);
+        }
+    }
+    pub fn get_sync_state(
+        &self,
+        video_pts: i64,
+        video_time_base: i32,
+        audio_time_base: i32,
+        video_start: i64,
+        audio_start: i64,
+    ) -> SyncState {
+        let sink = self.sink.as_ref().unwrap();
+        let v_mill_sec = (video_start+video_pts) * 1000 / video_time_base as i64;
+        let a_mill_sec = (audio_start+self.pts) * 1000 / audio_time_base as i64;
+        // warn!("a sec{}   ||  v sec{}",a_mill_sec,v_mill_sec);
+        if  a_mill_sec<v_mill_sec{
+            return SyncState::Slower;
+        } else {
+            return SyncState::Faster;
         }
     }
     pub fn change_volumn(&self) {
@@ -59,10 +82,16 @@ impl AudioPlayer {
         sink.clear();
         sink.play();
     }
-    pub fn pause_play(&self){
+    pub fn pause_play(&self) {
         self.sink.as_ref().unwrap().pause();
     }
-    pub fn continue_play(&self){
+    pub fn continue_play(&self) {
         self.sink.as_ref().unwrap().play();
+    }
+    pub fn set_pts(&mut self, pts: i64) {
+        self.pts = pts;
+    }
+    pub fn len(&self) ->usize{
+        self.sink.as_ref().unwrap().len()
     }
 }
