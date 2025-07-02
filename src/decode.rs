@@ -18,7 +18,7 @@ pub struct TinyDecoder {
     audio_start_time:i64,
     video_frame_rate: i32,
     video_frame_rect: [u32; 2],
-    total_video_frames: i64,
+    end_video_ts: i64,
     total_video_time_formatted_string: String,
     format_input: Option<Arc<Mutex<ffmpeg_the_third::format::context::Input>>>,
     video_decoder: Option<Arc<Mutex<ffmpeg_the_third::decoder::Video>>>,
@@ -45,7 +45,7 @@ impl TinyDecoder {
             audio_start_time:0,
             video_frame_rate: 0,
             video_frame_rect: [0, 0],
-            total_video_frames: 0,
+            end_video_ts: 0,
             total_video_time_formatted_string: String::new(),
             format_input: None,
             video_decoder: None,
@@ -83,6 +83,12 @@ impl TinyDecoder {
         }
         let v_frames = video_stream.frames();
         let fps = video_stream.avg_frame_rate().0;
+        self.video_time_base = video_stream.time_base().1;
+        warn!("video time_base==={}", self.video_time_base);
+        self.video_frame_rate = fps;
+        warn!("video_frame_rate==={}", self.video_frame_rate);
+        self.audio_time_base = audio_stream.time_base().1;
+        warn!("audio time_base==={}", self.audio_time_base);
         {
             let sec_num = v_frames / fps as i64;
             let sec = (sec_num % 60) as u8;
@@ -94,7 +100,8 @@ impl TinyDecoder {
             let formatter = format_description::parse("[hour]:[minute]:[second]").unwrap();
             self.total_video_time_formatted_string = time.format(&formatter).unwrap();
         }
-        self.total_video_frames = v_frames;
+        self.end_video_ts = v_frames/fps as i64*self.video_time_base as i64;
+        warn!("video end ts:{}",self.end_video_ts);
         let video_decoder_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(video_stream.parameters()).unwrap();
         let audio_decoder_ctx =
@@ -105,12 +112,7 @@ impl TinyDecoder {
             video_decoder.width(),
             video_decoder.height()
         );
-        self.video_time_base = video_stream.time_base().1;
-        warn!("video time_base==={}", self.video_time_base);
-        self.video_frame_rate = fps;
-        warn!("video_frame_rate==={}", self.video_frame_rate);
-        self.audio_time_base = audio_stream.time_base().1;
-        warn!("audio time_base==={}", self.audio_time_base);
+        
         self.converter_ctx = Some(
             ffmpeg_the_third::software::converter(
                 (video_decoder.width(), video_decoder.height()),
@@ -157,6 +159,12 @@ impl TinyDecoder {
         }
         let v_frames = video_stream.frames();
         let fps = video_stream.avg_frame_rate().0;
+        self.video_time_base = video_stream.time_base().1;
+        warn!("video time_base==={}", self.video_time_base);
+        self.video_frame_rate = fps;
+        warn!("video_frame_rate==={}", self.video_frame_rate);
+        self.audio_time_base = audio_stream.time_base().1;
+        warn!("audio time_base==={}", self.audio_time_base);
         {
             let sec_num = v_frames / fps as i64;
             let sec = (sec_num % 60) as u8;
@@ -168,7 +176,7 @@ impl TinyDecoder {
             let formatter = format_description::parse("[hour]:[minute]:[second]").unwrap();
             self.total_video_time_formatted_string = time.format(&formatter).unwrap();
         }
-        self.total_video_frames = v_frames;
+        self.end_video_ts = v_frames/fps as i64*self.video_time_base as i64;
         let video_decoder_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(video_stream.parameters()).unwrap();
         let audio_decoder_ctx =
@@ -179,12 +187,7 @@ impl TinyDecoder {
             video_decoder.width(),
             video_decoder.height()
         );
-        self.video_time_base = video_stream.time_base().1;
-        warn!("video time_base==={}", self.video_time_base);
-        self.video_frame_rate = fps;
-        warn!("video_frame_rate==={}", self.video_frame_rate);
-        self.audio_time_base = audio_stream.time_base().1;
-        warn!("audio time_base==={}", self.audio_time_base);
+       
         self.converter_ctx = Some(
             ffmpeg_the_third::software::converter(
                 (video_decoder.width(), video_decoder.height()),
@@ -423,9 +426,6 @@ impl TinyDecoder {
     pub fn get_video_frame_rate(&self) -> i32 {
         return self.video_frame_rate;
     }
-    pub fn get_total_video_frames(&self) -> i64 {
-        return self.total_video_frames;
-    }
     pub fn get_total_video_time_formatted_string(&self) -> &String {
         return &self.total_video_time_formatted_string;
     }
@@ -437,6 +437,9 @@ impl TinyDecoder {
     }
     pub fn get_audio_start_time(&self) -> i64 {
         return self.audio_start_time;
+    }
+    pub fn get_end_video_ts(&self) -> i64 {
+        return self.end_video_ts;
     }
     pub fn seek_timestamp_to_decode(&self, ts: i64) {
         {

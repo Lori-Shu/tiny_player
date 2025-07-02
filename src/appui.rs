@@ -16,7 +16,7 @@ use ffmpeg_the_third::frame::Video;
 use log::warn;
 use time::format_description;
 
-use crate::audio_play::SyncState;
+
 
 const VIDEO_FILE_IMG: ImageSource =
     include_image!("D:/rustprojects/tiny_player/resources/video_file_img.png");
@@ -220,12 +220,7 @@ impl eframe::App for AppUi {
                                 self.current_video_frame_timestamp.lock().unwrap();
                             let mut progress_slider = egui::Slider::new(
                                 &mut *mutex_guard,
-                                RangeInclusive::new(
-                                    0,
-                                    tiny_decoder.get_total_video_frames()
-                                        / tiny_decoder.get_video_frame_rate() as i64
-                                        * tiny_decoder.get_video_time_base() as i64,
-                                ),
+                                RangeInclusive::new(0, tiny_decoder.get_end_video_ts()),
                             );
                             progress_slider = progress_slider.show_value(false);
                             progress_slider = progress_slider.text(WidgetText::RichText(
@@ -383,15 +378,20 @@ impl AppUi {
         let audio_player = self.audio_player.as_mut().unwrap();
         let tiny_decoder = self.tiny_decoder.as_mut().unwrap();
         audio_player.sync_play_time();
+        let v_time_base = tiny_decoder.get_video_time_base();
+        let a_time_base = tiny_decoder.get_audio_time_base();
+        let v_start_t = tiny_decoder.get_video_start_time();
+        let a_start_t = tiny_decoder.get_audio_start_time();
         loop {
-            if let SyncState::Faster = audio_player.get_sync_state(
-                video_pts,
-                tiny_decoder.get_video_time_base(),
-                tiny_decoder.get_audio_time_base(),
-                tiny_decoder.get_video_start_time(),
-                tiny_decoder.get_audio_start_time(),
-            ) && audio_player.len() > 1
+            if audio_player.len() > 1
+                || (a_start_t + audio_player.get_pts())  / a_time_base as i64+1
+                    >= (v_start_t + tiny_decoder.get_end_video_ts())  / v_time_base as i64
             {
+                warn!(
+                    "audio time {} video end time{}",
+                    (a_start_t + audio_player.get_pts()) * 1000 / a_time_base as i64
+                        ,(v_start_t + tiny_decoder.get_end_video_ts()) * 1000 / v_time_base as i64
+                );
                 break;
             }
             let (audio_frame_opt, pts) = tiny_decoder.get_one_audio_play_frame_and_pts();
