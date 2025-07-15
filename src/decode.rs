@@ -1,5 +1,8 @@
 use std::{
-     path::Path, sync::{Arc, Mutex, RwLock}, thread::{self, sleep}, time::Duration
+    path::Path,
+    sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
+    thread::{self, sleep},
+    time::Duration,
 };
 
 use ffmpeg_the_third::{
@@ -14,13 +17,14 @@ pub struct TinyDecoder {
     audio_stream_index: Arc<Mutex<usize>>,
     video_time_base: i32,
     audio_time_base: i32,
-    video_start_time:i64,
-    audio_start_time:i64,
+    video_start_time: i64,
+    audio_start_time: i64,
     video_frame_rate: i32,
     video_frame_rect: [u32; 2],
     end_video_ts: i64,
     total_video_time_formatted_string: String,
     format_input: Option<Arc<Mutex<ffmpeg_the_third::format::context::Input>>>,
+    input_play_end_flag: Arc<AtomicBool>,
     video_decoder: Option<Arc<Mutex<ffmpeg_the_third::decoder::Video>>>,
     audio_decoder: Option<Arc<Mutex<ffmpeg_the_third::decoder::Audio>>>,
     converter_ctx: Option<ffmpeg_the_third::software::scaling::Context>,
@@ -40,14 +44,15 @@ impl TinyDecoder {
             video_stream_index: Arc::new(Mutex::new(0)),
             audio_stream_index: Arc::new(Mutex::new(0)),
             video_time_base: 0,
-            audio_time_base:0,
-            video_start_time:0,
-            audio_start_time:0,
+            audio_time_base: 0,
+            video_start_time: 0,
+            audio_start_time: 0,
             video_frame_rate: 0,
             video_frame_rect: [0, 0],
             end_video_ts: 0,
             total_video_time_formatted_string: String::new(),
             format_input: None,
+            input_play_end_flag: Arc::new(AtomicBool::new(false)),
             video_decoder: None,
             audio_decoder: None,
             converter_ctx: None,
@@ -68,10 +73,10 @@ impl TinyDecoder {
 
     pub fn set_file_path_and_init_par(&mut self, file_path: &Path) {
         warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
-        let mut format_input = format::input(file_path).unwrap();
+        let format_input = format::input(file_path).unwrap();
         let video_stream = format_input.streams().best(Type::Video).unwrap();
         let audio_stream = format_input.streams().best(Type::Audio).unwrap();
-        self.audio_start_time= audio_stream.start_time();
+        self.audio_start_time = audio_stream.start_time();
         self.video_start_time = video_stream.start_time();
         {
             let mut mutex_guard = self.video_stream_index.lock().unwrap();
@@ -100,19 +105,19 @@ impl TinyDecoder {
             let formatter = format_description::parse("[hour]:[minute]:[second]").unwrap();
             self.total_video_time_formatted_string = time.format(&formatter).unwrap();
         }
-        self.end_video_ts = v_frames/fps as i64*self.video_time_base as i64;
-        warn!("video end ts:{}",self.end_video_ts);
+        self.end_video_ts = v_frames / fps as i64 * self.video_time_base as i64;
+        warn!("video end ts:{}", self.end_video_ts);
         let video_decoder_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(video_stream.parameters()).unwrap();
         let audio_decoder_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(audio_stream.parameters()).unwrap();
-        let mut video_decoder = video_decoder_ctx.decoder().video().unwrap();
+        let video_decoder = video_decoder_ctx.decoder().video().unwrap();
         warn!(
             "video decoder width=={} height=={}",
             video_decoder.width(),
             video_decoder.height()
         );
-        
+
         self.converter_ctx = Some(
             ffmpeg_the_third::software::converter(
                 (video_decoder.width(), video_decoder.height()),
@@ -122,7 +127,7 @@ impl TinyDecoder {
             .unwrap(),
         );
         self.video_frame_rect = [video_decoder.width(), video_decoder.height()];
-        let mut audio_decoder = audio_decoder_ctx.decoder().audio().unwrap();
+        let audio_decoder = audio_decoder_ctx.decoder().audio().unwrap();
         self.resampler_ctx = Some(
             ffmpeg_the_third::software::resampler2(
                 (
@@ -133,21 +138,23 @@ impl TinyDecoder {
                 (
                     format::Sample::I16(format::sample::Type::Packed),
                     audio_decoder.ch_layout(),
-                    48000,
+                    audio_decoder.rate(),
                 ),
             )
             .unwrap(),
         );
+        self.input_play_end_flag
+            .store(false, std::sync::atomic::Ordering::Release);
         self.video_decoder = Some(Arc::new(Mutex::new(video_decoder)));
         self.audio_decoder = Some(Arc::new(Mutex::new(audio_decoder)));
         self.format_input = Some(Arc::new(Mutex::new(format_input)));
     }
     pub fn change_file_path_and_init_par(&mut self, file_path: &Path) {
         warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
-        let mut format_input = format::input(file_path).unwrap();
+        let format_input = format::input(file_path).unwrap();
         let video_stream = format_input.streams().best(Type::Video).unwrap();
         let audio_stream = format_input.streams().best(Type::Audio).unwrap();
-        self.audio_start_time= audio_stream.start_time();
+        self.audio_start_time = audio_stream.start_time();
         self.video_start_time = video_stream.start_time();
         {
             let mut mutex_guard = self.video_stream_index.lock().unwrap();
@@ -176,18 +183,18 @@ impl TinyDecoder {
             let formatter = format_description::parse("[hour]:[minute]:[second]").unwrap();
             self.total_video_time_formatted_string = time.format(&formatter).unwrap();
         }
-        self.end_video_ts = v_frames/fps as i64*self.video_time_base as i64;
+        self.end_video_ts = v_frames / fps as i64 * self.video_time_base as i64;
         let video_decoder_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(video_stream.parameters()).unwrap();
         let audio_decoder_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(audio_stream.parameters()).unwrap();
-        let mut video_decoder = video_decoder_ctx.decoder().video().unwrap();
+        let video_decoder = video_decoder_ctx.decoder().video().unwrap();
         warn!(
             "video decoder width=={} height=={}",
             video_decoder.width(),
             video_decoder.height()
         );
-       
+
         self.converter_ctx = Some(
             ffmpeg_the_third::software::converter(
                 (video_decoder.width(), video_decoder.height()),
@@ -197,7 +204,7 @@ impl TinyDecoder {
             .unwrap(),
         );
         self.video_frame_rect = [video_decoder.width(), video_decoder.height()];
-        let mut audio_decoder = audio_decoder_ctx.decoder().audio().unwrap();
+        let audio_decoder = audio_decoder_ctx.decoder().audio().unwrap();
         self.resampler_ctx = Some(
             ffmpeg_the_third::software::resampler2(
                 (
@@ -208,11 +215,13 @@ impl TinyDecoder {
                 (
                     format::Sample::I16(format::sample::Type::Packed),
                     audio_decoder.ch_layout(),
-                    48000,
+                    audio_decoder.rate(),
                 ),
             )
             .unwrap(),
         );
+        self.input_play_end_flag
+            .store(false, std::sync::atomic::Ordering::Release);
         {
             let mut mutex_guard = self.packet_cache_vec.write().unwrap();
             mutex_guard.clear();
@@ -232,6 +241,7 @@ impl TinyDecoder {
         packet_demux_thread_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         format_input: Arc<Mutex<ffmpeg_the_third::format::context::Input>>,
         packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::packet::Packet>>>,
+        input_end_flag: Arc<AtomicBool>,
     ) {
         loop {
             if packet_demux_thread_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
@@ -251,9 +261,15 @@ impl TinyDecoder {
                  */
                 let mut rw_lock_guard = packet_cache_vec.write().unwrap();
                 let mut lock_guard = format_input.lock().unwrap();
-
-                if let Some(Ok((stream, packet))) = lock_guard.packets().next() {
-                    rw_lock_guard.push(packet);
+                match lock_guard.packets().next() {
+                    Some(Ok((stream, packet))) => rw_lock_guard.push(packet),
+                    Some(Err(e)) => {
+                        if let ffmpeg_the_third::Error::Eof = e {
+                            input_end_flag.store(true, std::sync::atomic::Ordering::Release);
+                            warn!("set end flag !!!");
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -273,14 +289,14 @@ impl TinyDecoder {
                 break;
             }
             let video_frame_vec_len = {
-                let mut guard = video_frame_cache_vec.read().unwrap();
+                let guard = video_frame_cache_vec.read().unwrap();
                 guard.len()
             };
             let audio_frame_vec_len = {
-                let mut guard = audio_frame_cache_vec.read().unwrap();
+                let guard = audio_frame_cache_vec.read().unwrap();
                 guard.len()
             };
-            if video_frame_vec_len >= 100 && audio_frame_vec_len>=100{
+            if video_frame_vec_len >= 100 && audio_frame_vec_len >= 100 {
                 sleep(Duration::from_millis(10));
                 continue;
             }
@@ -293,7 +309,7 @@ impl TinyDecoder {
                         遇到decoder和packet不匹配的情况
                 */
                 let mut rw_lock_write_guard = packet_cache_vec.write().unwrap();
-                let mut front_packet;
+                let front_packet;
                 if rw_lock_write_guard.len() > 0 {
                     front_packet = rw_lock_write_guard.remove(0);
                 } else {
@@ -333,10 +349,10 @@ impl TinyDecoder {
         }
     }
     pub fn start_process_threads(&mut self) {
-        let mut packet_demux_thread_stop_flag = self.packet_demux_thread_stop_flag.clone();
-        let mut format_input = self.format_input.as_ref().unwrap().clone();
-        let mut packet_cache_vec = self.packet_cache_vec.clone();
-
+        let packet_demux_thread_stop_flag = self.packet_demux_thread_stop_flag.clone();
+        let format_input = self.format_input.as_ref().unwrap().clone();
+        let packet_cache_vec = self.packet_cache_vec.clone();
+        let input_end_flag = self.input_play_end_flag.clone();
         self.packet_demux_thread_handler = Some(
             thread::Builder::new()
                 .name("demux thread".to_string())
@@ -345,19 +361,20 @@ impl TinyDecoder {
                         packet_demux_thread_stop_flag,
                         format_input,
                         packet_cache_vec,
+                        input_end_flag,
                     );
                 })
                 .unwrap(),
         );
 
-        let mut video_stream_index = self.video_stream_index.clone();
-        let mut audio_stream_index = self.audio_stream_index.clone();
-        let mut video_decoder = self.video_decoder.as_ref().unwrap().clone();
-        let mut audio_decoder = self.audio_decoder.as_ref().unwrap().clone();
-        let mut video_frame_cache_vec = self.video_frame_cache_vec.clone();
-        let mut audio_frame_cache_vec = self.audio_frame_cache_vec.clone();
-        let mut packet_cache_vec = self.packet_cache_vec.clone();
-        let mut frame_decode_thread_stop_flag = self.frame_decode_thread_stop_flag.clone();
+        let video_stream_index = self.video_stream_index.clone();
+        let audio_stream_index = self.audio_stream_index.clone();
+        let video_decoder = self.video_decoder.as_ref().unwrap().clone();
+        let audio_decoder = self.audio_decoder.as_ref().unwrap().clone();
+        let video_frame_cache_vec = self.video_frame_cache_vec.clone();
+        let audio_frame_cache_vec = self.audio_frame_cache_vec.clone();
+        let packet_cache_vec = self.packet_cache_vec.clone();
+        let frame_decode_thread_stop_flag = self.frame_decode_thread_stop_flag.clone();
         self.frame_decode_thread_handler = Some(
             std::thread::Builder::new()
                 .name("decode thread".to_string())
@@ -376,7 +393,9 @@ impl TinyDecoder {
                 .unwrap(),
         );
     }
-    pub fn get_one_audio_play_frame_and_pts(&mut self) -> (Option<ffmpeg_the_third::frame::Audio>,i64) {
+    pub fn get_one_audio_play_frame_and_pts(
+        &mut self,
+    ) -> (Option<ffmpeg_the_third::frame::Audio>, i64) {
         let resampler_ctx = self.resampler_ctx.as_mut().unwrap();
         let mut res = ffmpeg_the_third::frame::Audio::empty();
         let raw_frame;
@@ -385,25 +404,27 @@ impl TinyDecoder {
             if rw_lock_write_guard.len() > 0 {
                 raw_frame = rw_lock_write_guard.remove(0);
             } else {
-                return (None,0);
+                return (None, 0);
             }
         }
-        let pts=raw_frame.pts().unwrap();
+        let pts = raw_frame.pts().unwrap();
         resampler_ctx.run(&raw_frame, &mut res).unwrap();
 
-        return (Some(res),pts);
+        return (Some(res), pts);
     }
-    pub fn get_one_video_play_frame_and_pts(&mut self) -> (Option<ffmpeg_the_third::frame::Video>,i64) {
+    pub fn get_one_video_play_frame_and_pts(
+        &mut self,
+    ) -> (Option<ffmpeg_the_third::frame::Video>, i64) {
         let converter_ctx = self.converter_ctx.as_mut().unwrap();
         let mut res = ffmpeg_the_third::frame::Video::empty();
-        let mut return_val = (None,0);
+        let mut return_val = (None, 0);
         {
             let mut rw_lock_write_guard = self.video_frame_cache_vec.write().unwrap();
             if rw_lock_write_guard.len() > 0 {
                 let raw_frame = rw_lock_write_guard.remove(0);
-                let pts=raw_frame.pts().unwrap();
+                let pts = raw_frame.pts().unwrap();
                 converter_ctx.run(&raw_frame, &mut res).unwrap();
-                return_val = (Some(res),pts);
+                return_val = (Some(res), pts);
             }
         }
         return return_val;
@@ -440,6 +461,9 @@ impl TinyDecoder {
     }
     pub fn get_end_video_ts(&self) -> i64 {
         return self.end_video_ts;
+    }
+    pub fn get_input_end_flag(&self) -> Arc<AtomicBool> {
+        return self.input_play_end_flag.clone();
     }
     pub fn seek_timestamp_to_decode(&self, ts: i64) {
         {

@@ -1,18 +1,14 @@
-use std::time::Duration;
-
-use log::warn;
-
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
     stream: Option<rodio::OutputStream>,
     handle: Option<rodio::OutputStreamHandle>,
     pub current_volumn: f32,
-    pts: i64,
+    pts_vec2: Vec<i64>,
 }
 impl AudioPlayer {
     pub fn new() -> Self {
         return Self {
-            pts: 0,
+            pts_vec2: vec![0, 0],
             current_volumn: 1.0,
             stream: None,
             handle: None,
@@ -41,17 +37,17 @@ impl AudioPlayer {
     one audio source time is about 21 millisecond,if the len is beyond about 10 source,
     skip one to catch the video stime
      */
-    pub fn sync_play_time(&self) {
+    pub fn sync_play_time(&self, a_strt: i64, a_base: i64, v_strt: i64, v_base: i64, v_pts: i64) {
         let sink = self.sink.as_ref().unwrap();
-        let len = sink.len();
-
-        if len <= 1 {
+        let a_mill = (a_strt + self.pts_vec2[0]) / a_base * 1000;
+        let v_mill = (v_strt + v_pts) / v_base * 1000;
+        if a_mill > v_mill {
             sink.set_speed(1.0);
         } else {
             sink.set_speed(1.02);
         }
     }
-    
+
     pub fn change_volumn(&self) {
         let sink = self.sink.as_ref().unwrap();
         sink.set_volume(self.current_volumn);
@@ -68,10 +64,13 @@ impl AudioPlayer {
         self.sink.as_ref().unwrap().play();
     }
     pub fn set_pts(&mut self, pts: i64) {
-        self.pts = pts;
+        if self.pts_vec2.len() >= 2 {
+            self.pts_vec2.remove(0);
+        }
+        self.pts_vec2.push(pts);
     }
     pub fn get_pts(&self) -> i64 {
-        self.pts
+        self.pts_vec2[1]
     }
     pub fn len(&self) -> usize {
         self.sink.as_ref().unwrap().len()
