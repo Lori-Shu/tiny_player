@@ -12,22 +12,23 @@ use egui::{
 use log::warn;
 use time::format_description;
 
-const VIDEO_FILE_IMG: ImageSource =
-    include_image!("D:/rustprojects/tiny_player/resources/video_file_img.png");
-const VOLUMN_IMG: ImageSource =
-    include_image!("D:/rustprojects/tiny_player/resources/volumn_img.png");
-const PLAY_IMG: ImageSource = include_image!("D:/rustprojects/tiny_player/resources/play_img.png");
-const PAUSE_IMG: ImageSource =
-    include_image!("D:/rustprojects/tiny_player/resources/pause_img.png");
-const FULLSCREEN_IMG: ImageSource =
-    include_image!("D:/rustprojects/tiny_player/resources/fullscreen_img.png");
+
+const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
+const VOLUMN_IMG: ImageSource = include_image!("../resources/volumn_img.png");
+const PLAY_IMG: ImageSource = include_image!("../resources/play_img.png");
+const PAUSE_IMG: ImageSource = include_image!("../resources/pause_img.png");
+const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.png");
+struct CurrentVideoFrameDetail {
+    frame: ffmpeg_the_third::util::frame::Video,
+    pts: i64,
+}
 pub struct AppUi {
     video_texture_id: Option<TextureId>,
     tiny_decoder: Option<crate::decode::TinyDecoder>,
     audio_player: Option<crate::audio_play::AudioPlayer>,
     current_video_frame_timestamp: Arc<Mutex<i64>>,
     color_image: Option<ColorImage>,
-    next_frame_show_instant: Instant,
+    frame_show_instant: Instant,
     pause_flag: bool,
     play_time: time::Time,
     time_text: String,
@@ -36,6 +37,8 @@ pub struct AppUi {
     err_window_flag: bool,
     err_window_msg: String,
     last_show_control_ui_instant: Instant,
+    app_start_instant: Instant,
+    current_frame_detail: Option<CurrentVideoFrameDetail>,
 }
 impl eframe::App for AppUi {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -52,7 +55,7 @@ impl eframe::App for AppUi {
                     if self.video_texture_id.is_none() {
                         self.create_or_change_color_image();
                         self.create_video_texture(ctx);
-                        self.next_frame_show_instant = now;
+                        self.frame_show_instant = now;
                     }
                     if !self.pause_flag {
                         /*
@@ -60,45 +63,54 @@ impl eframe::App for AppUi {
                          */
 
                         if now
-                            .checked_duration_since(self.next_frame_show_instant.clone())
+                            .checked_duration_since(self.frame_show_instant.clone())
                             .is_some()
                         {
                             let tiny_decoder = self.tiny_decoder.as_mut().unwrap();
                             let (video_frame_opt, pts) =
                                 tiny_decoder.get_one_video_play_frame_and_pts();
                             if video_frame_opt.is_some() {
-                                let frame_rate = tiny_decoder.get_video_frame_rate();
-
-                                self.next_frame_show_instant = self
-                                    .next_frame_show_instant
-                                    .checked_add(Duration::from_millis(
-                                        (1.0 / (frame_rate as f32) * 1000.0) as u64,
-                                    ))
-                                    .unwrap();
-                                {
-                                    let mut lock_guard =
-                                        self.current_video_frame_timestamp.lock().unwrap();
-                                    (*lock_guard) = pts;
-                                    if pts >= tiny_decoder.get_end_video_ts() {
-                                        self.pause_flag = true;
+                                if let Some(detail) = &mut self.current_frame_detail {
+                                    {
+                                        let mut lock_guard =
+                                            self.current_video_frame_timestamp.lock().unwrap();
+                                        (*lock_guard) = detail.pts;
+                                        self.frame_show_instant = self
+                                            .frame_show_instant
+                                            .checked_add(Duration::from_millis(
+                                                ((pts - detail.pts) * 1000
+                                                    / tiny_decoder.get_video_time_base() as i64)
+                                                    as u64,
+                                            ))
+                                            .unwrap();
                                     }
-                                }
 
-                                self.color_image
-                                    .as_mut()
-                                    .unwrap()
-                                    .as_raw_mut()
-                                    .copy_from_slice(video_frame_opt.unwrap().data(0));
-                                ctx.tex_manager().write().set(
-                                    self.video_texture_id.as_ref().unwrap().clone(),
-                                    ImageDelta::full(
-                                        ImageData::Color(Arc::new(
-                                            self.color_image.as_ref().unwrap().clone(),
-                                        )),
-                                        TextureOptions::LINEAR,
-                                    ),
-                                );
+                                    self.color_image
+                                        .as_mut()
+                                        .unwrap()
+                                        .as_raw_mut()
+                                        .copy_from_slice(detail.frame.data(0));
+                                    ctx.tex_manager().write().set(
+                                        self.video_texture_id.as_ref().unwrap().clone(),
+                                        ImageDelta::full(
+                                            ImageData::Color(Arc::new(
+                                                self.color_image.as_ref().unwrap().clone(),
+                                            )),
+                                            TextureOptions::LINEAR,
+                                        ),
+                                    );
+                                    detail.frame = video_frame_opt.unwrap();
+                                    detail.pts = pts;
+                                } else {
+                                    self.current_frame_detail = Some(CurrentVideoFrameDetail {
+                                        frame: video_frame_opt.unwrap(),
+                                        pts: pts,
+                                    });
+                                }
                             }
+                        }
+                        if self.check_play_is_at_endtail() {
+                            self.pause_flag = true;
                         }
                         let pts = {
                             let mutex_guard = self.current_video_frame_timestamp.lock().unwrap();
@@ -110,21 +122,23 @@ impl eframe::App for AppUi {
                         /*
                         player paused
                          */
-                        self.next_frame_show_instant = now;
+                        self.frame_show_instant = now;
                         self.paint_video_image(ctx, ui);
                     }
                 }
+                self.paint_frame_rate_text(ui, ctx, &now);
                 if self.control_ui_flag {
                     ui.set_opacity(1.0);
                 } else {
                     ui.set_opacity(0.0);
                 }
                 self.paint_file_btn(ui, ctx, &now);
+
                 ui.add_space(ctx.screen_rect().height() / 2.0 - 200.0);
                 ui.horizontal(|ui| {
                     self.paint_playpause_btn(ui, ctx, &now);
                 });
-                ui.add_space(ctx.screen_rect().height() / 2.0 - 200.0);
+                ui.add_space(ctx.screen_rect().height() / 2.0 - 230.0);
                 ui.horizontal(|ui| {
                     let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
                     if let Some(input_par) = tiny_decoder.get_input_par() {
@@ -167,6 +181,36 @@ impl eframe::App for AppUi {
     }
 }
 impl AppUi {
+    pub fn replace_fonts(&self, ctx: &egui::Context) {
+        // Start with the default fonts (we will be adding to them rather than replacing them).
+        let mut fonts = egui::FontDefinitions::default();
+
+        // Install my own font (maybe supporting non-latin characters).
+        // .ttf and .otf files supported.
+        fonts.font_data.insert(
+            "app_default_font".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+                "../resources/fonts/MapleMono-CN-Regular.ttf"
+            ))),
+        );
+
+        // Put my font first (highest priority) for proportional text:
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "app_default_font".to_owned());
+
+        // Put my font as last fallback for monospace:
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "app_default_font".to_owned());
+
+        // Tell egui to use these fonts:
+        ctx.set_fonts(fonts);
+    }
     pub fn new() -> Self {
         return Self {
             video_texture_id: None,
@@ -175,7 +219,7 @@ impl AppUi {
             current_video_frame_timestamp: Arc::new(Mutex::new(0)),
             play_time: time::Time::from_hms(0, 0, 0).unwrap(),
             color_image: None,
-            next_frame_show_instant: Instant::now(),
+            frame_show_instant: Instant::now(),
             pause_flag: false,
             time_text: String::new(),
             fullscreen_flag: false,
@@ -183,6 +227,8 @@ impl AppUi {
             err_window_flag: false,
             err_window_msg: String::new(),
             last_show_control_ui_instant: Instant::now(),
+            app_start_instant: Instant::now(),
+            current_frame_detail: None,
         };
     }
     pub fn init_appui_and_resources(&mut self) {
@@ -235,7 +281,7 @@ impl AppUi {
     fn create_or_change_color_image(&mut self) {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
         let frame_rect = tiny_decoder.get_video_frame_rect();
-        let color_image = ColorImage::new(
+        let color_image = ColorImage::filled(
             [frame_rect[0] as usize, frame_rect[1] as usize],
             Color32::from_rgba_unmultiplied(0, 200, 0, 200),
         );
@@ -259,26 +305,41 @@ impl AppUi {
         /*
         add audio frame data to the audio player and sync with video frame time
          */
-        let audio_player = self.audio_player.as_mut().unwrap();
-        let tiny_decoder = self.tiny_decoder.as_mut().unwrap();
-
-        let v_time_base = tiny_decoder.get_video_time_base();
-        let a_time_base = tiny_decoder.get_audio_time_base();
-        let v_start_t = tiny_decoder.get_video_start_time();
-        let a_start_t = tiny_decoder.get_audio_start_time();
-        let end_flag = tiny_decoder.get_input_end_flag();
-        audio_player.sync_play_time(
-            a_start_t,
-            a_time_base as i64,
-            v_start_t,
-            v_time_base as i64,
-            video_pts,
-        );
-        if !end_flag.load(std::sync::atomic::Ordering::Acquire) && audio_player.len() < 2 {
-            let (audio_frame_opt, pts) = tiny_decoder.get_one_audio_play_frame_and_pts();
-            if audio_frame_opt.is_some() {
-                audio_player.set_pts(pts);
-                audio_player.play_raw_data_from_audio_frame(audio_frame_opt.unwrap());
+        if let Some(audio_player) = &mut self.audio_player {
+            if let Some(tiny_decoder) = &mut self.tiny_decoder {
+                let v_time_base = tiny_decoder.get_video_time_base();
+                let a_time_base = tiny_decoder.get_audio_time_base();
+                let v_start_t = tiny_decoder.get_video_start_time();
+                let a_start_t = tiny_decoder.get_audio_start_time();
+                let end_flag = tiny_decoder.get_input_end_flag();
+                audio_player.sync_play_time(
+                    a_start_t,
+                    a_time_base as i64,
+                    v_start_t,
+                    v_time_base as i64,
+                    video_pts,
+                );
+            }
+        }
+        loop {
+            if self.check_play_is_at_endtail() {
+                break;
+            }
+            if let Some(audio_player) = &mut self.audio_player {
+                if let Some(tiny_decoder) = &mut self.tiny_decoder {
+                    if audio_player.len() < 10 {
+                        let (audio_frame_opt, pts) =
+                            tiny_decoder.get_one_audio_play_frame_and_pts();
+                        if audio_frame_opt.is_some() {
+                            audio_player.set_pts(pts);
+                            audio_player.play_raw_data_from_audio_frame(audio_frame_opt.unwrap());
+                        } else if audio_player.len() > 8 {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -375,13 +436,13 @@ impl AppUi {
                     RangeInclusive::new(0, tiny_decoder.get_end_video_ts()),
                 );
                 progress_slider = progress_slider.show_value(false);
-                progress_slider = progress_slider.text(WidgetText::RichText(
+                progress_slider = progress_slider.text(WidgetText::RichText(Arc::new(
                     RichText::new(self.time_text.clone())
                         .size(20.0)
                         .color(Color32::BROWN),
-                ));
+                )));
                 let mut slider_width_style = egui::style::Style::default();
-                slider_width_style.spacing.slider_width = ctx.screen_rect().width() - 300.0;
+                slider_width_style.spacing.slider_width = ctx.screen_rect().width() - 350.0;
                 slider_width_style.spacing.slider_rail_height = 10.0;
                 ui.set_style(slider_width_style);
                 let slider_response = ui.add(progress_slider);
@@ -394,6 +455,8 @@ impl AppUi {
                     let audio_player = self.audio_player.as_mut().unwrap();
                     audio_player.source_queue_skip_to_end();
                     audio_player.set_pts(0);
+                    self.frame_show_instant = now.clone();
+                    self.current_frame_detail = None;
                     tiny_decoder.seek_timestamp_to_decode(*mutex_guard);
                 }
             }
@@ -418,6 +481,31 @@ impl AppUi {
             if btn_response.clicked() {
                 self.fullscreen_flag = !self.fullscreen_flag;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen_flag));
+            }
+        }
+    }
+
+    fn paint_frame_rate_text(&self, ui: &mut Ui, ctx: &Context, now: &Instant) {
+        ui.horizontal(|ui| {
+            ui.add_space(ctx.screen_rect().width() / 2.0);
+            let app_sec = (*now - self.app_start_instant).as_secs();
+            if app_sec > 0 {
+                let mut text_str = "当前帧率fps：".to_string();
+                text_str.push_str((ctx.cumulative_frame_nr() / app_sec).to_string().as_str());
+                let rich_text = egui::RichText::new(text_str).size(30.0);
+                let fps_button = egui::Button::new(rich_text).frame(false);
+                ui.add(fps_button);
+            }
+        });
+    }
+    fn check_play_is_at_endtail(&self) -> bool {
+        {
+            if let Some(tiny_decoder) = &self.tiny_decoder {
+                let pts = self.current_video_frame_timestamp.lock().unwrap();
+                *pts / tiny_decoder.get_video_time_base() as i64 + 1
+                    >= tiny_decoder.get_end_video_ts() / tiny_decoder.get_video_time_base() as i64
+            } else {
+                false
             }
         }
     }

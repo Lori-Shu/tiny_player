@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 use log::{Level, info};
 
 mod appui;
@@ -15,6 +18,7 @@ fn main() {
         options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            tiny_app_ui.replace_fonts(&cc.egui_ctx);
             return Ok(Box::new(tiny_app_ui));
         }),
     )

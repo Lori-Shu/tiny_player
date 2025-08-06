@@ -117,7 +117,6 @@ impl TinyDecoder {
             video_decoder.width(),
             video_decoder.height()
         );
-
         self.converter_ctx = Some(
             ffmpeg_the_third::software::converter(
                 (video_decoder.width(), video_decoder.height()),

@@ -1,3 +1,5 @@
+use log::warn;
+
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
     stream: Option<rodio::OutputStream>,
@@ -8,7 +10,7 @@ pub struct AudioPlayer {
 impl AudioPlayer {
     pub fn new() -> Self {
         return Self {
-            pts_vec2: vec![0, 0],
+            pts_vec2: vec![0; 10],
             current_volumn: 1.0,
             stream: None,
             handle: None,
@@ -39,12 +41,17 @@ impl AudioPlayer {
      */
     pub fn sync_play_time(&self, a_strt: i64, a_base: i64, v_strt: i64, v_base: i64, v_pts: i64) {
         let sink = self.sink.as_ref().unwrap();
-        let a_mill = (a_strt + self.pts_vec2[0]) / a_base * 1000;
-        let v_mill = (v_strt + v_pts) / v_base * 1000;
-        if a_mill > v_mill {
-            sink.set_speed(1.0);
-        } else {
-            sink.set_speed(1.02);
+        let a_mill = (a_strt + self.pts_vec2[0]) * 1000 / a_base;
+        let v_mill = (v_strt + v_pts) * 1000 / v_base;
+        warn!("a:{}||||v:{}", a_mill, v_mill);
+        // if a_mill + 100 > v_mill {
+        //     sink.set_speed(1.0);
+
+        // } else {
+        //     sink.set_speed(1.4);
+        // }
+        if a_mill + 100 < v_mill {
+            sink.skip_one();
         }
     }
 
@@ -64,7 +71,7 @@ impl AudioPlayer {
         self.sink.as_ref().unwrap().play();
     }
     pub fn set_pts(&mut self, pts: i64) {
-        if self.pts_vec2.len() >= 2 {
+        if self.pts_vec2.len() > 10 {
             self.pts_vec2.remove(0);
         }
         self.pts_vec2.push(pts);
