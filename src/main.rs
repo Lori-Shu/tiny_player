@@ -2,6 +2,7 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
+#![deny(unused_variables)]
 use log::{Level, info};
 
 mod appui;
@@ -24,7 +25,9 @@ fn main() {
     )
     .unwrap();
 }
+#[cfg(test)]
 mod test {
+    #[derive(Debug)]
     enum DivisionError {
         // Example: 42 / 0
         DivideByZero,
@@ -48,42 +51,9 @@ mod test {
 
         Ok(a / b)
     }
-    fn result_with_list() -> Result<Vec<i64>, DivisionError> {
-        //                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        let numbers = [27, 297, 38502, 81];
-        let mut division_results = numbers.into_iter().map(|n| divide(n, 0));
-        // Collects to the expected return type. Returns the first error in the
-        // division results (if one exists).
-        match division_results.find(|n| match n {
-            Ok(num) => return false,
-            Err(e) => return true,
-        }) {
-            Some(r) => return Err(r.unwrap_err()),
-            None => {
-                let ans: Vec<i64> = division_results
-                    .map(|n| {
-                        return match n {
-                            Ok(num) => return num,
-                            Err(e) => return -1,
-                        };
-                    })
-                    .collect();
-                return Ok(ans);
-            }
-        }
-    }
     #[test]
-    fn test_iter() {
-        match result_with_list() {
-            Err(e) => match e {
-                DivisionError::DivideByZero => {
-                    println!("error dividby zero");
-                }
-                _ => {}
-            },
-            Ok(_) => {}
-        }
+    fn testdivide() {
+        let divide = divide(20, 0).unwrap();
+        println!("{:#?}", divide);
     }
-    #[test]
-    fn test_alg() {}
 }

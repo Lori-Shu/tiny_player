@@ -1,4 +1,3 @@
-use log::warn;
 
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
@@ -43,7 +42,7 @@ impl AudioPlayer {
         let sink = self.sink.as_ref().unwrap();
         let a_mill = (a_strt + self.pts_vec2[0]) * 1000 / a_base;
         let v_mill = (v_strt + v_pts) * 1000 / v_base;
-        warn!("a:{}||||v:{}", a_mill, v_mill);
+        // warn!("a:{}||||v:{}", a_mill, v_mill);
         // if a_mill + 100 > v_mill {
         //     sink.set_speed(1.0);
 
@@ -75,9 +74,6 @@ impl AudioPlayer {
             self.pts_vec2.remove(0);
         }
         self.pts_vec2.push(pts);
-    }
-    pub fn get_pts(&self) -> i64 {
-        self.pts_vec2[1]
     }
     pub fn len(&self) -> usize {
         self.sink.as_ref().unwrap().len()

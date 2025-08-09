@@ -12,7 +12,6 @@ use egui::{
 use log::warn;
 use time::format_description;
 
-
 const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
 const VOLUMN_IMG: ImageSource = include_image!("../resources/volumn_img.png");
 const PLAY_IMG: ImageSource = include_image!("../resources/play_img.png");
@@ -41,7 +40,7 @@ pub struct AppUi {
     current_frame_detail: Option<CurrentVideoFrameDetail>,
 }
 impl eframe::App for AppUi {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
                 let now = Instant::now();
@@ -61,7 +60,13 @@ impl eframe::App for AppUi {
                         /*
                         if now is next_frame_time or a little beyond get and show a new frame
                          */
-
+                        let _keepawake = keepawake::Builder::default()
+                            .display(true)
+                            .idle(true)
+                            .app_name("tiny_player")
+                            .reason("video play")
+                            .create()
+                            .unwrap();
                         if now
                             .checked_duration_since(self.frame_show_instant.clone())
                             .is_some()
@@ -141,7 +146,7 @@ impl eframe::App for AppUi {
                 ui.add_space(ctx.screen_rect().height() / 2.0 - 230.0);
                 ui.horizontal(|ui| {
                     let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
-                    if let Some(input_par) = tiny_decoder.get_input_par() {
+                    if let Some(_input_par) = tiny_decoder.get_input_par() {
                         ui.add_space(ctx.screen_rect().width() - 120.0);
                         let audio_player = self.audio_player.as_mut().unwrap();
                         let mut volumn_slider = egui::Slider::new(
@@ -255,7 +260,7 @@ impl AppUi {
     }
     fn update_time_and_time_text(&mut self) {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
-        if let Some(input_par) = tiny_decoder.get_input_par() {
+        if let Some(_input_par) = tiny_decoder.get_input_par() {
             let sec_num;
             {
                 let mutex_guard = self.current_video_frame_timestamp.lock().unwrap();
@@ -311,7 +316,6 @@ impl AppUi {
                 let a_time_base = tiny_decoder.get_audio_time_base();
                 let v_start_t = tiny_decoder.get_video_start_time();
                 let a_start_t = tiny_decoder.get_audio_start_time();
-                let end_flag = tiny_decoder.get_input_end_flag();
                 audio_player.sync_play_time(
                     a_start_t,
                     a_time_base as i64,
@@ -397,7 +401,7 @@ impl AppUi {
 
     fn paint_playpause_btn(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
-        if let Some(input_par) = tiny_decoder.get_input_par() {
+        if let Some(_input_par) = tiny_decoder.get_input_par() {
             let play_or_pause_image_source;
             if self.pause_flag {
                 play_or_pause_image_source = PLAY_IMG;
@@ -428,7 +432,7 @@ impl AppUi {
 
     fn paint_control_area(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
-        if let Some(input_par) = tiny_decoder.get_input_par() {
+        if let Some(_input_par) = tiny_decoder.get_input_par() {
             {
                 let mut mutex_guard = self.current_video_frame_timestamp.lock().unwrap();
                 let mut progress_slider = egui::Slider::new(

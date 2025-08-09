@@ -1,11 +1,17 @@
 use std::{
     path::Path,
+    ptr::{null, null_mut},
     sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
     thread::{self, sleep},
     time::Duration,
 };
 
 use ffmpeg_the_third::{
+    Stream,
+    codec::Id,
+    ffi::{
+        AVBufferRef, av_hwdevice_ctx_create, av_hwframe_transfer_data, avcodec_get_hw_config,
+    },
     format::{self, Pixel},
     media::Type,
 };
@@ -36,6 +42,7 @@ pub struct TinyDecoder {
     packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::packet::Packet>>>,
     frame_decode_thread_handler: Option<thread::JoinHandle<()>>,
     frame_decode_thread_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hardware_config: Arc<RwLock<bool>>,
 }
 impl TinyDecoder {
     pub fn new() -> Self {
@@ -68,6 +75,7 @@ impl TinyDecoder {
                 false,
             )),
             packet_cache_vec: std::sync::Arc::new(RwLock::new(vec![])),
+            hardware_config: Arc::new(RwLock::new(false)),
         };
     }
 
@@ -107,25 +115,24 @@ impl TinyDecoder {
         }
         self.end_video_ts = v_frames / fps as i64 * self.video_time_base as i64;
         warn!("video end ts:{}", self.end_video_ts);
-        let video_decoder_ctx =
-            ffmpeg_the_third::codec::Context::from_parameters(video_stream.parameters()).unwrap();
+        let video_decode_ctx = self.choose_decoder_with_hardware_prefer(&video_stream);
         let audio_decoder_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(audio_stream.parameters()).unwrap();
-        let video_decoder = video_decoder_ctx.decoder().video().unwrap();
         warn!(
             "video decoder width=={} height=={}",
-            video_decoder.width(),
-            video_decoder.height()
+            video_decode_ctx.width(),
+            video_decode_ctx.height()
         );
         self.converter_ctx = Some(
             ffmpeg_the_third::software::converter(
-                (video_decoder.width(), video_decoder.height()),
-                video_decoder.format(),
+                (video_decode_ctx.width(), video_decode_ctx.height()),
+                video_decode_ctx.format(),
                 Pixel::RGBA,
             )
             .unwrap(),
         );
-        self.video_frame_rect = [video_decoder.width(), video_decoder.height()];
+        warn!("video decode format{:#?}", video_decode_ctx.format());
+        self.video_frame_rect = [video_decode_ctx.width(), video_decode_ctx.height()];
         let audio_decoder = audio_decoder_ctx.decoder().audio().unwrap();
         self.resampler_ctx = Some(
             ffmpeg_the_third::software::resampler2(
@@ -144,7 +151,7 @@ impl TinyDecoder {
         );
         self.input_play_end_flag
             .store(false, std::sync::atomic::Ordering::Release);
-        self.video_decoder = Some(Arc::new(Mutex::new(video_decoder)));
+        self.video_decoder = Some(Arc::new(Mutex::new(video_decode_ctx)));
         self.audio_decoder = Some(Arc::new(Mutex::new(audio_decoder)));
         self.format_input = Some(Arc::new(Mutex::new(format_input)));
     }
@@ -261,9 +268,9 @@ impl TinyDecoder {
                 let mut rw_lock_guard = packet_cache_vec.write().unwrap();
                 let mut lock_guard = format_input.lock().unwrap();
                 match lock_guard.packets().next() {
-                    Some(Ok((stream, packet))) => rw_lock_guard.push(packet),
+                    Some(Ok((_stream, packet))) => rw_lock_guard.push(packet),
                     Some(Err(e)) => {
-                        if let ffmpeg_the_third::Error::Eof = e {
+                        if let ffmpeg_the_third::util::error::Error::Eof = e {
                             input_end_flag.store(true, std::sync::atomic::Ordering::Release);
                             warn!("set end flag !!!");
                         }
@@ -282,6 +289,7 @@ impl TinyDecoder {
         audio_frame_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::frame::Audio>>>,
         packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::packet::Packet>>>,
         frame_decode_thread_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        hardware_config: Arc<RwLock<bool>>,
     ) {
         loop {
             if frame_decode_thread_stop_flag.load(std::sync::atomic::Ordering::Acquire) {
@@ -321,13 +329,29 @@ impl TinyDecoder {
 
                         loop {
                             let mut video_frame_tmp = ffmpeg_the_third::frame::Video::empty();
-                            if let Err(e) = lock_guard.receive_frame(&mut video_frame_tmp) {
+                            if let Err(_e) = lock_guard.receive_frame(&mut video_frame_tmp) {
                                 break;
                             }
                             // warn!("decode video frame ts:{}",video_frame_tmp.timestamp().unwrap());
                             // warn!("decode video frame pts:{}",video_frame_tmp.pts().unwrap());
                             let mut rw_lock_write_guard1 = video_frame_cache_vec.write().unwrap();
-                            rw_lock_write_guard1.push(video_frame_tmp);
+                            if !*hardware_config.read().unwrap() {
+                                rw_lock_write_guard1.push(video_frame_tmp);
+                            } else {
+                                unsafe {
+                                    let mut transfered_frame =
+                                        ffmpeg_the_third::frame::Video::empty();
+                                    if 0 != av_hwframe_transfer_data(
+                                        transfered_frame.as_mut_ptr(),
+                                        video_frame_tmp.as_ptr(),
+                                        0,
+                                    ) {
+                                        warn!("hardware frame transfer to software frame err");
+                                    }
+                                    transfered_frame.set_pts(video_frame_tmp.pts());
+                                    rw_lock_write_guard1.push(transfered_frame);
+                                }
+                            }
                         }
                     }
                 } else if front_packet.stream() == *audio_stream_index.lock().unwrap() {
@@ -336,7 +360,7 @@ impl TinyDecoder {
                         lock_guard.send_packet(&front_packet).unwrap();
                         loop {
                             let mut audio_frame_tmp = ffmpeg_the_third::frame::Audio::empty();
-                            if let Err(e) = lock_guard.receive_frame(&mut audio_frame_tmp) {
+                            if let Err(_e) = lock_guard.receive_frame(&mut audio_frame_tmp) {
                                 break;
                             }
                             let mut rw_lock_write_guard1 = audio_frame_cache_vec.write().unwrap();
@@ -374,6 +398,7 @@ impl TinyDecoder {
         let audio_frame_cache_vec = self.audio_frame_cache_vec.clone();
         let packet_cache_vec = self.packet_cache_vec.clone();
         let frame_decode_thread_stop_flag = self.frame_decode_thread_stop_flag.clone();
+        let hardware_config = self.hardware_config.clone();
         self.frame_decode_thread_handler = Some(
             std::thread::Builder::new()
                 .name("decode thread".to_string())
@@ -387,6 +412,7 @@ impl TinyDecoder {
                         audio_frame_cache_vec,
                         packet_cache_vec,
                         frame_decode_thread_stop_flag,
+                        hardware_config,
                     );
                 })
                 .unwrap(),
@@ -422,6 +448,14 @@ impl TinyDecoder {
             if rw_lock_write_guard.len() > 0 {
                 let raw_frame = rw_lock_write_guard.remove(0);
                 let pts = raw_frame.pts().unwrap();
+                if raw_frame.format() != converter_ctx.input().format {
+                    *converter_ctx = ffmpeg_the_third::software::converter(
+                        (converter_ctx.input().width, converter_ctx.input().height),
+                        raw_frame.format(),
+                        Pixel::RGBA,
+                    )
+                    .unwrap();
+                }
                 converter_ctx.run(&raw_frame, &mut res).unwrap();
                 return_val = (Some(res), pts);
             }
@@ -434,17 +468,11 @@ impl TinyDecoder {
         }
         return Some(self.format_input.as_ref().unwrap().clone());
     }
-    pub fn get_resampler(&self) -> &ffmpeg_the_third::software::resampling::Context {
-        return self.resampler_ctx.as_ref().unwrap();
-    }
     pub fn get_video_time_base(&self) -> i32 {
         return self.video_time_base;
     }
     pub fn get_audio_time_base(&self) -> i32 {
         return self.audio_time_base;
-    }
-    pub fn get_video_frame_rate(&self) -> i32 {
-        return self.video_frame_rate;
     }
     pub fn get_total_video_time_formatted_string(&self) -> &String {
         return &self.total_video_time_formatted_string;
@@ -460,9 +488,6 @@ impl TinyDecoder {
     }
     pub fn get_end_video_ts(&self) -> i64 {
         return self.end_video_ts;
-    }
-    pub fn get_input_end_flag(&self) -> Arc<AtomicBool> {
-        return self.input_play_end_flag.clone();
     }
     pub fn seek_timestamp_to_decode(&self, ts: i64) {
         {
@@ -489,5 +514,42 @@ impl TinyDecoder {
                 }
             }
         }
+    }
+}
+impl TinyDecoder {
+    fn choose_decoder_with_hardware_prefer(
+        &mut self,
+        stream: &Stream<'_>,
+    ) -> ffmpeg_the_third::decoder::Video {
+        let codec_ctx =
+            ffmpeg_the_third::codec::Context::from_parameters(stream.parameters()).unwrap();
+        let mut decode_ctx = codec_ctx.decoder();
+        let codec_id = stream.parameters().id();
+        let decoder = ffmpeg_the_third::decoder::find(codec_id).unwrap();
+        let opened_decoder: ffmpeg_the_third::decoder::Video;
+        if codec_id.eq(&Id::H264) || codec_id.eq(&Id::H265) || codec_id.eq(&Id::HEVC) {
+            unsafe {
+                let mut hw_device_ctx: *mut AVBufferRef = null_mut();
+                if 0 != av_hwdevice_ctx_create(
+                    &mut hw_device_ctx as *mut *mut AVBufferRef,
+                    ffmpeg_the_third::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D12VA,
+                    null(),
+                    null_mut(),
+                    0,
+                ) {
+                    warn!("hw device create err");
+                }
+                (*decode_ctx.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
+                opened_decoder = decode_ctx.open_as(decoder).unwrap().video().unwrap();
+                let hw_config = avcodec_get_hw_config(opened_decoder.codec().unwrap().as_ptr(), 0);
+                if hw_config.is_null() {
+                    warn!("currently dont support hardware accelerate");
+                }
+                *self.hardware_config.write().unwrap() = true;
+            }
+        } else {
+            opened_decoder = decode_ctx.open_as(decoder).unwrap().video().unwrap();
+        }
+        opened_decoder
     }
 }
