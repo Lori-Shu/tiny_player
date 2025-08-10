@@ -2,7 +2,7 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
-#![deny(unused_variables)]
+#![deny(unused)]
 use log::{Level, info};
 
 mod appui;

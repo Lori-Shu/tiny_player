@@ -25,7 +25,7 @@ pub struct AppUi {
     video_texture_id: Option<TextureId>,
     tiny_decoder: Option<crate::decode::TinyDecoder>,
     audio_player: Option<crate::audio_play::AudioPlayer>,
-    current_video_frame_timestamp: Arc<Mutex<i64>>,
+    current_audio_frame_timestamp: Arc<Mutex<i64>>,
     color_image: Option<ColorImage>,
     frame_show_instant: Instant,
     pause_flag: bool,
@@ -44,14 +44,8 @@ impl eframe::App for AppUi {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
                 let now = Instant::now();
-                if self
-                    .tiny_decoder
-                    .as_ref()
-                    .unwrap()
-                    .get_input_par()
-                    .is_some()
-                {
-                    if self.video_texture_id.is_none() {
+                if let Some(_) = self.tiny_decoder.as_ref().unwrap().get_input_par() {
+                    if let None = self.video_texture_id {
                         self.create_or_change_color_image();
                         self.create_video_texture(ctx);
                         self.frame_show_instant = now;
@@ -67,61 +61,81 @@ impl eframe::App for AppUi {
                             .reason("video play")
                             .create()
                             .unwrap();
+                        self.audio_source_add();
+                        self.audio_pts_to_current_play_pts();
                         if now
                             .checked_duration_since(self.frame_show_instant.clone())
                             .is_some()
                         {
-                            let tiny_decoder = self.tiny_decoder.as_mut().unwrap();
-                            let (video_frame_opt, pts) =
-                                tiny_decoder.get_one_video_play_frame_and_pts();
-                            if video_frame_opt.is_some() {
-                                if let Some(detail) = &mut self.current_frame_detail {
+                            if self.check_video_wait_for_audio() {
+                                if let Some(tiny_decoder) = &mut self.tiny_decoder {
+                                    if let Some(v_frame) =
+                                        tiny_decoder.get_one_video_play_frame_and_pts()
                                     {
-                                        let mut lock_guard =
-                                            self.current_video_frame_timestamp.lock().unwrap();
-                                        (*lock_guard) = detail.pts;
-                                        self.frame_show_instant = self
-                                            .frame_show_instant
-                                            .checked_add(Duration::from_millis(
-                                                ((pts - detail.pts) * 1000
-                                                    / tiny_decoder.get_video_time_base() as i64)
-                                                    as u64,
-                                            ))
-                                            .unwrap();
-                                    }
+                                        if let Some(detail) = &mut self.current_frame_detail {
+                                            if let Ok(cur_au_ts) =
+                                                self.current_audio_frame_timestamp.lock()
+                                            {
+                                                if let Some(pts) = v_frame.pts() {
+                                                    if *cur_au_ts * 1000
+                                                        / tiny_decoder.get_audio_time_base() as i64
+                                                        - detail.pts * 1000
+                                                            / tiny_decoder.get_video_time_base()
+                                                                as i64
+                                                        > 100
+                                                    {
+                                                        self.frame_show_instant = now;
+                                                    } else if let Some(ins) = self
+                                                        .frame_show_instant
+                                                        .checked_add(Duration::from_millis(
+                                                            ((pts - detail.pts) * 1000
+                                                                / tiny_decoder.get_video_time_base()
+                                                                    as i64)
+                                                                as u64,
+                                                        ))
+                                                    {
+                                                        self.frame_show_instant = ins;
+                                                    }
+                                                    detail.pts = pts;
+                                                    detail.frame = v_frame;
+                                                }
 
-                                    self.color_image
-                                        .as_mut()
-                                        .unwrap()
-                                        .as_raw_mut()
-                                        .copy_from_slice(detail.frame.data(0));
-                                    ctx.tex_manager().write().set(
-                                        self.video_texture_id.as_ref().unwrap().clone(),
-                                        ImageDelta::full(
-                                            ImageData::Color(Arc::new(
-                                                self.color_image.as_ref().unwrap().clone(),
-                                            )),
-                                            TextureOptions::LINEAR,
-                                        ),
-                                    );
-                                    detail.frame = video_frame_opt.unwrap();
-                                    detail.pts = pts;
-                                } else {
-                                    self.current_frame_detail = Some(CurrentVideoFrameDetail {
-                                        frame: video_frame_opt.unwrap(),
-                                        pts: pts,
-                                    });
+                                                if let Some(c_img) = &mut self.color_image {
+                                                    c_img
+                                                        .as_raw_mut()
+                                                        .copy_from_slice(detail.frame.data(0));
+                                                    if let Some(v_tex) = &self.video_texture_id {
+                                                        ctx.tex_manager().write().set(
+                                                            v_tex.clone(),
+                                                            ImageDelta::full(
+                                                                ImageData::Color(Arc::new(
+                                                                    c_img.clone(),
+                                                                )),
+                                                                TextureOptions::LINEAR,
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            if let Some(pts) = v_frame.pts() {
+                                                self.current_frame_detail =
+                                                    Some(CurrentVideoFrameDetail {
+                                                        frame: v_frame,
+                                                        pts: pts,
+                                                    });
+                                            }
+                                        }
+                                    }
                                 }
+                            } else {
+                                self.frame_show_instant = now;
                             }
                         }
                         if self.check_play_is_at_endtail() {
                             self.pause_flag = true;
                         }
-                        let pts = {
-                            let mutex_guard = self.current_video_frame_timestamp.lock().unwrap();
-                            *mutex_guard
-                        };
-                        self.audio_source_add_and_sync(pts);
+
                         self.paint_video_image(ctx, ui);
                     } else {
                         /*
@@ -221,7 +235,7 @@ impl AppUi {
             video_texture_id: None,
             tiny_decoder: None,
             audio_player: None,
-            current_video_frame_timestamp: Arc::new(Mutex::new(0)),
+            current_audio_frame_timestamp: Arc::new(Mutex::new(0)),
             play_time: time::Time::from_hms(0, 0, 0).unwrap(),
             color_image: None,
             frame_show_instant: Instant::now(),
@@ -262,24 +276,23 @@ impl AppUi {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
         if let Some(_input_par) = tiny_decoder.get_input_par() {
             let sec_num;
-            {
-                let mutex_guard = self.current_video_frame_timestamp.lock().unwrap();
-                sec_num = *mutex_guard / tiny_decoder.get_video_time_base() as i64;
-            }
+            if let Ok(play_ts) = self.current_audio_frame_timestamp.lock() {
+                sec_num = *play_ts / tiny_decoder.get_audio_time_base() as i64;
 
-            let sec = (sec_num % 60) as u8;
-            let min_num = sec_num / 60;
-            let min = (min_num % 60) as u8;
-            let hour_num = min_num / 60;
-            let hour = hour_num as u8;
-            let time = time::Time::from_hms(hour, min, sec).unwrap();
-            if !time.eq(&self.play_time) {
-                let formatter = format_description::parse("[hour]:[minute]:[second]").unwrap();
-                let mut now_str = time.format(&formatter).unwrap();
-                now_str.push_str("|");
-                now_str.push_str(tiny_decoder.get_total_video_time_formatted_string());
-                self.time_text = now_str;
-                self.play_time = time;
+                let sec = (sec_num % 60) as u8;
+                let min_num = sec_num / 60;
+                let min = (min_num % 60) as u8;
+                let hour_num = min_num / 60;
+                let hour = hour_num as u8;
+                let time = time::Time::from_hms(hour, min, sec).unwrap();
+                if !time.eq(&self.play_time) {
+                    let formatter = format_description::parse("[hour]:[minute]:[second]").unwrap();
+                    let mut now_str = time.format(&formatter).unwrap();
+                    now_str.push_str("|");
+                    now_str.push_str(tiny_decoder.get_total_video_time_formatted_string());
+                    self.time_text = now_str;
+                    self.play_time = time;
+                }
             }
         }
     }
@@ -306,25 +319,10 @@ impl AppUi {
         self.video_texture_id = Some(id);
     }
 
-    fn audio_source_add_and_sync(&mut self, video_pts: i64) {
+    fn audio_source_add(&mut self) {
         /*
-        add audio frame data to the audio player and sync with video frame time
+        add audio frame data to the audio player
          */
-        if let Some(audio_player) = &mut self.audio_player {
-            if let Some(tiny_decoder) = &mut self.tiny_decoder {
-                let v_time_base = tiny_decoder.get_video_time_base();
-                let a_time_base = tiny_decoder.get_audio_time_base();
-                let v_start_t = tiny_decoder.get_video_start_time();
-                let a_start_t = tiny_decoder.get_audio_start_time();
-                audio_player.sync_play_time(
-                    a_start_t,
-                    a_time_base as i64,
-                    v_start_t,
-                    v_time_base as i64,
-                    video_pts,
-                );
-            }
-        }
         loop {
             if self.check_play_is_at_endtail() {
                 break;
@@ -332,13 +330,11 @@ impl AppUi {
             if let Some(audio_player) = &mut self.audio_player {
                 if let Some(tiny_decoder) = &mut self.tiny_decoder {
                     if audio_player.len() < 10 {
-                        let (audio_frame_opt, pts) =
-                            tiny_decoder.get_one_audio_play_frame_and_pts();
-                        if audio_frame_opt.is_some() {
-                            audio_player.set_pts(pts);
-                            audio_player.play_raw_data_from_audio_frame(audio_frame_opt.unwrap());
-                        } else if audio_player.len() > 8 {
-                            break;
+                        if let Some(audio_frame) = tiny_decoder.get_one_audio_play_frame_and_pts() {
+                            if let Some(pts) = audio_frame.pts() {
+                                audio_player.set_pts(pts);
+                            }
+                            audio_player.play_raw_data_from_audio_frame(audio_frame);
                         }
                     } else {
                         break;
@@ -376,7 +372,6 @@ impl AppUi {
             if let Some(path) = rfd::FileDialog::new().pick_file().filter(|f| {
                 f.display().to_string().ends_with(".mp4")
                     || f.display().to_string().ends_with(".mkv")
-                    || f.display().to_string().ends_with(".ts")
             }) {
                 warn!("filepath{}", path.display().to_string());
                 let tiny_decoder = self.tiny_decoder.as_mut().unwrap();
@@ -388,9 +383,12 @@ impl AppUi {
                     self.pause_flag = true;
                     tiny_decoder.change_file_path_and_init_par(&path);
                     self.create_or_change_color_image();
-                    let mut mutex_guard = self.current_video_frame_timestamp.lock().unwrap();
-                    *mutex_guard = 0;
-                    self.audio_player.as_mut().unwrap().set_pts(0);
+                    if let Ok(mut mutex_guard) = self.current_audio_frame_timestamp.lock() {
+                        *mutex_guard = 0;
+                    }
+                    if let Some(au_pl) = &mut self.audio_player {
+                        au_pl.source_queue_skip_to_end();
+                    }
                 }
             } else {
                 self.err_window_msg = "please choose a valid file !!!".to_string();
@@ -433,11 +431,10 @@ impl AppUi {
     fn paint_control_area(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
         if let Some(_input_par) = tiny_decoder.get_input_par() {
-            {
-                let mut mutex_guard = self.current_video_frame_timestamp.lock().unwrap();
+            if let Ok(mut timestamp) = self.current_audio_frame_timestamp.lock() {
                 let mut progress_slider = egui::Slider::new(
-                    &mut *mutex_guard,
-                    RangeInclusive::new(0, tiny_decoder.get_end_video_ts()),
+                    &mut *timestamp,
+                    RangeInclusive::new(0, tiny_decoder.get_end_audio_ts()),
                 );
                 progress_slider = progress_slider.show_value(false);
                 progress_slider = progress_slider.text(WidgetText::RichText(Arc::new(
@@ -458,10 +455,9 @@ impl AppUi {
                     warn!("slider dragged!");
                     let audio_player = self.audio_player.as_mut().unwrap();
                     audio_player.source_queue_skip_to_end();
-                    audio_player.set_pts(0);
                     self.frame_show_instant = now.clone();
                     self.current_frame_detail = None;
-                    tiny_decoder.seek_timestamp_to_decode(*mutex_guard);
+                    tiny_decoder.seek_timestamp_to_decode(*timestamp);
                 }
             }
             let mut volumn_img = egui::Image::new(VOLUMN_IMG);
@@ -503,14 +499,45 @@ impl AppUi {
         });
     }
     fn check_play_is_at_endtail(&self) -> bool {
-        {
-            if let Some(tiny_decoder) = &self.tiny_decoder {
-                let pts = self.current_video_frame_timestamp.lock().unwrap();
-                *pts / tiny_decoder.get_video_time_base() as i64 + 1
-                    >= tiny_decoder.get_end_video_ts() / tiny_decoder.get_video_time_base() as i64
+        if let Some(tiny_decoder) = &self.tiny_decoder {
+            if let Ok(pts) = self.current_audio_frame_timestamp.lock() {
+                *pts / tiny_decoder.get_audio_time_base() as i64 + 1
+                    >= tiny_decoder.get_end_audio_ts() / tiny_decoder.get_audio_time_base() as i64
             } else {
                 false
             }
+        } else {
+            false
         }
+    }
+
+    fn audio_pts_to_current_play_pts(&self) {
+        if let Some(audio_player) = &self.audio_player {
+            let pts = audio_player.get_last_source_pts();
+            {
+                if let Ok(mut cur_pts) = self.current_audio_frame_timestamp.lock() {
+                    *cur_pts = pts;
+                }
+            }
+        }
+    }
+
+    fn check_video_wait_for_audio(&self) -> bool {
+        if let Some(tiny_decoder) = &self.tiny_decoder {
+            if let Some(detail) = &self.current_frame_detail {
+                if let Ok(timestamp) = self.current_audio_frame_timestamp.lock() {
+                    if detail.pts * 1000 / tiny_decoder.get_video_time_base() as i64
+                        > *timestamp * 1000 / tiny_decoder.get_audio_time_base() as i64
+                    {
+                        return false;
+                    } else {
+                        return true;
+                    }
+                }
+            } else {
+                return true;
+            }
+        }
+        false
     }
 }
