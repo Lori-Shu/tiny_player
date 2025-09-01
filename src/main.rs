@@ -3,24 +3,25 @@
     windows_subsystem = "windows"
 )]
 #![deny(unused)]
-use log::{Level, info};
+use log::{warn, Level};
 
 mod appui;
+mod asyncmod;
 mod audio_play;
 mod decode;
 fn main() {
     simple_logger::init_with_level(Level::Warn).unwrap();
-    info!("logger init and app banner!!-------------==========");
-    let mut tiny_app_ui = appui::AppUi::new();
-    tiny_app_ui.init_appui_and_resources();
-    let options = eframe::NativeOptions::default();
+    warn!("logger init and app banner!!-------------==========");
+    let tiny_app_ui = appui::AppUi::new();
+    let mut options = eframe::NativeOptions::default();
+    options.renderer=eframe::Renderer::Wgpu;
     eframe::run_native(
         "tiny player",
         options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             tiny_app_ui.replace_fonts(&cc.egui_ctx);
-            return Ok(Box::new(tiny_app_ui));
+            Ok(Box::new(tiny_app_ui))
         }),
     )
     .unwrap();

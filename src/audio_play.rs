@@ -7,20 +7,19 @@ pub struct AudioPlayer {
 }
 impl AudioPlayer {
     pub fn new() -> Self {
-        return Self {
+        let mut sel = Self {
             pts_vec: vec![],
             current_volumn: 1.0,
             stream: None,
             handle: None,
             sink: None,
         };
-    }
-    pub fn init_device(&mut self) {
         let (stream, handle) = rodio::OutputStream::try_default().unwrap();
         let sink = rodio::Sink::try_new(&handle).unwrap();
-        self.sink = Some(sink);
-        self.handle = Some(handle);
-        self.stream = Some(stream);
+        sel.sink = Some(sink);
+        sel.handle = Some(handle);
+        sel.stream = Some(stream);
+        sel
     }
     pub fn play_raw_data_from_audio_frame(&self, audio_frame: ffmpeg_the_third::frame::Audio) {
         let audio_data: &[i16] = bytemuck::cast_slice(audio_frame.data(0));
@@ -56,8 +55,12 @@ impl AudioPlayer {
         }
         self.pts_vec.push(pts);
     }
-    pub fn get_last_source_pts(&self) -> i64 {
-        self.pts_vec[self.pts_vec.len() - 1]
+    pub fn get_last_source_pts(&self) -> Result<i64, String> {
+        if self.pts_vec.len() > 0 {
+            return Ok(self.pts_vec[self.pts_vec.len() - 1]);
+        } else {
+            return Err("audio source len is 0".to_string());
+        }
     }
     pub fn len(&self) -> usize {
         self.sink.as_ref().unwrap().len()
