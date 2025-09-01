@@ -1,4 +1,4 @@
 /target
 /tiny_installer
-./Cargo.lock
-./debug.log
+Cargo.lock
+debug.log
