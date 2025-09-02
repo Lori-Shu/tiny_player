@@ -17,4 +17,9 @@ fn main() {
         fs::copy(dll, resource_dest).unwrap();
         fs::copy(dll, target_debug_dest).unwrap();
     }
+    if std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap() == "windows" {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("resources/desktop_icon.ico");
+        res.compile().unwrap();
+    }
 }

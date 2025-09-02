@@ -3,8 +3,12 @@
     windows_subsystem = "windows"
 )]
 #![deny(unused)]
-use log::{warn, Level};
 
+use std::sync::Arc;
+
+use egui::{IconData, ImageSource, include_image};
+use log::{Level, warn};
+const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
 mod appui;
 mod asyncmod;
 mod audio_play;
@@ -14,7 +18,17 @@ fn main() {
     warn!("logger init and app banner!!-------------==========");
     let tiny_app_ui = appui::AppUi::new();
     let mut options = eframe::NativeOptions::default();
-    options.renderer=eframe::Renderer::Wgpu;
+    options.renderer = eframe::Renderer::Wgpu;
+    if let ImageSource::Bytes { bytes, .. } = WINDOW_ICON {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            options.viewport.icon = Some(Arc::new(IconData {
+                width: img.width(),
+                height: img.height(),
+                rgba: img.as_bytes().to_vec(),
+            }));
+        }
+    }
+
     eframe::run_native(
         "tiny player",
         options,

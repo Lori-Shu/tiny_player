@@ -9,7 +9,8 @@ use std::{
 use egui::{
     Color32, ColorImage, Context, CornerRadius, ImageData, ImageSource, Pos2, Rect, RichText,
     TextureId, TextureOptions, Ui, Vec2, Vec2b, ViewportBuilder, ViewportId, WidgetText,
-    epaint::ImageDelta, include_image,
+    epaint::ImageDelta,
+    include_image,
 };
 
 use image::DynamicImage;
@@ -21,8 +22,8 @@ use crate::asyncmod::{AsyncContext, SocketChatMessage};
 
 const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
 const VOLUMN_IMG: ImageSource = include_image!("../resources/volumn_img.png");
-const PLAY_IMG: ImageSource = include_image!("../resources/play_img.png");
-const PAUSE_IMG: ImageSource = include_image!("../resources/pause_img.png");
+const PLAY_IMG: ImageSource = include_image!("../resources/youtube-1718976_1920.png");
+const PAUSE_IMG: ImageSource = include_image!("../resources/pause-97625_1920.png");
 const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.png");
 const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png");
 const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
@@ -37,7 +38,7 @@ pub struct AppUi {
     audio_player: Option<crate::audio_play::AudioPlayer>,
     current_audio_frame_timestamp: Arc<RwLock<i64>>,
     main_color_image: Option<ColorImage>,
-    bg_dyn_img:DynamicImage,
+    bg_dyn_img: DynamicImage,
     frame_show_instant: Instant,
     pause_flag: bool,
     play_time: time::Time,
@@ -194,7 +195,7 @@ impl eframe::App for AppUi {
                     });
                 });
 
-                ui.add_space(ctx.screen_rect().height() / 2.0 - 300.0);
+                ui.add_space(ctx.screen_rect().height() / 2.0 - 200.0);
                 ui.horizontal(|ui| {
                     self.paint_playpause_btn(ui, ctx, &now);
                 });
@@ -212,6 +213,16 @@ impl eframe::App for AppUi {
                         volumn_slider = volumn_slider.show_value(false);
                         let mut slider_style = egui::style::Style::default();
                         slider_style.spacing.slider_width = 150.0;
+                        slider_style.spacing.slider_rail_height = 10.0;
+                        slider_style.spacing.interact_size = Vec2::new(20.0, 20.0);
+                        slider_style.visuals.extreme_bg_color =
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                        slider_style.visuals.selection.bg_fill =
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                        slider_style.visuals.widgets.active.bg_fill =
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                        slider_style.visuals.widgets.inactive.bg_fill =
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 100);
                         ui.set_style(slider_style);
                         let mut slider_response = ui.add(volumn_slider);
                         slider_response = slider_response
@@ -289,8 +300,8 @@ impl AppUi {
         };
         let async_ctx = AsyncContext::new();
         let f_dialog = egui_file::FileDialog::open_file(None);
-        let (color_image,dyn_img) = {
-            if let ImageSource::Bytes {  bytes,.. } = DEFAULT_BG_IMG {
+        let (color_image, dyn_img) = {
+            if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
                 if let Ok(dynimg) = image::load_from_memory(&bytes) {
                     (
                         ColorImage::from_rgba_unmultiplied(
@@ -306,6 +317,7 @@ impl AppUi {
                 panic!();
             }
         };
+
         let mut sel = Self {
             video_texture_id: None,
             tiny_decoder: None,
@@ -430,13 +442,18 @@ impl AppUi {
     }
 
     fn paint_file_btn(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
-        let video_file_image = egui::Image::new(VIDEO_FILE_IMG);
-        let mut file_image_button = egui::ImageButton::new(video_file_image).frame(false);
-        file_image_button = file_image_button.corner_radius(CornerRadius::from(40));
+        let file_image_button = egui::ImageButton::new(VIDEO_FILE_IMG)
+            .frame(false)
+            .corner_radius(CornerRadius::from(100));
         let file_img_btn_response = ui.add_sized(Vec2::new(100.0, 100.0), file_image_button);
         if file_img_btn_response.hovered() {
             self.control_ui_flag = true;
             self.last_show_control_ui_instant = now.clone();
+        }
+        if file_img_btn_response.clicked() {
+            if let Some(dialog) = &mut self.open_file_dialog {
+                dialog.open();
+            }
         }
         if self.err_window_flag {
             egui::Window::new("err window")
@@ -462,11 +479,6 @@ impl AppUi {
             }
         }
 
-        if file_img_btn_response.clicked() {
-            if let Some(dialog) = &mut self.open_file_dialog {
-                dialog.open();
-            }
-        }
         if let Some(path) = self.opened_file.take() {
             if path.display().to_string().ends_with(".mp4")
                 || path.display().to_string().ends_with(".mkv")
@@ -516,12 +528,13 @@ impl AppUi {
             } else {
                 play_or_pause_image_source = PAUSE_IMG;
             }
-            let mut play_or_pause_image = egui::Image::new(play_or_pause_image_source);
-            play_or_pause_image = play_or_pause_image.corner_radius(50.0);
-            let play_or_pause_btn = egui::ImageButton::new(play_or_pause_image).frame(false);
+
+            let play_or_pause_btn = egui::ImageButton::new(play_or_pause_image_source)
+                .corner_radius(100.0)
+                .frame(false);
 
             ui.add_space(ctx.screen_rect().width() / 2.0 - 100.0);
-            let btn_response = ui.add_sized(Vec2::new(200.0, 200.0), play_or_pause_btn);
+            let btn_response = ui.add_sized(Vec2::new(100.0, 100.0), play_or_pause_btn);
             if btn_response.hovered() {
                 self.control_ui_flag = true;
                 self.last_show_control_ui_instant = now.clone();
@@ -542,19 +555,28 @@ impl AppUi {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
         if let Some(_input_par) = tiny_decoder.get_input_par() {
             if let Ok(mut timestamp) = self.current_audio_frame_timestamp.write() {
-                let mut progress_slider = egui::Slider::new(
+                let progress_slider = egui::Slider::new(
                     &mut *timestamp,
                     RangeInclusive::new(0, tiny_decoder.get_end_audio_ts()),
-                );
-                progress_slider = progress_slider.show_value(false);
-                progress_slider = progress_slider.text(WidgetText::RichText(Arc::new(
+                )
+                .show_value(false)
+                .text(WidgetText::RichText(Arc::new(
                     RichText::new(self.time_text.clone())
                         .size(20.0)
-                        .color(Color32::BROWN),
+                        .color(Color32::ORANGE),
                 )));
                 let mut slider_width_style = egui::style::Style::default();
                 slider_width_style.spacing.slider_width = ctx.screen_rect().width() - 350.0;
                 slider_width_style.spacing.slider_rail_height = 10.0;
+                slider_width_style.spacing.interact_size = Vec2::new(20.0, 20.0);
+                slider_width_style.visuals.extreme_bg_color =
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                slider_width_style.visuals.selection.bg_fill =
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                slider_width_style.visuals.widgets.active.bg_fill =
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                slider_width_style.visuals.widgets.inactive.bg_fill =
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
                 ui.set_style(slider_width_style);
                 let slider_response = ui.add(progress_slider);
                 if slider_response.hovered() {
