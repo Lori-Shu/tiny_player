@@ -5,13 +5,11 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
 };
 use log::{error, warn};
-use reqwest::{Client, Method, StatusCode, Url};
+use reqwest::{Client, Method, Url};
+use reqwest_websocket::{Bytes, Message, RequestBuilderExt, WebSocket};
 use serde::{Deserialize, Serialize};
 use tokio::{runtime::Runtime, sync::RwLock, time::sleep};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{ClientRequestBuilder, Message, client::IntoClientRequest, http::Uri},
-};
+
 enum ServerApi {
     Login,
     ChatMsg,
@@ -54,10 +52,11 @@ impl AsyncContext {
             let rt = Arc::new(runtime);
             let req_man = Arc::new(RequestManager::new());
             let rt_cloned = rt.clone();
+            let req_client = req_man.get_client().clone();
             let s = Self {
                 async_runtime: rt_cloned,
                 request_manager: req_man,
-                websocket_manager: Arc::new(WebSocketManager::new()),
+                websocket_manager: Arc::new(WebSocketManager::new(req_client)),
                 online_flag: false,
                 user_detail: None,
                 chat_msg_vec: Arc::new(RwLock::new(Vec::new())),
@@ -88,7 +87,7 @@ impl AsyncContext {
     pub fn get_online_flag(&self) -> bool {
         self.online_flag
     }
-    pub fn login_server(&mut self,username:String) {
+    pub fn login_server(&mut self, username: String) {
         let request_manager = self.request_manager.clone();
         self.user_detail = Some(self.async_runtime.block_on(async move {
             if let Ok(user_detail) = request_manager.login(username).await {
@@ -116,7 +115,7 @@ impl AsyncContext {
     }
     pub fn ws_send_chat_msg(&self, message: SocketChatMessage) {
         let manager = self.websocket_manager.clone();
-        self.async_runtime.block_on(async move {
+        self.async_runtime.spawn(async move {
             manager.send_msg(message).await;
         });
     }
@@ -126,6 +125,12 @@ impl AsyncContext {
         } else {
             panic!("you are offline!");
         }
+    }
+}
+
+impl Default for AsyncContext {
+    fn default() -> Self {
+        Self::new()
     }
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -140,9 +145,12 @@ pub struct RequestManager {
 impl RequestManager {
     pub fn new() -> Self {
         let s = Self {
-            client: Arc::new(Client::new()),
+            client: Arc::new(Client::default()),
         };
         s
+    }
+    pub fn get_client(&self) -> &Arc<Client> {
+        &self.client
     }
 
     async fn execute_req(&self, method: Method, url: Url) -> Result<String, String> {
@@ -160,7 +168,7 @@ impl RequestManager {
             Err("req err".to_string())
         }
     }
-    async fn login(&self,username:String) -> Result<UserDetail, String> {
+    async fn login(&self, username: String) -> Result<UserDetail, String> {
         if let Ok(response) = self
             .client
             .post(ServerApi::get_url_from_server_api(ServerApi::Login))
@@ -210,16 +218,17 @@ impl SocketChatMessage {
         &self.msg
     }
 }
+
 struct WebSocketManager {
-    chat_socket_sink: Arc<
-        RwLock<Option<SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>>>,
-    >,
-    chat_socket_stream:
-        Arc<RwLock<Option<SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>>>>,
+    client: Arc<Client>,
+    chat_socket_sink: Arc<RwLock<Option<SplitSink<WebSocket, Message>>>>,
+    chat_socket_stream: Arc<RwLock<Option<SplitStream<WebSocket>>>>,
 }
+
 impl WebSocketManager {
-    pub fn new() -> Self {
+    pub fn new(client: Arc<Client>) -> Self {
         Self {
+            client: client,
             chat_socket_sink: Arc::new(RwLock::new(None)),
             chat_socket_stream: Arc::new(RwLock::new(None)),
         }
@@ -230,47 +239,44 @@ impl WebSocketManager {
         msg_vec: Arc<RwLock<Vec<SocketChatMessage>>>,
     ) {
         let url = ServerApi::get_url_from_server_api(ServerApi::ChatMsg);
-        if let Ok(uri) = Uri::from_str(url.as_str()) {
-            warn!("connect uri{:?}", uri);
-            if let Ok(client_request) = ClientRequestBuilder::new(uri).into_client_request() {
-                if let Ok((ws, res)) = connect_async(client_request).await {
-                    if res.status() == StatusCode::SWITCHING_PROTOCOLS {
-                        let (mut sink, stream) = ws.split();
-                        let msg_str = format!("user {:?} is now online", user_detail.username);
-                        let msg = SocketChatMessage::new(
-                            user_detail.id.clone(),
-                            user_detail.username.clone(),
-                            "server".to_string(),
-                            msg_str,
-                        );
-                        if let Ok(json_msg) = serde_json::to_string(&msg) {
-                            if let Ok(_) = sink
-                                .send(tokio_tungstenite::tungstenite::Message::binary(json_msg))
-                                .await
-                            {
-                                warn!("连接到chat服务");
-                                {
-                                    let mut chat_sink = self.chat_socket_sink.write().await;
-                                    *chat_sink = Some(sink);
-                                    let mut chat_stream = self.chat_socket_stream.write().await;
-                                    *chat_stream = Some(stream);
-                                }
-                                self.watch_server_chat_msg(msg_vec).await;
-                            }
-                        } else {
-                            error!("json serialize err");
+        warn!("url to connect websocket{}", url.as_str());
+        if let Ok(res) = self
+            .client
+            .get("ws://127.0.0.1:8536/player/chat")
+            .upgrade()
+            .send()
+            .await
+        {
+            let web_socket = res.into_websocket().await;
+            if let Ok(mut ws) = web_socket {
+                let msg_str = format!("user {:?} is now online", user_detail.username);
+                let msg = SocketChatMessage::new(
+                    user_detail.id.clone(),
+                    user_detail.username.clone(),
+                    "server".to_string(),
+                    msg_str,
+                );
+                if let Ok(json_msg) = serde_json::to_string(&msg) {
+                    if let Ok(_) = ws
+                        .send(reqwest_websocket::Message::Binary(Bytes::copy_from_slice(
+                            json_msg.as_bytes(),
+                        )))
+                        .await
+                    {
+                        warn!("连接到chat服务");
+                        {
+                            let (sink, stream) = ws.split();
+                            *self.chat_socket_sink.write().await = Some(sink);
+                            *self.chat_socket_stream.write().await = Some(stream);
                         }
-                    } else {
-                        warn!("statuscode{:?}", res.status());
+                        self.watch_server_chat_msg(msg_vec).await;
                     }
-                } else {
-                    panic!()
                 }
-            } else {
-                panic!();
+            } else if let Err(e) = web_socket {
+                error!("connect server err{:?}", e);
             }
         } else {
-            panic!();
+            warn!("into websocket res err");
         }
     }
     async fn watch_server_chat_msg(&self, msg_vec: Arc<RwLock<Vec<SocketChatMessage>>>) {
@@ -280,12 +286,13 @@ impl WebSocketManager {
                 let mut sock = self.chat_socket_stream.write().await;
                 if let Some(sock) = &mut *sock {
                     if let Some(Ok(msg)) = sock.next().await {
-                        let bytes = msg.into_data();
-                        if let Ok(msg) = serde_json::from_slice::<'_, SocketChatMessage>(
-                            bytes.to_vec().as_slice(),
-                        ) {
-                            let mut v = msg_vec.write().await;
-                            v.push(msg);
+                        if let reqwest_websocket::Message::Binary(bytes) = msg {
+                            if let Ok(msg) = serde_json::from_slice::<'_, SocketChatMessage>(
+                                bytes.to_vec().as_slice(),
+                            ) {
+                                let mut v = msg_vec.write().await;
+                                v.push(msg);
+                            }
                         }
                     }
                 }
@@ -293,16 +300,18 @@ impl WebSocketManager {
         }
     }
     async fn send_msg(&self, message: SocketChatMessage) {
-        warn!("before write sink");
-        let mut sink = self.chat_socket_sink.write().await;
-        if let Some(socket) = &mut *sink {
+        warn!("before write ws");
+        let mut ws = self.chat_socket_sink.write().await;
+        if let Some(socket) = &mut *ws {
             if let Ok(bin) = serde_json::to_vec(&message) {
                 warn!("before send message");
-                let send_res=socket.send(Message::binary(bin)).await;
+                let send_res = socket
+                    .send(reqwest_websocket::Message::Binary(Bytes::from_owner(bin)))
+                    .await;
                 if let Ok(_) = send_res {
                     warn!("send msg success");
-                } else if let Err(e) = send_res{
-                    panic!("send bin err{:?}",e);
+                } else if let Err(e) = send_res {
+                    panic!("send bin err{:?}", e);
                 }
             } else {
                 panic!("deserialize err");

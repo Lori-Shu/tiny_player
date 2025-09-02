@@ -9,8 +9,7 @@ use std::{
 use egui::{
     Color32, ColorImage, Context, CornerRadius, ImageData, ImageSource, Pos2, Rect, RichText,
     TextureId, TextureOptions, Ui, Vec2, Vec2b, ViewportBuilder, ViewportId, WidgetText,
-    epaint::ImageDelta,
-    include_image,
+    epaint::ImageDelta, include_image,
 };
 
 use image::DynamicImage;
@@ -71,6 +70,11 @@ impl eframe::App for AppUi {
                     self.frame_show_instant = now;
                 }
                 if let Some(_input) = self.tiny_decoder.as_ref().unwrap().get_input_par() {
+                    ctx.input(|s| {
+                        if s.key_released(egui::Key::Space) {
+                            self.pause_flag = !self.pause_flag;
+                        }
+                    });
                     if !self.pause_flag {
                         /*
                         if now is next_frame_time or a little beyond get and show a new frame
@@ -182,7 +186,7 @@ impl eframe::App for AppUi {
 
                  */
                 self.paint_video_image(ctx, ui);
-                self.paint_frame_rate_text(ui, ctx, &now);
+                self.paint_frame_info_text(ui, ctx, &now);
                 if self.control_ui_flag {
                     ui.set_opacity(1.0);
                 } else {
@@ -617,11 +621,11 @@ impl AppUi {
         }
     }
 
-    fn paint_frame_rate_text(&self, ui: &mut Ui, ctx: &Context, now: &Instant) {
+    fn paint_frame_info_text(&self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         ui.horizontal(|ui| {
             let app_sec = (*now - self.app_start_instant).as_secs();
             if app_sec > 0 {
-                let mut text_str = "帧率fps：".to_string();
+                let mut text_str = "fps：".to_string();
                 text_str.push_str((ctx.cumulative_frame_nr() / app_sec).to_string().as_str());
                 let rich_text = egui::RichText::new(text_str)
                     .color(Color32::ORANGE)
@@ -629,7 +633,7 @@ impl AppUi {
                 let fps_button = egui::Button::new(rich_text).frame(false);
                 ui.add(fps_button);
             }
-            let mut date_time_str = "日期时间：".to_string();
+            let mut date_time_str = "date-time：".to_string();
             if let Ok(formatter) =
                 time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
             {

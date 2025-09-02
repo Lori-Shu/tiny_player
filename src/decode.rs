@@ -16,13 +16,13 @@ use ffmpeg_the_third::{
 use log::warn;
 use time::format_description;
 pub struct ManualProtectedInput(ffmpeg_the_third::format::context::Input);
-unsafe impl Send for ManualProtectedInput {}
+
 unsafe impl Sync for ManualProtectedInput {}
 pub struct ManualProtectedVideoDecoder(ffmpeg_the_third::decoder::Video);
-unsafe impl Send for ManualProtectedVideoDecoder {}
+
 unsafe impl Sync for ManualProtectedVideoDecoder {}
 pub struct ManualProtectedAudioDecoder(ffmpeg_the_third::decoder::Audio);
-unsafe impl Send for ManualProtectedAudioDecoder {}
+
 unsafe impl Sync for ManualProtectedAudioDecoder {}
 pub struct TinyDecoder {
     video_stream_index: Arc<RwLock<usize>>,

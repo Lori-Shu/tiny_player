@@ -18,3 +18,5 @@ core feature based on project
 7. click the play button
 8. control the video by the control widges
 9. the network part is in developing dont use it unless you want the app to crash 😂
+# Running shortcut
+![project_show_image](resources/project_show_img.png) 

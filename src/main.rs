@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use egui::{IconData, ImageSource, include_image};
+use egui::{include_image, IconData, ImageSource, Vec2};
 use log::{Level, warn};
 const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
 mod appui;
@@ -28,6 +28,8 @@ fn main() {
             }));
         }
     }
+    options.centered=true;
+    options.viewport.inner_size=Some(Vec2::new(1280.0, 720.0));
 
     eframe::run_native(
         "tiny player",
