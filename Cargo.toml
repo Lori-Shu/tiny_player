@@ -10,11 +10,11 @@ authors=["Lori-Shu"]
 ffmpeg-the-third = "3.0.2"
 rodio="0.20.1"
 bytemuck = "1.22.0"
-egui_extras = {version="0.32.1",features = ["all_loaders"]}
+egui_extras = {version="0.32.2",features = ["all_loaders"]}
 image = {version="0.25.6",features = ["jpeg","png"]}
 wgpu = { version = "25.0.2", default-features = false, features = ["vulkan"] }
-eframe = {version="0.32.1",features = ["wgpu"]}
-egui = "0.32.1"
+eframe = {version="0.32.2",features = ["wgpu"]}
+egui = "0.32.2"
 egui_file = "0.23.1"
 simple_logger = "5.0.0"
 log = "0.4.27"

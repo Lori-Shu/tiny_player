@@ -6,13 +6,14 @@
 
 use std::sync::Arc;
 
-use egui::{include_image, IconData, ImageSource, Vec2};
+use egui::{IconData, ImageSource, Vec2, include_image};
 use log::{Level, warn};
 const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
 mod appui;
 mod asyncmod;
 mod audio_play;
 mod decode;
+/// main fun init log, init main ui type Appui
 fn main() {
     simple_logger::init_with_level(Level::Warn).unwrap();
     warn!("logger init and app banner!!-------------==========");
@@ -28,8 +29,8 @@ fn main() {
             }));
         }
     }
-    options.centered=true;
-    options.viewport.inner_size=Some(Vec2::new(1280.0, 720.0));
+    options.centered = true;
+    options.viewport.inner_size = Some(Vec2::new(1280.0, 720.0));
 
     eframe::run_native(
         "tiny player",

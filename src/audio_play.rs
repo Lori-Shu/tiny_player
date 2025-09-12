@@ -25,7 +25,7 @@ impl AudioPlayer {
         let audio_data: &[i16] = bytemuck::cast_slice(audio_frame.data(0));
         let source = rodio::buffer::SamplesBuffer::new(
             audio_frame.ch_layout().channels() as u16,
-            audio_frame.rate(),
+            48000,
             audio_data,
         );
 

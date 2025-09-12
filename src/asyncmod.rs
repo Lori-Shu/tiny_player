@@ -126,6 +126,18 @@ impl AsyncContext {
             panic!("you are offline!");
         }
     }
+    pub fn spawn_demux_and_decode_task<Task>(&self, mut f: Task)
+    where
+        Task: FnMut(&Runtime) -> (),
+    {
+        f(&self.async_runtime);
+    }
+    pub fn exec_normal_task<Fu, Ot>(&self, f: Fu) -> Ot
+    where
+        Fu: Future<Output = Ot>,
+    {
+        self.async_runtime.block_on(f)
+    }
 }
 
 impl Default for AsyncContext {
