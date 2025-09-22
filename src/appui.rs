@@ -1,13 +1,13 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use egui::{
-    Color32, ColorImage, Context, CornerRadius, ImageData, ImageSource, Pos2, Rect, RichText,
-    TextureId, TextureOptions, Ui, Vec2, Vec2b, ViewportBuilder, ViewportId, WidgetText,
+    AtomExt, Color32, ColorImage, Context, CornerRadius, ImageData, ImageSource, Pos2, Rect,
+    RichText, TextureId, TextureOptions, Ui, Vec2, Vec2b, ViewportBuilder, ViewportId, WidgetText,
     epaint::ImageDelta, include_image,
 };
 
@@ -17,7 +17,7 @@ use reqwest::{Method, Url};
 use time::format_description;
 use tokio::sync::RwLock;
 
-use crate::asyncmod::{AsyncContext, SocketChatMessage};
+use crate::asyncmod::{AsyncContext, SocketMessage, VideoDes};
 
 const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
 const VOLUMN_IMG: ImageSource = include_image!("../resources/volumn_img.png");
@@ -25,6 +25,7 @@ const PLAY_IMG: ImageSource = include_image!("../resources/play_img.png");
 const PAUSE_IMG: ImageSource = include_image!("../resources/pause-97625_1920.png");
 const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.png");
 const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png");
+const UP_ARROW_IMG: ImageSource = include_image!("../resources/uparrow.png");
 const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
 const EMOJI_FONT: &[u8] = include_bytes!("../resources/fonts/seguiemj.ttf");
 /// the main struct stores all the vars which are related to ui  
@@ -51,6 +52,7 @@ pub struct AppUi {
     content_str: String,
     opened_file: Option<std::path::PathBuf>,
     open_file_dialog: Option<egui_file::FileDialog>,
+    share_folder_dialog: Option<egui_file::FileDialog>,
     username_buf: String,
 }
 impl eframe::App for AppUi {
@@ -67,12 +69,10 @@ impl eframe::App for AppUi {
                     self.create_video_texture(ctx);
                     self.frame_show_instant = now;
                 }
-                if self.async_ctx.exec_normal_task(self.tiny_decoder.as_ref().unwrap().check_input_exist())  {
-                    ctx.input(|s| {
-                        if s.key_released(egui::Key::Space) {
-                            self.pause_flag = !self.pause_flag;
-                        }
-                    });
+                if self
+                    .async_ctx
+                    .exec_normal_task(self.tiny_decoder.as_ref().unwrap().check_input_exist())
+                {
                     if !self.pause_flag {
                         /*
                         if now is next_frame_time or a little beyond get and show a new frame
@@ -95,59 +95,73 @@ impl eframe::App for AppUi {
                                     if let Some(tiny_decoder) = &mut self.tiny_decoder {
                                         if let Some(v_frame) =
                                             self.async_ctx.exec_normal_task(async {
-                                                tiny_decoder
-                                                    .pull_one_video_play_frame()
-                                                    .await
+                                                tiny_decoder.pull_one_video_play_frame().await
                                             })
                                         {
-                                            if let Some(cur_v_frame) = &mut self.current_video_frame {
-                                                let cur_au_ts = self.async_ctx.exec_normal_task(
-                                                    async {
+                                            if let Some(cur_v_frame) = &mut self.current_video_frame
+                                            {
+                                                let cur_au_ts =
+                                                    self.async_ctx.exec_normal_task(async {
                                                         *self
                                                             .current_audio_frame_timestamp
                                                             .read()
                                                             .await
-                                                    },
-                                                );
+                                                    });
 
                                                 {
                                                     if let Some(pts) = v_frame.pts() {
                                                         if let Some(cur_pts) = cur_v_frame.pts() {
-                                                                let a_time=cur_au_ts * 1000
-                                                            / tiny_decoder.get_audio_time_base()
-                                                                as i64;
-                                                                let v_time=cur_pts* 1000
-                                                                / tiny_decoder.get_video_time_base()
+                                                            let audio_time_base =
+                                                                tiny_decoder.get_audio_time_base();
+                                                            let video_time_base =
+                                                                tiny_decoder.get_video_time_base();
+                                                            let a_time = cur_au_ts
+                                                                * 1000
+                                                                * audio_time_base.numerator()
+                                                                    as i64
+                                                                / audio_time_base.denominator()
                                                                     as i64;
-                                                        if a_time
-                                                            -  v_time
-                                                            > 100 || (a_time-v_time).abs()>1000
-                                                        {
-                                                            self.frame_show_instant = now;
-                                                        } else {
-                                                            let duration = Duration::from_millis(
-                                                                ((pts - cur_pts) * 1000
-                                                                    / tiny_decoder
-                                                                        .get_video_time_base()
-                                                                        as i64)
-                                                                    as u64,
-                                                            );
-                                                            if duration
-                                                                > Duration::from_millis(1000)
-                                                                || duration
-                                                                    < Duration::from_millis(0)
+                                                            let v_time = cur_pts
+                                                                * 1000
+                                                                * video_time_base.numerator()
+                                                                    as i64
+                                                                / video_time_base.denominator()
+                                                                    as i64;
+                                                            if a_time - v_time > 100
+                                                                || (a_time - v_time).abs() > 1000
                                                             {
                                                                 self.frame_show_instant = now;
-                                                            } else if let Some(ins) = self
-                                                                .frame_show_instant
-                                                                .checked_add(duration)
-                                                            {
-                                                                self.frame_show_instant = ins;
+                                                            } else {
+                                                                let video_time_base = tiny_decoder
+                                                                    .get_video_time_base();
+                                                                let duration =
+                                                                    Duration::from_millis(
+                                                                        ((pts - cur_pts)
+                                                                            * 1000
+                                                                            * video_time_base
+                                                                                .numerator()
+                                                                                as i64
+                                                                            / video_time_base
+                                                                                .denominator()
+                                                                                as i64)
+                                                                            as u64,
+                                                                    );
+                                                                if duration
+                                                                    > Duration::from_millis(1000)
+                                                                    || duration
+                                                                        < Duration::from_millis(0)
+                                                                {
+                                                                    self.frame_show_instant = now;
+                                                                } else if let Some(ins) = self
+                                                                    .frame_show_instant
+                                                                    .checked_add(duration)
+                                                                {
+                                                                    self.frame_show_instant = ins;
+                                                                }
                                                             }
+                                                            *cur_v_frame = v_frame;
+                                                            cur_v_frame.set_pts(Some(pts));
                                                         }
-                                                        *cur_v_frame=v_frame;
-                                                        cur_v_frame.set_pts(Some(pts));
-                                                }
                                                     }
 
                                                     if let Some(c_img) = &mut self.main_color_image
@@ -170,8 +184,7 @@ impl eframe::App for AppUi {
                                                     }
                                                 }
                                             } else {
-                                                    self.current_video_frame =
-                                                        Some(v_frame);
+                                                self.current_video_frame = Some(v_frame);
                                             }
                                         }
                                     }
@@ -215,13 +228,14 @@ impl eframe::App for AppUi {
                 ui.add_space(ctx.screen_rect().height() / 2.0 - 300.0);
                 ui.horizontal(|ui| {
                     let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
-                    if self.async_ctx.exec_normal_task(tiny_decoder.check_input_exist())  {
+                    if self
+                        .async_ctx
+                        .exec_normal_task(tiny_decoder.check_input_exist())
+                    {
                         ui.add_space(ctx.screen_rect().width() - 120.0);
                         let audio_player = self.audio_player.as_mut().unwrap();
-                        let mut volumn_slider = egui::Slider::new(
-                            &mut audio_player.current_volumn,
-                            0.0..=2.0,
-                        );
+                        let mut volumn_slider =
+                            egui::Slider::new(&mut audio_player.current_volumn, 0.0..=2.0);
                         volumn_slider = volumn_slider.vertical();
                         volumn_slider = volumn_slider.show_value(false);
                         let mut slider_style = egui::style::Style::default();
@@ -312,6 +326,7 @@ impl AppUi {
             }
         };
         let async_ctx = AsyncContext::new();
+        let rt=async_ctx.get_runtime();
         let f_dialog = egui_file::FileDialog::open_file(None);
         let (color_image, dyn_img) = {
             if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
@@ -353,10 +368,11 @@ impl AppUi {
             content_str: String::new(),
             opened_file: None,
             open_file_dialog: Some(f_dialog),
+            share_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
             bg_dyn_img: dyn_img,
             username_buf: String::new(),
         };
-        let tiny_decoder = crate::decode::TinyDecoder::new();
+        let tiny_decoder = crate::decode::TinyDecoder::new(rt);
         let audio_player = crate::audio_play::AudioPlayer::new();
         sel.tiny_decoder = Some(tiny_decoder);
         sel.audio_player = Some(audio_player);
@@ -379,7 +395,10 @@ impl AppUi {
     }
     fn update_time_and_time_text(&mut self) {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
-        if self.async_ctx.exec_normal_task(tiny_decoder.check_input_exist()) {
+        if self
+            .async_ctx
+            .exec_normal_task(tiny_decoder.check_input_exist())
+        {
             let sec_num;
 
             let play_ts = self.async_ctx.exec_normal_task(async {
@@ -387,7 +406,9 @@ impl AppUi {
                 *ts
             });
             {
-                sec_num = play_ts / tiny_decoder.get_audio_time_base() as i64;
+                let audio_time_base = tiny_decoder.get_audio_time_base();
+                sec_num = play_ts * audio_time_base.numerator() as i64
+                    / audio_time_base.denominator() as i64;
 
                 let sec = (sec_num % 60) as u8;
                 let min_num = sec_num / 60;
@@ -438,23 +459,19 @@ impl AppUi {
         /*
         add audio frame data to the audio player
          */
-        loop {
-            if self.check_play_is_at_endtail() {
-                break;
-            }
-            if let Some(audio_player) = &mut self.audio_player {
-                if let Some(tiny_decoder) = &mut self.tiny_decoder {
-                    if audio_player.len() < 10 {
-                        let frame_fu = tiny_decoder.get_one_audio_play_frame_and_pts();
+        if self.check_play_is_at_endtail() {
+            return;
+        }
+        if let Some(audio_player) = &mut self.audio_player {
+            if let Some(tiny_decoder) = &mut self.tiny_decoder {
+                if audio_player.len() < 10 {
+                    let frame_fu = tiny_decoder.get_one_audio_play_frame_and_pts();
 
-                        if let Some(audio_frame) = self.async_ctx.exec_normal_task(frame_fu) {
-                            if let Some(pts) = audio_frame.pts() {
-                                audio_player.set_pts(pts);
-                            }
-                            audio_player.play_raw_data_from_audio_frame(audio_frame);
+                    if let Some(audio_frame) = self.async_ctx.exec_normal_task(frame_fu) {
+                        if let Some(pts) = audio_frame.pts() {
+                            audio_player.set_pts(pts);
                         }
-                    } else {
-                        break;
+                        audio_player.play_raw_data_from_audio_frame(audio_frame);
                     }
                 }
             }
@@ -505,51 +522,7 @@ impl AppUi {
                 || path.display().to_string().ends_with(".ts")
             {
                 warn!("filepath{}", path.display().to_string());
-                if let Some(tiny_decoder) = &mut self.tiny_decoder {
-                    if let Some(path_str) = path.to_str() {
-                        let video_file_path = Path::new(path_str);
-                        if !self.async_ctx.exec_normal_task(tiny_decoder.check_input_exist()) {
-                            self.pause_flag = true;
-                            self.async_ctx.exec_normal_task(async {
-                                tiny_decoder
-                                    .set_file_path_and_init_par(video_file_path)
-                                    .await;
-                            });
-                            self.async_ctx.spawn_demux_and_decode_task(|rt| {
-                                tiny_decoder.start_process_input(rt);
-                            });
-
-                            self.update_color_image();
-                            self.reset_main_tex_to_cover_pic(ctx);
-                            self.frame_show_instant = *now;
-                        } else {
-                            self.pause_flag = true;
-
-                            self.async_ctx.exec_normal_task(async {
-                                tiny_decoder
-                                    .set_file_path_and_init_par(video_file_path)
-                                    .await;
-                            });
-                             if let Some(au_pl) = &mut self.audio_player {
-                                au_pl.source_queue_skip_to_end();
-                            }
-                            self.reset_main_tex_to_bg(ctx);
-                            self.reset_main_tex_to_cover_pic(ctx);
-                            self.update_color_image();
-                            self.async_ctx.exec_normal_task(async {
-                                let mut mutex_guard =
-                                    self.current_audio_frame_timestamp.write().await;
-                                {
-                                    *mutex_guard = 0;
-                                }
-                            });
-
-                            self.current_video_frame = None;
-                            self.frame_show_instant = *now;
-                           
-                        }
-                    }
-                }
+                self.change_format_input(ctx, path.as_path(), now);
             } else {
                 self.err_window_msg = "please choose a valid file !!!".to_string();
                 self.err_window_flag = true;
@@ -560,7 +533,10 @@ impl AppUi {
     fn paint_playpause_btn(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let tiny_decoder = self.tiny_decoder.as_ref().unwrap();
 
-        if self.async_ctx.exec_normal_task(tiny_decoder.check_input_exist()) {
+        if self
+            .async_ctx
+            .exec_normal_task(tiny_decoder.check_input_exist())
+        {
             let play_or_pause_image_source;
             if self.pause_flag {
                 play_or_pause_image_source = PLAY_IMG;
@@ -578,7 +554,7 @@ impl AppUi {
                 self.control_ui_flag = true;
                 self.last_show_control_ui_instant = now.clone();
             }
-            if btn_response.clicked() {
+            if btn_response.clicked() || ctx.input(|s| s.key_released(egui::Key::Space)) {
                 self.pause_flag = !self.pause_flag;
                 let audio_player = self.audio_player.as_ref().unwrap();
                 if self.pause_flag {
@@ -592,18 +568,25 @@ impl AppUi {
 
     fn paint_control_area(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let tiny_decoder = self.tiny_decoder.as_mut().unwrap();
-        if self.async_ctx.exec_normal_task(tiny_decoder.check_input_exist()) {
+        if self
+            .async_ctx
+            .exec_normal_task(tiny_decoder.check_input_exist())
+        {
             let mut timestamp = self
                 .async_ctx
                 .exec_normal_task(async { self.current_audio_frame_timestamp.write().await });
-            let progress_slider =
-                egui::Slider::new(&mut *timestamp, 0..=tiny_decoder.get_end_audio_ts())
-                    .show_value(false)
-                    .text(WidgetText::RichText(Arc::new(
-                        RichText::new(self.time_text.clone())
-                            .size(20.0)
-                            .color(Color32::ORANGE),
-                    )));
+            let progress_slider = egui::Slider::new(
+                &mut *timestamp,
+                0..=self
+                    .async_ctx
+                    .exec_normal_task(tiny_decoder.get_end_audio_ts()),
+            )
+            .show_value(false)
+            .text(WidgetText::RichText(Arc::new(
+                RichText::new(self.time_text.clone())
+                    .size(20.0)
+                    .color(Color32::ORANGE),
+            )));
             let mut slider_width_style = egui::style::Style::default();
             slider_width_style.spacing.slider_width = ctx.screen_rect().width() - 350.0;
             slider_width_style.spacing.slider_rail_height = 10.0;
@@ -687,13 +670,19 @@ impl AppUi {
             ui.add(date_time_button);
         });
     }
-    fn check_play_is_at_endtail(&self) -> bool {
-        if let Some(tiny_decoder) = &self.tiny_decoder {
+    fn check_play_is_at_endtail(&mut self) -> bool {
+        if let Some(tiny_decoder) = &mut self.tiny_decoder {
             let pts = self
                 .async_ctx
                 .exec_normal_task(async { *self.current_audio_frame_timestamp.read().await });
-            if pts / tiny_decoder.get_audio_time_base() as i64 + 1
-                >= tiny_decoder.get_end_audio_ts() / tiny_decoder.get_audio_time_base() as i64
+            let audio_time_base = tiny_decoder.get_audio_time_base();
+            if pts * audio_time_base.numerator() as i64 / audio_time_base.denominator() as i64
+                >= *self
+                    .async_ctx
+                    .exec_normal_task(tiny_decoder.get_format_duration().read())
+                    / 1_000_000
+            // tiny_decoder.get_end_audio_ts() * audio_time_base.numerator() as i64
+            //     / audio_time_base.denominator() as i64
             {
                 true
             } else {
@@ -720,17 +709,21 @@ impl AppUi {
     }
     /// return true when the current video time > audio time,else return false
     /// if video time-audio time is too high(more than 1 second),default return true
-    fn check_video_wait_for_audio(&self) -> bool {
+    fn check_video_wait_for_audio(&mut self) -> bool {
         if let Some(tiny_decoder) = &self.tiny_decoder {
             if let Some(frame) = &self.current_video_frame {
                 let timestamp = self
                     .async_ctx
                     .exec_normal_task(async { *self.current_audio_frame_timestamp.read().await });
                 {
-                    let v_time =
-                        frame.pts().unwrap() * 1000 / tiny_decoder.get_video_time_base() as i64;
-                    let a_time = timestamp * 1000 / tiny_decoder.get_audio_time_base() as i64;
+                    let video_time_base = tiny_decoder.get_video_time_base();
+                    let audio_time_base = tiny_decoder.get_audio_time_base();
+                    let v_time = frame.pts().unwrap() * 1000 * video_time_base.numerator() as i64
+                        / video_time_base.denominator() as i64;
+                    let a_time = timestamp * 1000 * audio_time_base.numerator() as i64
+                        / audio_time_base.denominator() as i64;
                     if (v_time - a_time).abs() > 1000 {
+                        self.current_video_frame=None;
                         return true;
                     } else if v_time > a_time {
                         return false;
@@ -762,65 +755,146 @@ impl AppUi {
             );
             ctx.show_viewport_immediate(viewport_id, ViewportBuilder::default(), |ctx, _| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let online_btn = {
-                        if self.async_ctx.get_online_flag() {
-                            egui::Button::new("status:online")
-                        } else {
-                            egui::Button::new("status:offline").shortcut_text("click to try online")
-                        }
-                    };
-                    let singleline = egui::TextEdit::singleline(&mut self.username_buf)
-                        .hint_text("type in your temporary usename");
-                    ui.add(singleline);
-                    if ui.add(online_btn).clicked() {
-                        self.async_ctx.login_server(self.username_buf.clone());
-                        self.async_ctx.ws_connect_to_chat();
-                    }
-                    let msg_scroll_area = egui::ScrollArea::new(Vec2b::new(false, true));
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            let online_btn = {
+                                if self.async_ctx.get_online_flag() {
+                                    egui::Button::new("status:online")
+                                } else {
+                                    egui::Button::new("status:offline")
+                                        .shortcut_text("click to try online")
+                                }
+                            };
+                            let singleline = egui::TextEdit::singleline(&mut self.username_buf)
+                                .hint_text("type in your temporary usename");
+                            ui.add(singleline);
+                            if ui.add(online_btn).clicked() {
+                                self.async_ctx.login_server(
+                                    self.username_buf.clone(),
+                                    self.tiny_decoder.as_ref().unwrap().get_format_duration(),
+                                );
+                            }
+                            if self.async_ctx.get_online_flag() {
+                                let msg_scroll_area =
+                                    egui::ScrollArea::new(Vec2b::new(false, true))
+                                        .max_height(200.0);
+                                ui.set_min_height(300.0);
+                                msg_scroll_area.id_salt("msg_scroll_area").show(ui, |ui| {
+                                    for item in self.async_ctx.get_chat_msg_vec() {
+                                        let rich_text = egui::RichText::new(format!(
+                                            "{}    :{}",
+                                            item.get_name(),
+                                            String::from_utf8(item.get_msg().clone()).unwrap()
+                                        ))
+                                        .size(20.0);
 
-                    msg_scroll_area
-                        .id_salt("msg_scroll_area")
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            ui.set_min_width(500.0);
-                            for item in self.async_ctx.get_chat_msg_vec() {
-                                let rich_text = egui::RichText::new(format!(
-                                    "{}    :{}",
-                                    item.get_name(),
-                                    item.get_msg()
-                                ))
-                                .size(20.0);
-
-                                ui.add(egui::Label::new(rich_text));
+                                        ui.add(egui::Label::new(rich_text));
+                                    }
+                                });
+                                let input_scroll_area =
+                                    egui::ScrollArea::new(Vec2b::new(false, true))
+                                        .max_height(200.0);
+                                ui.set_min_height(300.0);
+                                input_scroll_area
+                                    .id_salt("input_scroll_area")
+                                    .show(ui, |ui| {
+                                        ui.text_edit_multiline(&mut self.content_str);
+                                    });
+                                if ui.button("send message").clicked()
+                                    || ctx.input(|s| s.key_released(egui::Key::Enter))
+                                {
+                                    let detail = self.async_ctx.get_user_detail();
+                                    let mes = SocketMessage::new(
+                                        detail.id.clone(),
+                                        detail.username.clone(),
+                                        "server".to_string(),
+                                        "chat".to_string(),
+                                        "chat msg".to_string(),
+                                        self.content_str.to_string().as_bytes().to_vec(),
+                                    );
+                                    self.async_ctx.ws_send_chat_msg(mes);
+                                    self.content_str.clear();
+                                }
+                                if ui.button("send req").clicked() {
+                                    if let Ok(url) = Url::from_str("http://bing.com") {
+                                        if let Ok(r) =
+                                            self.async_ctx.req_external_url(Method::GET, url)
+                                        {
+                                            self.content_str.clear();
+                                            self.content_str.push_str(r.as_str());
+                                        }
+                                    }
+                                }
                             }
                         });
-                    let input_scroll_area = egui::ScrollArea::new(Vec2b::new(false, true));
-                    input_scroll_area
-                        .id_salt("input_scroll_area")
-                        .show(ui, |ui| {
-                            ui.set_min_width(500.0);
-
-                            ui.text_edit_multiline(&mut self.content_str);
-                        });
-                    if ui.button("send message").clicked() {
-                        let detail = self.async_ctx.get_user_detail();
-                        let mes = SocketChatMessage::new(
-                            detail.id.clone(),
-                            detail.username.clone(),
-                            "server".to_string(),
-                            self.content_str.to_string(),
-                        );
-                        self.async_ctx.ws_send_chat_msg(mes);
-                        self.content_str.clear();
-                    }
-                    if ui.button("send req").clicked() {
-                        if let Ok(url) = Url::from_str("http://bing.com") {
-                            if let Ok(r) = self.async_ctx.req_external_url(Method::GET, url) {
-                                self.content_str.clear();
-                                self.content_str.push_str(r.as_str());
+                        ui.vertical(|ui| {
+                            if self.async_ctx.get_online_flag() {
+                                let video_links_scroll =
+                                    egui::ScrollArea::vertical().max_height(200.0);
+                                ui.set_min_height(300.0);
+                                video_links_scroll.show(ui, |ui| {
+                                    let videos = self.async_ctx.get_online_videos().clone();
+                                    for i in videos {
+                                        if ui.button(&i.name).clicked() {
+                                            self.async_ctx.watch_shared_video(i.clone());
+                                            self.change_format_input(
+                                                ctx,
+                                                Path::new("tcp://127.0.0.1:18858"),
+                                                now,
+                                            );
+                                        }
+                                    }
+                                });
+                                let up_arrow_image =
+                                    egui::Image::new(UP_ARROW_IMG).atom_size(Vec2::new(12.0, 12.0));
+                                if let Some(dialog) = &mut self.share_folder_dialog {
+                                    dialog.show(ctx);
+                                    if ui.button((up_arrow_image, "share video")).clicked() {
+                                        dialog.open();
+                                    }
+                                    if dialog.selected() {
+                                        if let Some(path) = dialog.path() {
+                                            warn!("folder path{}", path.to_str().unwrap());
+                                            if let Ok(ite) = path.read_dir() {
+                                                let mut share_targets = vec![];
+                                                for entry in ite {
+                                                    if let Ok(en) = entry {
+                                                        if let Ok(t) = en.file_type() {
+                                                            if t.is_file() {
+                                                                let file_name = en
+                                                                    .file_name()
+                                                                    .to_str()
+                                                                    .unwrap()
+                                                                    .to_string();
+                                                                if file_name.ends_with(".ts")
+                                                                    || file_name.ends_with(".mp4")
+                                                                    || file_name.ends_with(".mkv")
+                                                                {
+                                                                    share_targets.push(VideoDes {
+                                                                        name: file_name.to_string(),
+                                                                        path: path
+                                                                            .join(file_name)
+                                                                            .to_str()
+                                                                            .unwrap()
+                                                                            .to_string(),
+                                                                        user_id: self
+                                                                            .async_ctx
+                                                                            .get_user_detail()
+                                                                            .id,
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                self.async_ctx.share_video(share_targets);
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    }
+                        });
+                    });
                 });
             });
         }
@@ -864,4 +938,56 @@ impl AppUi {
             }
         }
     }
+    fn change_format_input(&mut self, ctx: &Context, path: &Path, now: &Instant) {
+        if let Some(tiny_decoder) = &mut self.tiny_decoder {
+            let path = {
+                warn!("input path===={:?}", path);
+                if path.to_str().unwrap().starts_with("tcp") {
+                    VideoPathSource::TcpStream(path.to_path_buf())
+                } else {
+                    VideoPathSource::File(path.to_path_buf())
+                }
+            };
+
+            if !self
+                .async_ctx
+                .exec_normal_task(tiny_decoder.check_input_exist())
+            {
+                self.pause_flag = true;
+                self.async_ctx.exec_normal_task(async {
+                    tiny_decoder.set_file_path_and_init_par(path).await;
+                });
+                self.async_ctx.exec_normal_task(tiny_decoder.start_process_input());
+
+                self.update_color_image();
+                self.reset_main_tex_to_cover_pic(ctx);
+                self.frame_show_instant = *now;
+            } else {
+                self.pause_flag = true;
+
+                self.async_ctx.exec_normal_task(async {
+                    tiny_decoder.set_file_path_and_init_par(path).await;
+                });
+                if let Some(au_pl) = &mut self.audio_player {
+                    au_pl.source_queue_skip_to_end();
+                }
+                self.reset_main_tex_to_bg(ctx);
+                self.reset_main_tex_to_cover_pic(ctx);
+                self.update_color_image();
+                self.async_ctx.exec_normal_task(async {
+                    let mut mutex_guard = self.current_audio_frame_timestamp.write().await;
+                    {
+                        *mutex_guard = 0;
+                    }
+                });
+
+                self.current_video_frame = None;
+                self.frame_show_instant = *now;
+            }
+        }
+    }
+}
+pub enum VideoPathSource {
+    File(PathBuf),
+    TcpStream(PathBuf),
 }

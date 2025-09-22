@@ -1,21 +1,24 @@
 use std::{fs, path::Path};
 
 fn main() {
-    let dlls = vec![
-        "D:/cppproject/vcpkg-2025.03.19/installed/x64-windows/bin/avcodec-61.dll",
-        "D:/cppproject/vcpkg-2025.03.19/installed/x64-windows/bin/avdevice-61.dll",
-        "D:/cppproject/vcpkg-2025.03.19/installed/x64-windows/bin/avfilter-10.dll",
-        "D:/cppproject/vcpkg-2025.03.19/installed/x64-windows/bin/avformat-61.dll",
-        "D:/cppproject/vcpkg-2025.03.19/installed/x64-windows/bin/avutil-59.dll",
-        "D:/cppproject/vcpkg-2025.03.19/installed/x64-windows/bin/swresample-5.dll",
-        "D:/cppproject/vcpkg-2025.03.19/installed/x64-windows/bin/swscale-8.dll",
-    ];
-    let out_dir = "resources/dlls";
+    let mut dlls = vec![];
+    let folder_path = Path::new("D:/cppproject/ffmpeg-n8.0-latest-win64-gpl-shared-8.0/bin");
+    if let Ok(dir) = folder_path.read_dir() {
+        for dir_entry in dir {
+            if let Ok(p) = dir_entry {
+                if p.file_name().to_str().unwrap().ends_with(".dll") {
+                    dlls.push(p.path());
+                }
+            }
+        }
+    }
     for dll in dlls {
-        let resource_dest = Path::new(out_dir).join(Path::new(dll).file_name().unwrap());
-        let target_debug_dest = Path::new("target/debug").join(Path::new(dll).file_name().unwrap());
-        fs::copy(dll, resource_dest).unwrap();
-        fs::copy(dll, target_debug_dest).unwrap();
+        let resource_dest =
+            Path::new("resources/dlls").join(dll.file_name().unwrap().to_str().unwrap());
+        let target_debug_dest =
+            Path::new("target/debug").join(dll.file_name().unwrap().to_str().unwrap());
+        fs::copy(&dll, resource_dest).unwrap();
+        fs::copy(&dll, target_debug_dest).unwrap();
     }
     if std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap() == "windows" {
         let mut res = winresource::WindowsResource::new();

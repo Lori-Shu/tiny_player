@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     ptr::{null, null_mut},
     sync::Arc,
     time::Duration,
@@ -7,14 +6,16 @@ use std::{
 };
 
 use ffmpeg_the_third::{
-    Stream,
+    Rational, Stream,
     codec::Id,
     ffi::{AVBufferRef, av_hwdevice_ctx_create, av_hwframe_transfer_data, avcodec_get_hw_config},
     format::{self, Pixel},
 };
 use log::warn;
 use time::format_description;
-use tokio::{runtime::Runtime, sync::RwLock, time::sleep};
+use tokio::{runtime::Runtime, sync::RwLock, task::JoinHandle, time::sleep};
+
+use crate::appui::VideoPathSource;
 /// in order to make Input impl Sync, create a new Type ,
 /// this type can be manually sync by Rwlock
 pub struct ManualProtectedInput(ffmpeg_the_third::format::context::Input);
@@ -37,9 +38,10 @@ pub struct TinyDecoder {
     video_stream_index: Arc<RwLock<usize>>,
     audio_stream_index: Arc<RwLock<usize>>,
     cover_stream_index: Arc<RwLock<usize>>,
-    video_time_base: i32,
-    audio_time_base: i32,
+    video_time_base: Rational,
+    audio_time_base: Rational,
     video_frame_rect: [u32; 2],
+    format_duration: Arc<RwLock<i64>>,
     end_audio_ts: i64,
     end_time_formatted_string: String,
     format_input: Arc<RwLock<Option<ManualProtectedInput>>>,
@@ -50,20 +52,26 @@ pub struct TinyDecoder {
     video_frame_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::frame::Video>>>,
     audio_frame_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::frame::Audio>>>,
     packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::packet::Packet>>>,
+    demux_exit_flag: Arc<RwLock<bool>>,
+    decode_exit_flag: Arc<RwLock<bool>>,
+    demux_task_handle: Option<JoinHandle<()>>,
+    decode_task_handle: Option<JoinHandle<()>>,
     hardware_config: Arc<RwLock<bool>>,
     cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
+    async_rt: Arc<Runtime>,
 }
 impl TinyDecoder {
     /// init Decoder and new Struct
-    pub fn new() -> Self {
+    pub fn new(runtime: Arc<Runtime>) -> Self {
         ffmpeg_the_third::init().unwrap();
         return Self {
             video_stream_index: Arc::new(RwLock::new(0)),
             audio_stream_index: Arc::new(RwLock::new(0)),
             cover_stream_index: Arc::new(RwLock::new(usize::MAX)),
-            video_time_base: 0,
-            audio_time_base: 0,
+            video_time_base: Rational::new(1, 1),
+            audio_time_base: Rational::new(1, 1),
             video_frame_rect: [0, 0],
+            format_duration: Arc::new(RwLock::new(0)),
             end_audio_ts: 0,
             end_time_formatted_string: String::new(),
             format_input: Arc::new(RwLock::new(None)),
@@ -74,36 +82,44 @@ impl TinyDecoder {
             video_frame_cache_vec: std::sync::Arc::new(RwLock::new(vec![])),
             audio_frame_cache_vec: std::sync::Arc::new(RwLock::new(vec![])),
             packet_cache_vec: std::sync::Arc::new(RwLock::new(vec![])),
+            demux_exit_flag: Arc::new(RwLock::new(false)),
+            decode_exit_flag: Arc::new(RwLock::new(false)),
+            demux_task_handle: None,
+            decode_task_handle: None,
             hardware_config: Arc::new(RwLock::new(false)),
             cover_pic_data: Arc::new(RwLock::new(None)),
+            async_rt: runtime,
         };
     }
     /// called when user selected a file path to play
     /// init all the details from the file selected
-    pub async fn set_file_path_and_init_par(&mut self, file_path: &Path) {
+    pub async fn set_file_path_and_init_par(&mut self, path: VideoPathSource) {
         warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
-        let format_input = ffmpeg_the_third::format::input(file_path).unwrap();
+        let format_input = {
+            if let VideoPathSource::TcpStream(s) = &path {
+                ffmpeg_the_third::format::input(s).unwrap()
+            } else if let VideoPathSource::File(s) = &path {
+                ffmpeg_the_third::format::input(s).unwrap()
+            } else {
+                todo!();
+            }
+        };
+        warn!("input construct finished");
         let mut cover_stream = None;
         let mut video_stream = None;
         let mut audio_stream = None;
 
         format_input.streams().for_each(|item| {
-            let stream_id = item.parameters().id();
-            if stream_id == Id::JPEG2000
-                || stream_id == Id::JPEGLS
-                || stream_id == Id::JPEGXL
-                || stream_id == Id::PNG
-            {
-                cover_stream = Some(item);
-            } else if stream_id == Id::H264 || stream_id == Id::HEVC || stream_id == Id::AV1 {
+            let stream_type = item.parameters().medium();
+            if stream_type == ffmpeg_the_third::util::media::Type::Video {
+                warn!("找到视频流");
                 video_stream = Some(item);
-            } else if stream_id == Id::AAC
-                || stream_id == Id::MP3
-                || stream_id == Id::FLAC
-                || stream_id == Id::PCM_S16LE
-                || stream_id == Id::VORBIS
-            {
+            } else if stream_type == ffmpeg_the_third::util::media::Type::Audio {
+                warn!("找到音频流");
                 audio_stream = Some(item);
+            } else if stream_type == ffmpeg_the_third::util::media::Type::Attachment {
+                warn!("找到attachment流");
+                cover_stream = Some(item);
             } else {
                 warn!("unhandled stream");
             }
@@ -116,23 +132,31 @@ impl TinyDecoder {
         if let Some(stream) = &video_stream {
             let mut mutex_guard = self.video_stream_index.write().await;
             *mutex_guard = stream.index();
-            self.video_time_base = stream.time_base().1;
+            self.video_time_base = stream.time_base();
             warn!("video time_base==={}", self.video_time_base);
         }
         if let Some(stream) = &audio_stream {
             let mut mutex_guard = self.audio_stream_index.write().await;
             *mutex_guard = stream.index();
-            self.audio_time_base = stream.time_base().1;
+            self.audio_time_base = stream.time_base();
             warn!("audio time_base==={}", self.audio_time_base);
         }
 
         // format_input.duration() 能较准确得到视频文件的总时常，mkv等格式可能存在
         // stream不存储时长,format_input.duration()更可靠
         // format_input.duration() 单位是微妙
-        let adur_ts = format_input.duration() * self.audio_time_base as i64 / 1000_000;
-        self.end_audio_ts = adur_ts;
-        warn!("audio end ts:{}", self.end_audio_ts);
-        self.compute_and_set_end_time_str();
+        if let VideoPathSource::File(_s) = &path {
+            warn!("dur {} us", format_input.duration());
+            *self.format_duration.write().await = format_input.duration();
+            let adur_ts = format_input.duration() * self.audio_time_base.denominator() as i64
+                / self.audio_time_base.numerator() as i64
+                / 1000_000;
+            self.end_audio_ts = adur_ts;
+            warn!("audio end ts:{}", adur_ts);
+            self.compute_and_set_end_time_str(adur_ts);
+        } else {
+            self.end_audio_ts = 0;
+        }
         let video_decoder = self
             .choose_decoder_with_hardware_prefer(video_stream.as_ref().unwrap())
             .await;
@@ -192,12 +216,16 @@ impl TinyDecoder {
     }
     /// the loop of demux video file
     async fn packet_demux_process(
+        exit_flag: Arc<RwLock<bool>>,
         format_input: Arc<RwLock<Option<ManualProtectedInput>>>,
         packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::packet::Packet>>>,
         cover_stream_index: Arc<RwLock<usize>>,
         cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
     ) {
         loop {
+            if *exit_flag.read().await {
+                break;
+            }
             /*
             I choose to lock the packet vec first stick this in other functions
              */
@@ -209,11 +237,13 @@ impl TinyDecoder {
                 sleep(Duration::from_millis(10)).await;
                 continue;
             }
+            let mut input_end_flag = false;
             {
                 let mut rw_lock_guard = packet_cache_vec.write().await;
                 let cover_index = cover_stream_index.read().await;
                 let mut cover_pic_data = cover_pic_data.write().await;
                 let mut input = format_input.write().await;
+
                 match input.as_mut().unwrap().0.packets().next() {
                     Some(Ok((_stream, packet))) => {
                         if packet.stream() == *cover_index {
@@ -227,13 +257,19 @@ impl TinyDecoder {
                             warn!("demux process hit the end");
                         }
                     }
-                    _ => {}
+                    None => {
+                        input_end_flag = true;
+                    }
                 }
+            }
+            if input_end_flag {
+                sleep(Duration::from_millis(10)).await;
             }
         }
     }
     /// the loop of decode demuxed packet     
     async fn frame_decode_process(
+        exit_flag: Arc<RwLock<bool>>,
         video_stream_index: Arc<RwLock<usize>>,
         audio_stream_index: Arc<RwLock<usize>>,
         video_decoder: Arc<RwLock<Option<ManualProtectedVideoDecoder>>>,
@@ -244,6 +280,9 @@ impl TinyDecoder {
         hardware_config: Arc<RwLock<bool>>,
     ) {
         loop {
+            if *exit_flag.read().await {
+                break;
+            }
             let video_frame_vec_len = {
                 let guard = video_frame_cache_vec.read().await;
                 guard.len()
@@ -264,13 +303,17 @@ impl TinyDecoder {
                         同时拿到多锁是为了避免改变input时
                         遇到decoder和packet不匹配的情况
                 */
-                let mut rw_lock_write_guard = packet_cache_vec.write().await;
-                let front_packet;
-                if rw_lock_write_guard.len() > 0 {
-                    front_packet = rw_lock_write_guard.remove(0);
-                } else {
+                let packet_cache_len = {
+                    let packet_cache_vec = packet_cache_vec.write().await;
+                    packet_cache_vec.len()
+                };
+                if packet_cache_len <= 0 {
+                    sleep(Duration::from_millis(10)).await;
                     continue;
                 }
+                let mut rw_lock_write_guard = packet_cache_vec.write().await;
+                let front_packet = rw_lock_write_guard.remove(0);
+
                 if front_packet.stream() == *video_stream_index.read().await {
                     {
                         let mut v_frame_vec = video_frame_cache_vec.write().await;
@@ -335,27 +378,27 @@ impl TinyDecoder {
                             a_frame_vec.push(audio_frame_tmp);
                         }
                     }
-                } else {
-                    // nothing
                 }
             }
         }
     }
     /// start the demux and decode task,pass in tokio runtime
-    pub fn start_process_input(&mut self, rt: &Runtime) {
+    pub async fn start_process_input(&mut self) {
         let format_input = self.format_input.clone();
         let packet_cache_vec = self.packet_cache_vec.clone();
         let cov_stream_index = self.cover_stream_index.clone();
         let cover_pic_data = self.cover_pic_data.clone();
-        rt.spawn(async move {
+        let demux_exit_flag = self.demux_exit_flag.clone();
+        self.demux_task_handle = Some(tokio::spawn(async move {
             Self::packet_demux_process(
+                demux_exit_flag,
                 format_input,
                 packet_cache_vec,
                 cov_stream_index,
                 cover_pic_data,
             )
             .await;
-        });
+        }));
 
         let video_stream_index = self.video_stream_index.clone();
         let audio_stream_index = self.audio_stream_index.clone();
@@ -365,9 +408,10 @@ impl TinyDecoder {
         let audio_frame_cache_vec = self.audio_frame_cache_vec.clone();
         let packet_cache_vec = self.packet_cache_vec.clone();
         let hardware_config = self.hardware_config.clone();
-
-        rt.spawn(async move {
+        let decode_exit_flag = self.decode_exit_flag.clone();
+        self.decode_task_handle = Some(tokio::spawn(async move {
             Self::frame_decode_process(
+                decode_exit_flag,
                 video_stream_index,
                 audio_stream_index,
                 video_decoder,
@@ -378,7 +422,7 @@ impl TinyDecoder {
                 hardware_config,
             )
             .await;
-        });
+        }));
     }
     /// called by the main thread pull one audio frame from the vec
     /// in addition, do the resample     
@@ -433,12 +477,12 @@ impl TinyDecoder {
         return_val
     }
     /// get v time base used to check time and compare to sync     
-    pub fn get_video_time_base(&self) -> i32 {
-        return self.video_time_base;
+    pub fn get_video_time_base(&self) -> &Rational {
+        &self.video_time_base
     }
     /// get a time base used to check time and compare to sync    
-    pub fn get_audio_time_base(&self) -> i32 {
-        return self.audio_time_base;
+    pub fn get_audio_time_base(&self) -> &Rational {
+        &self.audio_time_base
     }
     /// get the calculated end time str     
     pub fn get_end_time_formatted_string(&self) -> &String {
@@ -450,8 +494,20 @@ impl TinyDecoder {
     }
     /// get the end audio timestamp used as the main time flow
     /// it is more accurate than just use time second     
-    pub fn get_end_audio_ts(&self) -> i64 {
-        return self.end_audio_ts;
+    pub async fn get_end_audio_ts(&mut self) -> i64 {
+        if self.end_audio_ts == 0 {
+            let adur_ts = {
+                let dur = self.format_duration.read().await;
+                let adur_ts = *dur * self.audio_time_base.denominator() as i64
+                    / self.audio_time_base.numerator() as i64
+                    / 1000_000;
+                self.end_audio_ts = adur_ts;
+                warn!("audio end ts:{}", adur_ts);
+                adur_ts
+            };
+            self.compute_and_set_end_time_str(adur_ts);
+        }
+        self.end_audio_ts
     }
     /// seek the input to a selected timestamp
     /// use the ffi function to enable seek all the frames
@@ -459,7 +515,12 @@ impl TinyDecoder {
     /// the seek would go as I want, to an exact frame
     pub async fn seek_timestamp_to_decode(&mut self, ts: i64) {
         {
-            self.clear_all_cache_vec().await;
+            let mut packet_cache_vec = self.packet_cache_vec.write().await;
+            let mut audio_cache_vec = self.audio_frame_cache_vec.write().await;
+            let mut video_cache_vec = self.video_frame_cache_vec.write().await;
+            packet_cache_vec.clear();
+            audio_cache_vec.clear();
+            video_cache_vec.clear();
             let mut input = self.format_input.write().await;
             unsafe {
                 let a_stream_idx = self.audio_stream_index.read().await;
@@ -467,9 +528,9 @@ impl TinyDecoder {
                 let res = ffmpeg_the_third::ffi::avformat_seek_file(
                     input.as_mut().unwrap().0.as_mut_ptr(),
                     *a_stream_idx as i32,
-                    ts - self.audio_time_base as i64,
+                    ts - self.audio_time_base.denominator() as i64,
                     ts,
-                    ts + self.audio_time_base as i64,
+                    ts + self.audio_time_base.denominator() as i64,
                     ffmpeg_the_third::ffi::AVSEEK_FLAG_ANY,
                 );
                 if res != 0 {
@@ -479,8 +540,9 @@ impl TinyDecoder {
         }
     }
     /// use the file detail to compute the video duration and make str to inform the user
-    fn compute_and_set_end_time_str(&mut self) {
-        let sec_num = self.end_audio_ts / self.audio_time_base as i64;
+    fn compute_and_set_end_time_str(&mut self, end_ts: i64) {
+        let sec_num = end_ts * self.audio_time_base.numerator() as i64
+            / self.audio_time_base.denominator() as i64;
         let sec = (sec_num % 60) as u8;
         let min_num = sec_num / 60;
         let min = (min_num % 60) as u8;
@@ -500,19 +562,15 @@ impl TinyDecoder {
     pub fn get_cover_pic_data(&self) -> Arc<RwLock<Option<Vec<u8>>>> {
         self.cover_pic_data.clone()
     }
-    pub async fn clear_all_cache_vec(&mut self) {
-        let mut packet_cache_vec = self.packet_cache_vec.write().await;
-        let mut audio_cache_vec = self.audio_frame_cache_vec.write().await;
-        let mut video_cache_vec = self.video_frame_cache_vec.write().await;
-        packet_cache_vec.clear();
-        audio_cache_vec.clear();
-        video_cache_vec.clear();
-    }
     pub async fn check_input_exist(&self) -> bool {
-        let input = self.format_input.read().await;
-        if let Some(_) = *input { true } else { false }
+        let input = self.format_input.write().await;
+        input.is_some()
+    }
+    pub fn get_format_duration(&self) -> Arc<RwLock<i64>> {
+        self.format_duration.clone()
     }
 }
+
 impl TinyDecoder {
     /// enable hardware accelerate for video decode, currently use d3d12 only on windows
     /// others like vulkan are in developing
@@ -530,7 +588,7 @@ impl TinyDecoder {
                 let mut hw_device_ctx: *mut AVBufferRef = null_mut();
                 if 0 != av_hwdevice_ctx_create(
                     &mut hw_device_ctx as *mut *mut AVBufferRef,
-                    ffmpeg_the_third::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D12VA,
+                    ffmpeg_the_third::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
                     null(),
                     null_mut(),
                     0,
@@ -551,5 +609,20 @@ impl TinyDecoder {
             decoder = codec_ctx.decoder().video().unwrap();
         }
         decoder
+    }
+}
+impl Drop for TinyDecoder {
+    fn drop(&mut self) {
+        self.async_rt.block_on(async {
+            *self.demux_exit_flag.write().await = true;
+            self.demux_task_handle.as_mut().unwrap().await.unwrap();
+            *self.decode_exit_flag.write().await = true;
+            self.decode_task_handle.as_mut().unwrap().await.unwrap();
+            warn!("demux and decode task exit gracefully!!!");
+            self.packet_cache_vec.write().await.clear();
+            self.audio_frame_cache_vec.write().await.clear();
+            self.video_frame_cache_vec.write().await.clear();
+            warn!("cache vec cleared gracefully!!!!");
+        });
     }
 }

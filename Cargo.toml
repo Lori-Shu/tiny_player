@@ -1,29 +1,34 @@
 [package]
 name = "tiny_player"
-version = "0.0.2"
+version = "0.0.4"
 edition = "2024"
-description="a tiny video player"
-license="GPL-3.0"
-authors=["Lori-Shu"]
+description = "a tiny video player"
+license = "GPL-3.0"
+authors = ["Lori-Shu"]
 
 [dependencies]
-ffmpeg-the-third = "3.0.2"
-rodio="0.20.1"
+ffmpeg-the-third = "4.0.0"
+rodio = "0.20.1"
 bytemuck = "1.22.0"
-egui_extras = {version="0.32.2",features = ["all_loaders"]}
-image = {version="0.25.6",features = ["jpeg","png"]}
+image = { version = "0.25.6", features = ["jpeg", "png"] }
 wgpu = { version = "25.0.2", default-features = false, features = ["vulkan"] }
-eframe = {version="0.32.2",features = ["wgpu"]}
-egui = "0.32.2"
+eframe = { version = "0.32.3", features = ["wgpu"] }
+egui = "0.32.3"
+egui_extras = { version = "0.32.3", features = ["all_loaders"] }
 egui_file = "0.23.1"
 simple_logger = "5.0.0"
 log = "0.4.27"
 time = "0.3.41"
 keepawake = "0.5.1"
-tokio = {version="1.47.1",features = ["macros", "rt-multi-thread", "time"]}
+tokio = { version = "1.47.1", features = [
+        "macros",
+        "rt-multi-thread",
+        "time",
+        "fs",
+] }
 reqwest = "0.12.23"
 reqwest-websocket = "0.5.1"
-serde = {version="1.0.219", features = ["derive"]}
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 futures-util = "0.3.31"
 [build-dependencies]
