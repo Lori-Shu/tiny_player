@@ -74,4 +74,50 @@ mod test {
         let divide = divide(20, 0).unwrap();
         println!("{:#?}", divide);
     }
+    #[test]
+    fn dian_bing() {
+        let num = 3 * 5 * 8;
+        let mut n1 = 0;
+        let mut temp = 5 * 8;
+        let mut mul_times = 1;
+        loop {
+            if n1 % 3 == 1 {
+                break;
+            }
+            n1 = temp * mul_times;
+            mul_times += 1;
+        }
+        let mut n2 = 0;
+        temp = 3 * 8;
+        mul_times = 1;
+        loop {
+            if n2 % 5 == 1 {
+                break;
+            }
+            n2 = temp * mul_times;
+            mul_times += 1;
+        }
+        let mut n3 = 0;
+        temp = 3 * 5;
+        mul_times = 1;
+        loop {
+            if n3 % 8 == 1 {
+                break;
+            }
+            n3 = temp * mul_times;
+            mul_times += 1;
+        }
+        println!("n1:{},n2:{},n3:{}", n1, n2, n3);
+        let mut ans = n1 * 2 + n2 * 3 + n3 * 5;
+        loop {
+            if ans >= 200 && ans <= 400 {
+                break;
+            } else if ans < 200 {
+                ans += num;
+            } else {
+                ans -= num;
+            }
+        }
+        println!("answer:{}", ans);
+    }
 }

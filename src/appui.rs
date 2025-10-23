@@ -6,9 +6,7 @@ use std::{
 };
 
 use egui::{
-    AtomExt, Color32, ColorImage, Context, CornerRadius, ImageData, ImageSource, Pos2, Rect,
-    RichText, TextureId, TextureOptions, Ui, Vec2, Vec2b, ViewportBuilder, ViewportId, WidgetText,
-    epaint::ImageDelta, include_image,
+    include_image, Color32, ColorImage, Context, CornerRadius, ImageData, ImageSource, Pos2, Rect, RichText, TextureHandle, TextureOptions, Ui, Vec2, Vec2b, ViewportBuilder, ViewportId, WidgetText
 };
 
 use image::DynamicImage;
@@ -25,12 +23,11 @@ const PLAY_IMG: ImageSource = include_image!("../resources/play_img.png");
 const PAUSE_IMG: ImageSource = include_image!("../resources/pause-97625_1920.png");
 const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.png");
 const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png");
-const UP_ARROW_IMG: ImageSource = include_image!("../resources/uparrow.png");
-const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
+pub const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
 const EMOJI_FONT: &[u8] = include_bytes!("../resources/fonts/seguiemj.ttf");
 /// the main struct stores all the vars which are related to ui  
 pub struct AppUi {
-    video_texture_id: Option<TextureId>,
+    video_texture_handle: Option<TextureHandle>,
     tiny_decoder: Option<crate::decode::TinyDecoder>,
     audio_player: Option<crate::audio_play::AudioPlayer>,
     current_audio_frame_timestamp: Arc<RwLock<i64>>,
@@ -65,10 +62,11 @@ impl eframe::App for AppUi {
 
                  */
                 let now = Instant::now();
-                if let None = self.video_texture_id {
-                    self.create_video_texture(ctx);
+                if let None = self.video_texture_handle {
+                    self.load_video_texture(ctx);
                     self.frame_show_instant = now;
                 }
+
                 if self
                     .async_ctx
                     .exec_normal_task(self.tiny_decoder.as_ref().unwrap().check_input_exist())
@@ -169,16 +167,15 @@ impl eframe::App for AppUi {
                                                         c_img
                                                             .as_raw_mut()
                                                             .copy_from_slice(cur_v_frame.data(0));
-                                                        if let Some(v_tex) = &self.video_texture_id
+                                                        if let Some(v_tex) = &mut self.video_texture_handle
                                                         {
-                                                            ctx.tex_manager().write().set(
-                                                                *v_tex,
-                                                                ImageDelta::full(
+                                                                
+                                                            v_tex.set(
                                                                     ImageData::Color(Arc::new(
                                                                         c_img.clone(),
                                                                     )),
                                                                     TextureOptions::LINEAR,
-                                                                ),
+                                                                
                                                             );
                                                         }
                                                     }
@@ -273,7 +270,6 @@ impl eframe::App for AppUi {
                     self.control_ui_flag = false;
                 }
             });
-
             ctx.request_repaint();
         });
     }
@@ -326,7 +322,7 @@ impl AppUi {
             }
         };
         let async_ctx = AsyncContext::new();
-        let rt=async_ctx.get_runtime();
+        let rt = async_ctx.get_runtime();
         let f_dialog = egui_file::FileDialog::open_file(None);
         let (color_image, dyn_img) = {
             if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
@@ -347,7 +343,7 @@ impl AppUi {
         };
 
         let mut sel = Self {
-            video_texture_id: None,
+            video_texture_handle: None,
             tiny_decoder: None,
             audio_player: None,
             current_audio_frame_timestamp: Arc::new(RwLock::new(0)),
@@ -384,7 +380,7 @@ impl AppUi {
          */
         let layer_painter = ctx.layer_painter(ui.layer_id());
         layer_painter.image(
-            *self.video_texture_id.as_ref().unwrap(),
+            self.video_texture_handle.as_ref().unwrap().id(),
             Rect::from_min_max(
                 Pos2::new(0.0, 0.0),
                 Pos2::new(ctx.screen_rect().width(), ctx.screen_rect().height()),
@@ -442,17 +438,16 @@ impl AppUi {
             *img = color_image;
         }
     }
-    fn create_video_texture(&mut self, ctx: &egui::Context) {
+    fn load_video_texture(&mut self, ctx: &egui::Context) {
         /*
-        创建视频显示用texture
+        从image背景图加载视频显示用texture
          */
-        let id = ctx.tex_manager().write().alloc(
-            "video_texture".to_string(),
+        let t = ctx.load_texture(
+            "video_texture",
             ImageData::Color(Arc::new(self.main_color_image.as_ref().unwrap().clone())),
             TextureOptions::LINEAR,
         );
-
-        self.video_texture_id = Some(id);
+        self.video_texture_handle = Some(t);
     }
 
     fn audio_source_add(&mut self) {
@@ -522,9 +517,9 @@ impl AppUi {
                 || path.display().to_string().ends_with(".ts")
             {
                 warn!("filepath{}", path.display().to_string());
-                self.change_format_input(ctx, path.as_path(), now);
+                self.change_format_input(path.as_path(), now);
             } else {
-                self.err_window_msg = "please choose a valid file !!!".to_string();
+                self.err_window_msg = "please choose a valid video file !!!".to_string();
                 self.err_window_flag = true;
             }
         }
@@ -723,9 +718,10 @@ impl AppUi {
                     let a_time = timestamp * 1000 * audio_time_base.numerator() as i64
                         / audio_time_base.denominator() as i64;
                     if (v_time - a_time).abs() > 1000 {
-                        self.current_video_frame=None;
+                        self.current_video_frame = None;
                         return true;
                     } else if v_time > a_time {
+                       
                         return false;
                     } else {
                         return true;
@@ -838,18 +834,15 @@ impl AppUi {
                                         if ui.button(&i.name).clicked() {
                                             self.async_ctx.watch_shared_video(i.clone());
                                             self.change_format_input(
-                                                ctx,
                                                 Path::new("tcp://127.0.0.1:18858"),
                                                 now,
                                             );
                                         }
                                     }
                                 });
-                                let up_arrow_image =
-                                    egui::Image::new(UP_ARROW_IMG).atom_size(Vec2::new(12.0, 12.0));
                                 if let Some(dialog) = &mut self.share_folder_dialog {
                                     dialog.show(ctx);
-                                    if ui.button((up_arrow_image, "share video")).clicked() {
+                                    if ui.button("share video").clicked() {
                                         dialog.open();
                                     }
                                     if dialog.selected() {
@@ -899,11 +892,9 @@ impl AppUi {
             });
         }
     }
-    fn reset_main_tex_to_bg(&mut self, ctx: &Context) {
-        if let Some(v_tex) = &self.video_texture_id {
-            ctx.tex_manager().write().set(
-                *v_tex,
-                ImageDelta::full(
+    fn reset_main_tex_to_bg(&mut self) {
+        if let Some(v_tex) = &mut self.video_texture_handle {
+            v_tex.set(
                     ImageData::Color(Arc::new(ColorImage::from_rgba_unmultiplied(
                         [
                             self.bg_dyn_img.width() as usize,
@@ -912,33 +903,29 @@ impl AppUi {
                         self.bg_dyn_img.as_bytes(),
                     ))),
                     TextureOptions::LINEAR,
-                ),
             );
         }
     }
-    fn reset_main_tex_to_cover_pic(&mut self, ctx: &Context) {
-        if let Some(v_tex) = &self.video_texture_id {
+    fn reset_main_tex_to_cover_pic(&mut self) {
+        if let Some(v_tex) = &mut self.video_texture_handle {
             if let Some(tiny_decoder) = &self.tiny_decoder {
                 let pic_data = tiny_decoder.get_cover_pic_data();
                 let cover_data = self.async_ctx.exec_normal_task(pic_data.read());
                 if let Some(data_vec) = &*cover_data {
                     if let Ok(img) = image::load_from_memory(&data_vec) {
-                        ctx.tex_manager().write().set(
-                            *v_tex,
-                            ImageDelta::full(
+                        v_tex.set(
                                 ImageData::Color(Arc::new(ColorImage::from_rgba_unmultiplied(
                                     [img.width() as usize, img.height() as usize],
                                     img.as_bytes(),
                                 ))),
                                 TextureOptions::LINEAR,
-                            ),
                         );
                     }
                 }
             }
         }
     }
-    fn change_format_input(&mut self, ctx: &Context, path: &Path, now: &Instant) {
+    fn change_format_input(&mut self, path: &Path, now: &Instant) {
         if let Some(tiny_decoder) = &mut self.tiny_decoder {
             let path = {
                 warn!("input path===={:?}", path);
@@ -948,31 +935,16 @@ impl AppUi {
                     VideoPathSource::File(path.to_path_buf())
                 }
             };
-
-            if !self
-                .async_ctx
-                .exec_normal_task(tiny_decoder.check_input_exist())
             {
                 self.pause_flag = true;
-                self.async_ctx.exec_normal_task(async {
-                    tiny_decoder.set_file_path_and_init_par(path).await;
-                });
-                self.async_ctx.exec_normal_task(tiny_decoder.start_process_input());
 
-                self.update_color_image();
-                self.reset_main_tex_to_cover_pic(ctx);
-                self.frame_show_instant = *now;
-            } else {
-                self.pause_flag = true;
-
-                self.async_ctx.exec_normal_task(async {
-                    tiny_decoder.set_file_path_and_init_par(path).await;
-                });
+                self.async_ctx
+                    .exec_normal_task(tiny_decoder.set_file_path_and_init_par(path));
                 if let Some(au_pl) = &mut self.audio_player {
                     au_pl.source_queue_skip_to_end();
                 }
-                self.reset_main_tex_to_bg(ctx);
-                self.reset_main_tex_to_cover_pic(ctx);
+                self.reset_main_tex_to_bg();
+                self.reset_main_tex_to_cover_pic();
                 self.update_color_image();
                 self.async_ctx.exec_normal_task(async {
                     let mut mutex_guard = self.current_audio_frame_timestamp.write().await;

@@ -9,11 +9,13 @@ use ffmpeg_the_third::{
     Rational, Stream,
     codec::Id,
     ffi::{AVBufferRef, av_hwdevice_ctx_create, av_hwframe_transfer_data, avcodec_get_hw_config},
+    filter::Graph,
     format::{self, Pixel},
+    frame::Video,
 };
 use log::warn;
 use time::format_description;
-use tokio::{runtime::Runtime, sync::RwLock, task::JoinHandle, time::sleep};
+use tokio::{io::AsyncWriteExt, runtime::Runtime, sync::RwLock, task::JoinHandle, time::sleep};
 
 use crate::appui::VideoPathSource;
 /// in order to make Input impl Sync, create a new Type ,
@@ -59,6 +61,7 @@ pub struct TinyDecoder {
     hardware_config: Arc<RwLock<bool>>,
     cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
     async_rt: Arc<Runtime>,
+    graph: Arc<RwLock<Option<ffmpeg_the_third::filter::Graph>>>,
 }
 impl TinyDecoder {
     /// init Decoder and new Struct
@@ -89,12 +92,16 @@ impl TinyDecoder {
             hardware_config: Arc::new(RwLock::new(false)),
             cover_pic_data: Arc::new(RwLock::new(None)),
             async_rt: runtime,
+            graph: Arc::new(RwLock::new(None)),
         };
     }
     /// called when user selected a file path to play
     /// init all the details from the file selected
     pub async fn set_file_path_and_init_par(&mut self, path: VideoPathSource) {
         warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
+        if self.demux_task_handle.is_some() {
+            self.stop_demux_and_decode().await;
+        }
         let format_input = {
             if let VideoPathSource::TcpStream(s) = &path {
                 ffmpeg_the_third::format::input(s).unwrap()
@@ -170,6 +177,8 @@ impl TinyDecoder {
             video_decoder.width(),
             video_decoder.height()
         );
+        let graph = ffmpeg_the_third::filter::Graph::new();
+        *self.graph.write().await = Some(graph);
         self.converter_ctx = Some(
             ffmpeg_the_third::software::converter(
                 (video_decoder.width(), video_decoder.height()),
@@ -213,6 +222,7 @@ impl TinyDecoder {
             *input = Some(ManualProtectedInput(format_input));
         }
         warn!("par init finished!!!");
+        self.start_process_input().await;
     }
     /// the loop of demux video file
     async fn packet_demux_process(
@@ -278,7 +288,43 @@ impl TinyDecoder {
         audio_frame_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::frame::Audio>>>,
         packet_cache_vec: std::sync::Arc<RwLock<Vec<ffmpeg_the_third::packet::Packet>>>,
         hardware_config: Arc<RwLock<bool>>,
+        graph: Arc<RwLock<Option<Graph>>>,
+        video_time_base: Rational,
+        video_frame_rect: [u32; 2],
     ) {
+        if let Err(_) = tokio::fs::File::open("./tmp_font.ttf").await {
+            if let Ok(mut file) = tokio::fs::File::create_new("./tmp_font.ttf").await {
+                if let Ok(_) = file.write_all(crate::appui::MAPLE_FONT).await {}
+            }
+        }
+        {
+            let mut graph = graph.write().await;
+            let graph = graph.as_mut().unwrap();
+            let args = {
+                let video_decoder = video_decoder.read().await;
+                let decoder = &video_decoder.as_ref().unwrap().0;
+                warn!(
+                    "video pixformat name{:?}",
+                    decoder.format().descriptor().unwrap().name()
+                );
+                let spec = "drawtext=text=\'Tiny Player\':fontfile=./tmp_font.ttf:fontsize=24:fontcolor=white@0.5:x=w-text_w-10:y=10";
+                format!(
+                    "buffer=video_size={}x{}:pix_fmt={}:time_base={}/{}[in];[in]{}[out];[out]buffersink",
+                    video_frame_rect[0],
+                    video_frame_rect[1],
+                    decoder.format().descriptor().unwrap().name(),
+                    video_time_base.numerator(),
+                    video_time_base.denominator(),
+                    spec
+                )
+            };
+
+            graph.parse(&args).unwrap();
+
+            graph.validate().unwrap();
+            warn!("graph validate success!dump:\n{}", graph.dump());
+        }
+
         loop {
             if *exit_flag.read().await {
                 break;
@@ -336,7 +382,27 @@ impl TinyDecoder {
                                 break;
                             }
                             if !*hardware_config.read().await {
-                                v_frame_vec.push(video_frame_tmp);
+                                let mut graph = graph.write().await;
+                                let graph = graph.as_mut().unwrap();
+                                if let Ok(_) = graph
+                                    .get("in")
+                                    .as_mut()
+                                    .unwrap()
+                                    .source()
+                                    .add(&video_frame_tmp)
+                                {
+                                    let mut filtered_frame =
+                                        ffmpeg_the_third::frame::Video::empty();
+                                    if let Ok(_) = graph
+                                        .get("out")
+                                        .as_mut()
+                                        .unwrap()
+                                        .sink()
+                                        .frame(&mut filtered_frame)
+                                    {
+                                        v_frame_vec.push(filtered_frame);
+                                    }
+                                }
                             } else {
                                 unsafe {
                                     let mut transfered_frame =
@@ -348,8 +414,43 @@ impl TinyDecoder {
                                     ) {
                                         warn!("hardware frame transfer to software frame err");
                                     }
+
                                     transfered_frame.set_pts(video_frame_tmp.pts());
-                                    v_frame_vec.push(transfered_frame);
+                                    let mut default_frame = Video::empty();
+                                    {
+                                        let mut converter = ffmpeg_the_third::software::converter(
+                                            (video_frame_tmp.width(), video_frame_tmp.height()),
+                                            transfered_frame.format(),
+                                            Pixel::YUV420P,
+                                        )
+                                        .unwrap();
+
+                                        converter
+                                            .run(&transfered_frame, &mut default_frame)
+                                            .unwrap();
+                                        default_frame.set_pts(transfered_frame.pts());
+                                    }
+                                    let mut graph = graph.write().await;
+                                    let graph = graph.as_mut().unwrap();
+                                    if let Ok(_) = graph
+                                        .get("Parsed_buffer_0")
+                                        .as_mut()
+                                        .unwrap()
+                                        .source()
+                                        .add(&default_frame)
+                                    {
+                                        let mut filtered_frame =
+                                            ffmpeg_the_third::frame::Video::empty();
+                                        if let Ok(_) = graph
+                                            .get("Parsed_buffersink_2")
+                                            .as_mut()
+                                            .unwrap()
+                                            .sink()
+                                            .frame(&mut filtered_frame)
+                                        {
+                                            v_frame_vec.push(filtered_frame);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -388,7 +489,9 @@ impl TinyDecoder {
         let packet_cache_vec = self.packet_cache_vec.clone();
         let cov_stream_index = self.cover_stream_index.clone();
         let cover_pic_data = self.cover_pic_data.clone();
+        *self.demux_exit_flag.write().await = false;
         let demux_exit_flag = self.demux_exit_flag.clone();
+
         self.demux_task_handle = Some(tokio::spawn(async move {
             Self::packet_demux_process(
                 demux_exit_flag,
@@ -408,7 +511,12 @@ impl TinyDecoder {
         let audio_frame_cache_vec = self.audio_frame_cache_vec.clone();
         let packet_cache_vec = self.packet_cache_vec.clone();
         let hardware_config = self.hardware_config.clone();
+        *self.decode_exit_flag.write().await = false;
         let decode_exit_flag = self.decode_exit_flag.clone();
+
+        let graph = self.graph.clone();
+        let video_time_base = self.video_time_base.clone();
+        let video_frame_rect = self.video_frame_rect.clone();
         self.decode_task_handle = Some(tokio::spawn(async move {
             Self::frame_decode_process(
                 decode_exit_flag,
@@ -420,6 +528,9 @@ impl TinyDecoder {
                 audio_frame_cache_vec,
                 packet_cache_vec,
                 hardware_config,
+                graph,
+                video_time_base,
+                video_frame_rect,
             )
             .await;
         }));
@@ -569,6 +680,13 @@ impl TinyDecoder {
     pub fn get_format_duration(&self) -> Arc<RwLock<i64>> {
         self.format_duration.clone()
     }
+    async fn stop_demux_and_decode(&mut self) {
+        *self.demux_exit_flag.write().await = true;
+        self.demux_task_handle.as_mut().unwrap().await.unwrap();
+        *self.decode_exit_flag.write().await = true;
+        self.decode_task_handle.as_mut().unwrap().await.unwrap();
+        warn!("demux and decode task exit gracefully!!!");
+    }
 }
 
 impl TinyDecoder {
@@ -613,16 +731,7 @@ impl TinyDecoder {
 }
 impl Drop for TinyDecoder {
     fn drop(&mut self) {
-        self.async_rt.block_on(async {
-            *self.demux_exit_flag.write().await = true;
-            self.demux_task_handle.as_mut().unwrap().await.unwrap();
-            *self.decode_exit_flag.write().await = true;
-            self.decode_task_handle.as_mut().unwrap().await.unwrap();
-            warn!("demux and decode task exit gracefully!!!");
-            self.packet_cache_vec.write().await.clear();
-            self.audio_frame_cache_vec.write().await.clear();
-            self.video_frame_cache_vec.write().await.clear();
-            warn!("cache vec cleared gracefully!!!!");
-        });
+        let runtime = self.async_rt.clone();
+        runtime.block_on(self.stop_demux_and_decode());
     }
 }

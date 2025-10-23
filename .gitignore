@@ -3,3 +3,6 @@
 /tiny_installer
 Cargo.lock
 debug.log
+tmp_font.ttf
+/test
+/.cargo
