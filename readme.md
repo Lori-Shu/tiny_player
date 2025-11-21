@@ -23,3 +23,7 @@ core feature based on project
 6. click open 
 7. click the play button
 8. control the video by the control widges
+# Tips
+1. if you use a laptop and player runs at a very low frame 
+rate, turn off "BatteryBoost" in nvidia driver which is to save 
+energy.

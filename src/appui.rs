@@ -30,7 +30,7 @@ const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.
 const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png");
 pub const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
 const EMOJI_FONT: &[u8] = include_bytes!("../resources/fonts/seguiemj.ttf");
-/// the main struct stores all the vars which are related to ui  
+/// the main struct stores all the vars which are related to ui
 pub struct AppUi {
     video_texture_handle: Option<TextureHandle>,
     tiny_decoder: Option<crate::decode::TinyDecoder>,
@@ -128,7 +128,9 @@ impl eframe::App for AppUi {
                 if (now - self.last_show_control_ui_instant).as_secs() > 3 {
                     self.control_ui_flag = false;
                 }
+                self.detect_file_drag(ctx, &now);
             });
+
             ctx.request_repaint();
         });
     }
@@ -381,14 +383,8 @@ impl AppUi {
         }
 
         if let Some(path) = self.opened_file.take() {
-            let path_s = path.to_str().unwrap();
-            if path_s.ends_with(".mp4")
-                || path_s.ends_with(".mkv")
-                || path_s.ends_with(".mp3")
-                || path_s.ends_with(".flac")
-            {
-                warn!("filepath{}", path.display().to_string());
-                self.change_format_input(path.as_path(), now);
+            if self.change_format_input(path.as_path(), now).is_ok() {
+                warn!("accept file path{}", path.display().to_string());
             } else {
                 self.err_window_msg = "please choose a valid video or audio file !!!".to_string();
                 self.err_window_flag = true;
@@ -746,7 +742,7 @@ impl AppUi {
                                             self.change_format_input(
                                                 Path::new("tcp://127.0.0.1:18858"),
                                                 now,
-                                            );
+                                            ).unwrap();
                                         }
                                     }
                                 });
@@ -835,20 +831,21 @@ impl AppUi {
             }
         }
     }
-    fn change_format_input(&mut self, path: &Path, now: &Instant) {
-        if let Some(tiny_decoder) = &mut self.tiny_decoder {
-            let path = {
-                warn!("input path===={:?}", path);
-                if path.to_str().unwrap().starts_with("tcp") {
-                    VideoPathSource::TcpStream(path.to_path_buf())
-                } else {
-                    VideoPathSource::File(path.to_path_buf())
-                }
-            };
-            {
+    fn change_format_input(&mut self, path: &Path, now: &Instant) -> Result<(), String> {
+        
+            if let Some(tiny_decoder) = &mut self.tiny_decoder {
+                let path = {
+                    warn!("input path===={:?}", path);
+                    if path.to_str().unwrap().starts_with("tcp") {
+                        VideoPathSource::TcpStream(path.to_path_buf())
+                    } else {
+                        VideoPathSource::File(path.to_path_buf())
+                    }
+                };
+
                 self.pause_flag = true;
                 self.async_ctx.exec_normal_task(async {
-                    tiny_decoder.set_file_path_and_init_par(path).await;
+                    tiny_decoder.set_file_path_and_init_par(path).await.unwrap();
                 });
                 if let Some(au_pl) = &mut self.audio_player {
                     au_pl.source_queue_skip_to_end();
@@ -865,8 +862,9 @@ impl AppUi {
 
                 self.current_video_frame = None;
                 self.frame_show_instant = *now;
-            }
+            
         }
+        Ok(())
     }
 
     fn data_manage_and_sync(&mut self, now: Instant) {
@@ -936,7 +934,7 @@ impl AppUi {
                                                 {
                                                     if duration.as_millis() < 1000 {
                                                         self.frame_show_instant = ins;
-                                                        warn!("add dur{}", duration.as_millis());
+                                                        // warn!("add dur{}", duration.as_millis());
                                                     } else {
                                                         self.frame_show_instant = now;
                                                     }
@@ -978,6 +976,21 @@ impl AppUi {
         if self.check_play_is_at_endtail() {
             self.pause_flag = true;
         }
+    }
+    fn detect_file_drag(&mut self, ctx: &Context, now: &Instant) {
+        ctx.input(|input| {
+            let dropped_files = &input.raw.dropped_files;
+            if dropped_files.len() > 0 {
+                let path = dropped_files[0].path.as_ref().unwrap();
+                if self.change_format_input(path.as_path(), now).is_ok() {
+                    warn!("filepath{}", path.display().to_string());
+                } else {
+                    self.err_window_msg =
+                        "please choose a valid video or audio file !!!".to_string();
+                    self.err_window_flag = true;
+                }
+            }
+        });
     }
 }
 pub enum VideoPathSource {
