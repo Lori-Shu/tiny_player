@@ -1,3 +1,5 @@
+use log::warn;
+
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
     stream: Option<rodio::OutputStream>,
@@ -21,9 +23,10 @@ impl AudioPlayer {
     }
     pub fn play_raw_data_from_audio_frame(&self, audio_frame: ffmpeg_the_third::frame::Audio) {
         let audio_data: &[f32] = bytemuck::cast_slice(audio_frame.data(0));
+        warn!("audio frame rate {}", audio_frame.rate());
         let source = rodio::buffer::SamplesBuffer::new(
             audio_frame.ch_layout().channels() as u16,
-            48000,
+            audio_frame.rate(),
             audio_data,
         );
         let sink = self.sink.as_ref().unwrap();

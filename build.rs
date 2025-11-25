@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 fn main() {
     let mut dlls = vec![];
-    let folder_path = Path::new("D:/cppproject/ffmpeg-n8.0-latest-win64-gpl-shared-8.0/bin");
+    let folder_path = Path::new("D:/program/ffmpeg-n8.0-latest-win64-gpl-shared-8.0/bin");
     if let Ok(dir) = folder_path.read_dir() {
         for dir_entry in dir {
             if let Ok(p) = dir_entry {

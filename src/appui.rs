@@ -325,7 +325,7 @@ impl AppUi {
             if let Some(tiny_decoder) = &mut self.tiny_decoder {
                 if let MainStream::Audio = tiny_decoder.get_main_stream() {
                     if audio_player.len() < 30 {
-                        let frame_fu = tiny_decoder.get_one_audio_play_frame_and_pts();
+                        let frame_fu = tiny_decoder.pull_one_audio_play_frame();
 
                         if let Some(audio_frame) = self.async_ctx.exec_normal_task(frame_fu) {
                             if let Some(pts) = audio_frame.pts() {
@@ -475,28 +475,31 @@ impl AppUi {
                     self.frame_show_instant = now.clone();
                     self.current_video_frame = None;
                 }
-                let mut volumn_img = egui::Image::new(VOLUMN_IMG);
-                volumn_img = volumn_img.max_height(20.0);
-                volumn_img = volumn_img.corner_radius(50.0);
-                let volumn_img_btn = egui::Button::image(volumn_img).frame(false);
-                let btn_response = ui.add(volumn_img_btn);
-                if btn_response.hovered() {
-                    self.control_ui_flag = true;
-                    self.last_show_control_ui_instant = now.clone();
-                }
-                let mut fullscreen_img = egui::Image::new(FULLSCREEN_IMG);
-                fullscreen_img = fullscreen_img.max_height(20.0);
-                fullscreen_img = fullscreen_img.corner_radius(50.0);
-                let fullscreen_image_btn = egui::Button::image(fullscreen_img).frame(false);
-                let btn_response = ui.add(fullscreen_image_btn);
-                if btn_response.hovered() {
-                    self.control_ui_flag = true;
-                    self.last_show_control_ui_instant = now.clone();
-                }
-                if btn_response.clicked() {
-                    self.fullscreen_flag = !self.fullscreen_flag;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen_flag));
-                }
+                ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+                    let volumn_img_btn =
+                        egui::Button::new(VOLUMN_IMG.atom_size(Vec2::new(50.0, 50.0))).frame(false);
+                    let btn_response = ui.add(volumn_img_btn);
+                    if btn_response.hovered() {
+                        self.control_ui_flag = true;
+                        self.last_show_control_ui_instant = now.clone();
+                    }
+                });
+                ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+                    let fullscreen_image_btn =
+                        egui::Button::new(FULLSCREEN_IMG.atom_size(Vec2::new(50.0, 50.0)))
+                            .frame(false);
+                    let btn_response = ui.add(fullscreen_image_btn);
+                    if btn_response.hovered() {
+                        self.control_ui_flag = true;
+                        self.last_show_control_ui_instant = now.clone();
+                    }
+                    if btn_response.clicked() {
+                        self.fullscreen_flag = !self.fullscreen_flag;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                            self.fullscreen_flag,
+                        ));
+                    }
+                });
             }
         });
     }
@@ -544,11 +547,19 @@ impl AppUi {
     fn paint_frame_info_text(&self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         ui.horizontal(|ui| {
             let app_sec = (*now - self.app_start_instant).as_secs();
+            let mut orange_color = Color32::ORANGE.to_srgba_unmultiplied();
+            orange_color[3] = 100;
             if app_sec > 0 {
                 let mut text_str = "fps：".to_string();
                 text_str.push_str((ctx.cumulative_frame_nr() / app_sec).to_string().as_str());
+
                 let rich_text = egui::RichText::new(text_str)
-                    .color(Color32::ORANGE)
+                    .color(Color32::from_rgba_unmultiplied(
+                        orange_color[0],
+                        orange_color[1],
+                        orange_color[2],
+                        orange_color[3],
+                    ))
                     .size(30.0);
                 let fps_button = egui::Button::new(rich_text).frame(false);
                 ui.add(fps_button);
@@ -564,7 +575,12 @@ impl AppUi {
                 }
             }
             let rich_text = egui::RichText::new(date_time_str)
-                .color(Color32::ORANGE)
+                .color(Color32::from_rgba_unmultiplied(
+                    orange_color[0],
+                    orange_color[1],
+                    orange_color[2],
+                    orange_color[3],
+                ))
                 .size(30.0);
             let date_time_button = egui::Button::new(rich_text).frame(false);
 
@@ -742,7 +758,8 @@ impl AppUi {
                                             self.change_format_input(
                                                 Path::new("tcp://127.0.0.1:18858"),
                                                 now,
-                                            ).unwrap();
+                                            )
+                                            .unwrap();
                                         }
                                     }
                                 });
@@ -832,37 +849,35 @@ impl AppUi {
         }
     }
     fn change_format_input(&mut self, path: &Path, now: &Instant) -> Result<(), String> {
-        
-            if let Some(tiny_decoder) = &mut self.tiny_decoder {
-                let path = {
-                    warn!("input path===={:?}", path);
-                    if path.to_str().unwrap().starts_with("tcp") {
-                        VideoPathSource::TcpStream(path.to_path_buf())
-                    } else {
-                        VideoPathSource::File(path.to_path_buf())
-                    }
-                };
-
-                self.pause_flag = true;
-                self.async_ctx.exec_normal_task(async {
-                    tiny_decoder.set_file_path_and_init_par(path).await.unwrap();
-                });
-                if let Some(au_pl) = &mut self.audio_player {
-                    au_pl.source_queue_skip_to_end();
+        if let Some(tiny_decoder) = &mut self.tiny_decoder {
+            let path = {
+                warn!("input path===={:?}", path);
+                if path.to_str().unwrap().starts_with("tcp") {
+                    VideoPathSource::TcpStream(path.to_path_buf())
+                } else {
+                    VideoPathSource::File(path.to_path_buf())
                 }
-                self.reset_main_tex_to_bg();
-                self.reset_main_tex_to_cover_pic();
-                self.update_color_image();
-                self.async_ctx.exec_normal_task(async {
-                    let mut mutex_guard = self.main_stream_current_timestamp.write().await;
-                    {
-                        *mutex_guard = 0;
-                    }
-                });
+            };
 
-                self.current_video_frame = None;
-                self.frame_show_instant = *now;
-            
+            self.pause_flag = true;
+            self.async_ctx.exec_normal_task(async {
+                tiny_decoder.set_file_path_and_init_par(path).await.unwrap();
+            });
+            if let Some(au_pl) = &mut self.audio_player {
+                au_pl.source_queue_skip_to_end();
+            }
+            self.reset_main_tex_to_bg();
+            self.reset_main_tex_to_cover_pic();
+            self.update_color_image();
+            self.async_ctx.exec_normal_task(async {
+                let mut mutex_guard = self.main_stream_current_timestamp.write().await;
+                {
+                    *mutex_guard = 0;
+                }
+            });
+
+            self.current_video_frame = None;
+            self.frame_show_instant = *now;
         }
         Ok(())
     }

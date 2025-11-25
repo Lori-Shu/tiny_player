@@ -1,4 +1,5 @@
 use std::{
+    fmt::Error,
     ptr::{null, null_mut},
     sync::Arc,
     time::Duration,
@@ -7,7 +8,6 @@ use std::{
 
 use ffmpeg_the_third::{
     Rational, Stream,
-    codec::Id,
     ffi::{
         AVBufferRef, AVPixelFormat, av_hwdevice_ctx_create, av_hwframe_transfer_data,
         avcodec_get_hw_config,
@@ -129,14 +129,14 @@ impl TinyDecoder {
         *self.video_decoder.write().await = None;
         self.video_frame_rect = [0, 0];
         self.video_time_base = Rational::new(1, 1);
-        *self.video_packet_cache_vec.write().await = None;
+        *self.audio_packet_cache_vec.write().await = None;
         *self.video_packet_cache_vec.write().await = None;
         *self.audio_frame_cache_vec.write().await = None;
         *self.video_frame_cache_vec.write().await = None;
     }
     /// called when user selected a file path to play
     /// init all the details from the file selected
-    pub async fn set_file_path_and_init_par(&mut self, path: VideoPathSource)->Result<(),String> {
+    pub async fn set_file_path_and_init_par(&mut self, path: VideoPathSource) -> Result<(), Error> {
         warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
         if self.demux_task_handle.is_some() {
             self.stop_demux_and_decode().await;
@@ -303,13 +303,12 @@ impl TinyDecoder {
                 if audio_packet_cache_vec.is_some() && video_packet_cache_vec.is_some() {
                     let a_packets = audio_packet_cache_vec.as_ref().unwrap();
                     let v_packets = video_packet_cache_vec.as_ref().unwrap();
-                    warn!(
-                        "audio packet vec len{},video packet vec len{}",
-                        a_packets.len(),
-                        v_packets.len()
-                    );
+                    //     warn!(
+                    //         "audio packet vec len{},video packet vec len{}",
+                    //         a_packets.len(),
+                    //         v_packets.len()
+                    //     );
                     if a_packets.len() >= 200 && v_packets.len() >= 200 {
-                        
                         continue;
                     }
                 } else if let Some(a_packets) = &*audio_packet_cache_vec {
@@ -435,7 +434,7 @@ impl TinyDecoder {
                 let mut a_frame_vec = audio_frame_cache_vec.write().await;
                 let frames = a_frame_vec.as_mut().unwrap();
                 let mut audio_decoder = audio_decoder.write().await;
-                warn!("audio frame vec len{}", frames.len());
+                // warn!("audio frame vec len{}", frames.len());
                 if packets.len() > 0 && frames.len() < 10 {
                     let front_packet = packets.remove(0);
                     audio_decoder
@@ -465,7 +464,7 @@ impl TinyDecoder {
                 let mut v_frame_vec = video_frame_cache_vec.write().await;
                 let frames = v_frame_vec.as_mut().unwrap();
                 let mut v_decoder = video_decoder.write().await;
-                warn!("video frame vec len{}", frames.len());
+                // warn!("video frame vec len{}", frames.len());
                 if packets.len() > 0 && frames.len() < 10 {
                     let front_packet = packets.remove(0);
 
@@ -604,9 +603,7 @@ impl TinyDecoder {
     }
     /// called by the main thread pull one audio frame from the vec
     /// in addition, do the resample
-    pub async fn get_one_audio_play_frame_and_pts(
-        &mut self,
-    ) -> Option<ffmpeg_the_third::frame::Audio> {
+    pub async fn pull_one_audio_play_frame(&mut self) -> Option<ffmpeg_the_third::frame::Audio> {
         let resampler_ctx = self.resampler_ctx.as_mut().unwrap();
         let mut res = ffmpeg_the_third::frame::Audio::empty();
         let raw_frame;
@@ -622,6 +619,7 @@ impl TinyDecoder {
         resampler_ctx.run(&raw_frame, &mut res).unwrap();
         if let Some(pts) = raw_frame.pts() {
             res.set_pts(Some(pts));
+            res.set_rate(resampler_ctx.output().rate);
         }
         return Some(res);
     }
@@ -705,7 +703,7 @@ impl TinyDecoder {
             video_packet_cache_vec.as_mut().unwrap().clear();
             audio_cache_vec.as_mut().unwrap().clear();
             video_cache_vec.as_mut().unwrap().clear();
-            self.async_rt.block_on(self.flush_decoders());
+
             let mut input = self.async_rt.block_on(self.format_input.write());
             let main_stream_idx = {
                 if let MainStream::Audio = self.main_stream {
@@ -737,6 +735,7 @@ impl TinyDecoder {
                     warn!("seek err num:{res}");
                 }
             }
+            self.async_rt.block_on(self.flush_decoders());
         }
     }
     /// use the file detail to compute the video duration and make str to inform the user
@@ -809,36 +808,34 @@ impl TinyDecoder {
         &mut self,
         stream: &Stream<'_>,
     ) -> ffmpeg_the_third::decoder::Video {
-        let mut codec_ctx =
+        let codec_ctx =
             ffmpeg_the_third::codec::Context::from_parameters(stream.parameters()).unwrap();
-        let codec_id = stream.parameters().id();
-        let decoder: ffmpeg_the_third::decoder::Video;
-        if codec_id.eq(&Id::H264) || codec_id.eq(&Id::H265) || codec_id.eq(&Id::HEVC) {
-            unsafe {
+        let mut decoder = codec_ctx.decoder().video().unwrap();
+        unsafe {
+            let hw_config = avcodec_get_hw_config(decoder.codec().as_ref().unwrap().as_ptr(), 0);
+
+            if hw_config.is_null() {
+                warn!("currently dont support hardware accelerate");
+                return decoder;
+            } else {
                 let mut hw_device_ctx: *mut AVBufferRef = null_mut();
                 if 0 != av_hwdevice_ctx_create(
                     &mut hw_device_ctx as *mut *mut AVBufferRef,
-                    ffmpeg_the_third::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                    (*hw_config).device_type,
                     null(),
                     null_mut(),
                     0,
                 ) {
                     warn!("hw device create err");
-                    return codec_ctx.decoder().video().unwrap();
-                }
-                (*codec_ctx.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
-                decoder = codec_ctx.decoder().video().unwrap();
-                let hw_config = avcodec_get_hw_config(decoder.codec().unwrap().as_ptr(), 0);
-                if hw_config.is_null() {
-                    warn!("currently dont support hardware accelerate");
                     return decoder;
                 }
+
+                (*decoder.0.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
+
                 *self.hardware_config.write().await = true;
+                decoder
             }
-        } else {
-            decoder = codec_ctx.decoder().video().unwrap();
         }
-        decoder
     }
 }
 impl Drop for TinyDecoder {

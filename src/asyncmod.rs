@@ -191,7 +191,7 @@ impl AsyncContext {
         }
         &self.online_videos
     }
-    pub fn get_runtime(&self)->Arc<Runtime>{
+    pub fn get_runtime(&self) -> Arc<Runtime> {
         self.async_runtime.clone()
     }
 }
