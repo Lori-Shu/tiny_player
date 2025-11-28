@@ -73,7 +73,7 @@ mod test {
     fn testdivide() {
         let divide = divide(20, 0).unwrap();
         println!("{:#?}", divide);
-        println!("success");
+        println!("test success");
     }
     #[test]
     fn dian_bing() {
