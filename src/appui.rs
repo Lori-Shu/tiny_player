@@ -46,11 +46,11 @@ pub struct AppUi {
     control_ui_flag: bool,
     err_window_flag: bool,
     err_window_msg: String,
+    network_window_flag: bool,
     last_show_control_ui_instant: Instant,
     app_start_instant: Instant,
     current_video_frame: Option<ffmpeg_the_third::frame::Video>,
     async_ctx: AsyncContext,
-    show_content_window_flag: bool,
     content_str: String,
     opened_file: Option<std::path::PathBuf>,
     open_file_dialog: Option<egui_file::FileDialog>,
@@ -110,7 +110,7 @@ impl eframe::App for AppUi {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         self.paint_file_btn(ui, ctx, &now);
-                        self.paint_open_network_content_box(ui, ctx, &now);
+                        self.paint_network_button(ui, ctx, &now);
                     });
                 });
 
@@ -217,11 +217,11 @@ impl AppUi {
             control_ui_flag: true,
             err_window_flag: false,
             err_window_msg: String::new(),
+            network_window_flag: false,
             last_show_control_ui_instant: Instant::now(),
             app_start_instant: Instant::now(),
             current_video_frame: None,
             async_ctx: async_ctx,
-            show_content_window_flag: false,
             content_str: String::new(),
             opened_file: None,
             open_file_dialog: Some(f_dialog),
@@ -656,22 +656,17 @@ impl AppUi {
         true
     }
 
-    fn paint_open_network_content_box(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
-        let openbox = egui::Checkbox::new(&mut self.show_content_window_flag, "network");
-        let box_response = ui.add(openbox);
-        if box_response.hovered() {
-            self.control_ui_flag = true;
-            self.last_show_control_ui_instant = now.clone();
-        }
-
-        if self.show_content_window_flag {
+    fn paint_network_window(&mut self, ctx: &Context, now: &Instant) {
+        if self.network_window_flag {
             let viewport_id = ViewportId::from_hash_of("content_window");
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd_to(
                 viewport_id,
                 egui::ViewportCommand::Title("content_window".to_string()),
             );
-            ctx.show_viewport_immediate(viewport_id, ViewportBuilder::default(), |ctx, _| {
+
+            let viewport_builder = ViewportBuilder::default().with_close_button(false);
+            ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
@@ -1006,6 +1001,30 @@ impl AppUi {
                 }
             }
         });
+    }
+    fn paint_network_button(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
+        let mut orange_color = Color32::ORANGE.to_srgba_unmultiplied();
+        orange_color[3] = 100;
+        let btn_text = RichText::new("network")
+            .color(Color32::from_rgba_unmultiplied(
+                orange_color[0],
+                orange_color[1],
+                orange_color[2],
+                orange_color[3],
+            ))
+            .size(30.0);
+        let open_btn = egui::Button::new(btn_text).frame(false);
+        let btn_response = ui.add(open_btn);
+        if btn_response.hovered() {
+            self.control_ui_flag = true;
+            self.last_show_control_ui_instant = now.clone();
+        }
+        if btn_response.clicked() {
+            self.network_window_flag = !self.network_window_flag;
+        }
+        if self.network_window_flag {
+            self.paint_network_window(ctx, now);
+        }
     }
 }
 pub enum VideoPathSource {
