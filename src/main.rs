@@ -2,7 +2,7 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
-#![deny(unused)]
+#![deny(unused,clippy::panic,clippy::unwrap_used,clippy::expect_used)]
 
 use std::sync::Arc;
 
@@ -15,8 +15,10 @@ mod audio_play;
 mod decode;
 /// main fun init log, init main ui type Appui
 fn main() {
-    simple_logger::init_with_level(Level::Warn).unwrap();
-    warn!("logger init and app banner!!-------------==========");
+    if simple_logger::init_with_level(Level::Warn).is_ok() {
+        warn!("logger init success\napp banner!!====================");
+    }
+    
     let tiny_app_ui = appui::AppUi::new();
     let mut options = eframe::NativeOptions::default();
     options.renderer = eframe::Renderer::Wgpu;
@@ -32,7 +34,7 @@ fn main() {
     options.centered = true;
     options.viewport.inner_size = Some(Vec2::new(900.0, 700.0));
 
-    eframe::run_native(
+    if eframe::run_native(
         "tiny player",
         options,
         Box::new(|cc| {
@@ -40,8 +42,9 @@ fn main() {
             tiny_app_ui.replace_fonts(&cc.egui_ctx);
             Ok(Box::new(tiny_app_ui))
         }),
-    )
-    .unwrap();
+    ).is_ok(){
+        warn!("eframe start success");
+    }
 }
 #[cfg(test)]
 mod test {

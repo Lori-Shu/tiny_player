@@ -1,5 +1,4 @@
 use std::{
-    fmt::Error,
     ptr::{null, null_mut},
     sync::Arc,
     time::Duration,
@@ -136,7 +135,10 @@ impl TinyDecoder {
     }
     /// called when user selected a file path to play
     /// init all the details from the file selected
-    pub async fn set_file_path_and_init_par(&mut self, path: VideoPathSource) -> Result<(), Error> {
+    pub async fn set_file_path_and_init_par(
+        &mut self,
+        path: VideoPathSource,
+    ) -> Result<(), String> {
         warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
         if self.demux_task_handle.is_some() {
             self.stop_demux_and_decode().await;
@@ -223,21 +225,23 @@ impl TinyDecoder {
             self.compute_and_set_end_time_str(adur_ts);
         }
         if video_stream.is_some() {
-            let video_decoder = self
+            if let Ok(video_decoder) = self
                 .choose_decoder_with_hardware_prefer(video_stream.as_ref().unwrap())
-                .await;
-            self.converter_ctx = Some(
-                ffmpeg_the_third::software::converter(
-                    (video_decoder.width(), video_decoder.height()),
-                    Pixel::YUV420P,
-                    Pixel::RGBA,
-                )
-                .unwrap(),
-            );
-            warn!("video decode format{:#?}", video_decoder.format());
-            self.video_frame_rect = [video_decoder.width(), video_decoder.height()];
-            let mut v_decoder = self.video_decoder.write().await;
-            *v_decoder = Some(ManualProtectedVideoDecoder(video_decoder));
+                .await
+            {
+                self.converter_ctx = Some(
+                    ffmpeg_the_third::software::converter(
+                        (video_decoder.width(), video_decoder.height()),
+                        Pixel::YUV420P,
+                        Pixel::RGBA,
+                    )
+                    .unwrap(),
+                );
+                warn!("video decode format{:#?}", video_decoder.format());
+                self.video_frame_rect = [video_decoder.width(), video_decoder.height()];
+                let mut v_decoder = self.video_decoder.write().await;
+                *v_decoder = Some(ManualProtectedVideoDecoder(video_decoder));
+            }
         }
         if audio_stream.is_some() {
             let audio_decoder_ctx = ffmpeg_the_third::codec::Context::from_parameters(
@@ -783,10 +787,17 @@ impl TinyDecoder {
     }
     async fn stop_demux_and_decode(&mut self) {
         *self.demux_exit_flag.write().await = true;
-        self.demux_task_handle.as_mut().unwrap().await.unwrap();
+        if let Some(handle) = &mut self.demux_task_handle {
+            if handle.await.is_ok() {
+                warn!("demux thread join success");
+            }
+        }
         *self.decode_exit_flag.write().await = true;
-        self.decode_task_handle.as_mut().unwrap().await.unwrap();
-        warn!("demux and decode task exit gracefully!!!");
+        if let Some(handle) = &mut self.decode_task_handle {
+            if handle.await.is_ok() {
+                warn!("decode thread join success");
+            }
+        }
     }
     pub async fn flush_decoders(&self) {
         let mut a_decoder = self.audio_decoder.write().await;
@@ -807,35 +818,40 @@ impl TinyDecoder {
     async fn choose_decoder_with_hardware_prefer(
         &mut self,
         stream: &Stream<'_>,
-    ) -> ffmpeg_the_third::decoder::Video {
-        let codec_ctx =
-            ffmpeg_the_third::codec::Context::from_parameters(stream.parameters()).unwrap();
-        let mut decoder = codec_ctx.decoder().video().unwrap();
-        unsafe {
-            let hw_config = avcodec_get_hw_config(decoder.codec().as_ref().unwrap().as_ptr(), 0);
+    ) -> Result<ffmpeg_the_third::decoder::Video, String> {
+        if let Ok(codec_ctx) =
+            ffmpeg_the_third::codec::Context::from_parameters(stream.parameters())
+        {
+            if let Ok(mut decoder) = codec_ctx.decoder().video() {
+                unsafe {
+                    if let Some(codec) = &decoder.codec() {
+                        let hw_config = avcodec_get_hw_config(codec.as_ptr(), 0);
 
-            if hw_config.is_null() {
-                warn!("currently dont support hardware accelerate");
-                return decoder;
-            } else {
-                let mut hw_device_ctx: *mut AVBufferRef = null_mut();
-                if 0 != av_hwdevice_ctx_create(
-                    &mut hw_device_ctx as *mut *mut AVBufferRef,
-                    (*hw_config).device_type,
-                    null(),
-                    null_mut(),
-                    0,
-                ) {
-                    warn!("hw device create err");
-                    return decoder;
+                        if hw_config.is_null() {
+                            warn!("currently dont support hardware accelerate");
+                            return Ok(decoder);
+                        } else {
+                            let mut hw_device_ctx: *mut AVBufferRef = null_mut();
+                            if 0 != av_hwdevice_ctx_create(
+                                &mut hw_device_ctx as *mut *mut AVBufferRef,
+                                (*hw_config).device_type,
+                                null(),
+                                null_mut(),
+                                0,
+                            ) {
+                                warn!("hw device create err");
+                                return Ok(decoder);
+                            }
+                            (*decoder.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
+
+                            *self.hardware_config.write().await = true;
+                            return Ok(decoder);
+                        }
+                    }
                 }
-
-                (*decoder.0.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
-
-                *self.hardware_config.write().await = true;
-                decoder
             }
         }
+        Err("get video decoder err".to_string())
     }
 }
 impl Drop for TinyDecoder {
