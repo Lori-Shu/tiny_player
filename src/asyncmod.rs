@@ -8,10 +8,10 @@ use std::{
 
 use ffmpeg_the_third::{
     ffi::{
-        AVDictionary, AVFormatContext, AVIO_FLAG_WRITE, AVMediaType, av_dict_set,
-        av_interleaved_write_frame, av_packet_rescale_ts, av_write_trailer,
-        avcodec_parameters_copy, avformat_alloc_output_context2, avformat_free_context,
-        avformat_new_stream, avformat_write_header, avio_closep, avio_open2,
+        AVFormatContext, AVIO_FLAG_WRITE, AVMediaType, av_interleaved_write_frame,
+        av_packet_rescale_ts, av_write_trailer, avcodec_parameters_copy,
+        avformat_alloc_output_context2, avformat_free_context, avformat_new_stream,
+        avformat_write_header, avio_closep, avio_open2,
     },
     packet::Mut,
 };
@@ -26,33 +26,35 @@ use reqwest_websocket::{Bytes, Message, RequestBuilderExt, WebSocket};
 use serde::{Deserialize, Serialize};
 use tokio::{runtime::Runtime, sync::RwLock, time::sleep};
 
+use crate::{PlayerError, PlayerResult};
+
 enum ServerApi {
     Login,
     ChatMsg,
     ShareVideoSock,
 }
 impl ServerApi {
-    pub fn get_url_from_server_api(self) -> Url {
+    pub fn get_url_from_server_api(self) -> PlayerResult<Url> {
         match self {
             Self::Login => {
                 if let Ok(url) = Url::from_str("http://127.0.0.1:8536/user/guest_login") {
-                    url
+                    Ok(url)
                 } else {
-                    panic!()
+                    Err(PlayerError::Internal("Login err".to_string()))
                 }
             }
             Self::ChatMsg => {
                 if let Ok(url) = Url::from_str("ws://127.0.0.1:8536/player/chat") {
-                    url
+                    Ok(url)
                 } else {
-                    panic!()
+                    Err(PlayerError::Internal("ChatMsg err".to_string()))
                 }
             }
             Self::ShareVideoSock => {
                 if let Ok(url) = Url::from_str("ws://127.0.0.1:8536/player/share_sock") {
-                    url
+                    Ok(url)
                 } else {
-                    panic!()
+                    Err(PlayerError::Internal("ShareVideoSock err".to_string()))
                 }
             }
         }
@@ -76,7 +78,7 @@ pub struct AsyncContext {
     online_videos: Vec<VideoDes>,
 }
 impl AsyncContext {
-    pub fn new() -> Self {
+    pub fn new() -> PlayerResult<Self> {
         if let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -98,9 +100,11 @@ impl AsyncContext {
                 ui_msg_vec: vec![],
                 online_videos: vec![],
             };
-            s
+            Ok(s)
         } else {
-            panic!();
+            Err(PlayerError::Internal(
+                "build async runtime error".to_string(),
+            ))
         }
     }
     pub fn req_external_url(&self, me: Method, url: Url) -> Result<String, String> {
@@ -123,13 +127,15 @@ impl AsyncContext {
         let request_manager = self.request_manager.clone();
         let user_detail = self.async_runtime.block_on(async move {
             if let Ok(user_detail) = request_manager.login(username).await {
-                user_detail
+                Ok(user_detail)
             } else {
-                panic!("login failed");
+                Err(PlayerError::Internal("login failed".to_string()))
             }
         });
         self.online_flag = true;
-        self.user_detail = user_detail;
+        if let Ok(user_detail) = user_detail {
+            self.user_detail = user_detail;
+        }
         self.ws_connect_to_chat();
         self.ws_connect_share(format_duration);
     }
@@ -237,32 +243,31 @@ impl RequestManager {
             Err("req err".to_string())
         }
     }
-    async fn login(&self, username: String) -> Result<Arc<RwLock<UserDetail>>, String> {
-        if let Ok(response) = self
-            .client
-            .post(ServerApi::get_url_from_server_api(ServerApi::Login))
-            .body(username)
-            .send()
-            .await
-        {
-            if let Ok(bytes) = response.bytes().await {
-                if let Ok(str) = String::from_utf8(bytes.to_vec()) {
-                    if let Ok(user_detail) = serde_json::from_str::<UserDetail>(&str) {
-                        warn!("receive detail{:?}", user_detail);
-                        *self.user_detail.write().await = user_detail;
-                        Ok(self.user_detail.clone())
+    async fn login(&self, username: String) -> PlayerResult<Arc<RwLock<UserDetail>>> {
+        if let Ok(url) = ServerApi::get_url_from_server_api(ServerApi::Login) {
+            if let Ok(response) = self.client.post(url).body(username).send().await {
+                if let Ok(bytes) = response.bytes().await {
+                    if let Ok(str) = String::from_utf8(bytes.to_vec()) {
+                        if let Ok(user_detail) = serde_json::from_str::<UserDetail>(&str) {
+                            warn!("receive detail{:?}", user_detail);
+                            *self.user_detail.write().await = user_detail;
+                            return Ok(self.user_detail.clone());
+                        } else {
+                            return Err(PlayerError::Internal("json parse err".to_string()));
+                        }
                     } else {
-                        Err("json parse err".to_string())
+                        return Err(PlayerError::Internal("bytes to string err".to_string()));
                     }
                 } else {
-                    Err("bytes to string err".to_string())
+                    return Err(PlayerError::Internal(
+                        "extract response bytes err".to_string(),
+                    ));
                 }
             } else {
-                Err("extract response bytes err".to_string())
+                return Err(PlayerError::Internal("req err".to_string()));
             }
-        } else {
-            Err("req err".to_string())
         }
+        Err(PlayerError::Internal("req err".to_string()))
     }
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -335,46 +340,48 @@ impl WebSocketManager {
         user_detail: Arc<RwLock<UserDetail>>,
         msg_vec: Arc<RwLock<Vec<SocketMessage>>>,
     ) {
-        let url = ServerApi::get_url_from_server_api(ServerApi::ChatMsg);
-        warn!("url to connect websocket{}", url.as_str());
-        if let Ok(res) = self.client.get(url).upgrade().send().await {
-            let web_socket = res.into_websocket().await;
-            if let Ok(mut ws) = web_socket {
-                {
-                    let user = user_detail.read().await;
-                    let msg_str = format!("user {:?} is now online", user.username);
-                    let msg = SocketMessage::new(
-                        user.id.clone(),
-                        user.username.clone(),
-                        "server".to_string(),
-                        "server".to_string(),
-                        "chat init".to_string(),
-                        msg_str.as_bytes().to_vec(),
-                    );
-                    if let Ok(json_msg) = serde_json::to_string(&msg) {
-                        if let Ok(_) = ws
-                            .send(reqwest_websocket::Message::Binary(Bytes::from(
-                                json_msg.as_bytes().to_vec(),
-                            )))
-                            .await
-                        {
-                            warn!("连接到chat服务");
+        if let Ok(url) = ServerApi::get_url_from_server_api(ServerApi::ChatMsg) {
+            warn!("url to connect websocket{}", url.as_str());
+            if let Ok(res) = self.client.get(url).upgrade().send().await {
+                let web_socket = res.into_websocket().await;
+                if let Ok(mut ws) = web_socket {
+                    {
+                        let user = user_detail.read().await;
+                        let msg_str = format!("user {:?} is now online", user.username);
+                        let msg = SocketMessage::new(
+                            user.id.clone(),
+                            user.username.clone(),
+                            "server".to_string(),
+                            "server".to_string(),
+                            "chat init".to_string(),
+                            msg_str.as_bytes().to_vec(),
+                        );
+                        if let Ok(json_msg) = serde_json::to_string(&msg) {
+                            if ws
+                                .send(reqwest_websocket::Message::Binary(Bytes::from(
+                                    json_msg.as_bytes().to_vec(),
+                                )))
+                                .await
+                                .is_ok()
                             {
-                                let (sink, stream) = ws.split();
-                                *self.chat_socket_sink.write().await = Some(sink);
-                                *self.chat_socket_stream.write().await = Some(stream);
+                                warn!("连接到chat服务");
+                                {
+                                    let (sink, stream) = ws.split();
+                                    *self.chat_socket_sink.write().await = Some(sink);
+                                    *self.chat_socket_stream.write().await = Some(stream);
+                                }
+                                *self.user.write().await = (*user).clone();
                             }
-                            *self.user.write().await = (*user).clone();
                         }
                     }
+                    let stream = self.chat_socket_stream.clone();
+                    tokio::spawn(Self::watch_server_chat_msg(stream, msg_vec));
+                } else if let Err(e) = web_socket {
+                    error!("connect server err{:?}", e);
                 }
-                let stream = self.chat_socket_stream.clone();
-                tokio::spawn(Self::watch_server_chat_msg(stream, msg_vec));
-            } else if let Err(e) = web_socket {
-                error!("connect server err{:?}", e);
+            } else {
+                warn!("into websocket res err");
             }
-        } else {
-            warn!("into websocket res err");
         }
     }
     async fn watch_server_chat_msg(
@@ -416,93 +423,95 @@ impl WebSocketManager {
                 let send_res = socket
                     .send(reqwest_websocket::Message::Binary(Bytes::from_owner(bin)))
                     .await;
-                if let Ok(_) = send_res {
+                if send_res.is_ok() {
                     warn!("send msg success");
                 } else if let Err(e) = send_res {
-                    panic!("send bin err{:?}", e);
+                    warn!("send bin err{:?}", e);
                 }
             } else {
-                panic!("deserialize err");
+                warn!("deserialize err");
             }
         } else {
-            panic!("you are offline");
+            warn!("you are offline");
         }
     }
     async fn connect_share(&self, format_duration: Arc<RwLock<i64>>) {
-        if let Ok(res) = self
-            .client
-            .get(ServerApi::get_url_from_server_api(
-                ServerApi::ShareVideoSock,
-            ))
-            .upgrade()
-            .send()
-            .await
-        {
-            if let Ok(socket) = res.into_websocket().await {
-                let (mut sink, stream) = socket.split();
-                {
-                    let user = self.user.read().await;
-                    warn!("connect share user id{:?}", user.id);
-                    let socket_message = SocketMessage::new(
-                        user.id.clone(),
-                        user.username.clone(),
-                        "server".to_string(),
-                        "server".to_string(),
-                        "share init".to_string(),
-                        "".to_string().as_bytes().to_vec(),
-                    );
-                    if let Ok(str) = serde_json::to_string(&socket_message) {
-                        sink.send(reqwest_websocket::Message::Binary(Bytes::from(
-                            str.as_bytes().to_vec(),
-                        )))
-                        .await
-                        .unwrap();
-                    }
+        if let Ok(url) = ServerApi::get_url_from_server_api(ServerApi::ShareVideoSock) {
+            if let Ok(res) = self.client.get(url).upgrade().send().await {
+                if let Ok(socket) = res.into_websocket().await {
+                    let (mut sink, stream) = socket.split();
                     {
-                        *self.share_socket_sink.write().await = Some(sink);
-                        *self.share_socket_stream.write().await = Some(stream);
+                        let user = self.user.read().await;
+                        warn!("connect share user id{:?}", user.id);
+                        let socket_message = SocketMessage::new(
+                            user.id.clone(),
+                            user.username.clone(),
+                            "server".to_string(),
+                            "server".to_string(),
+                            "share init".to_string(),
+                            "".to_string().as_bytes().to_vec(),
+                        );
+                        if let Ok(str) = serde_json::to_string(&socket_message) {
+                            if sink
+                                .send(reqwest_websocket::Message::Binary(Bytes::from(
+                                    str.as_bytes().to_vec(),
+                                )))
+                                .await
+                                .is_ok()
+                            {
+                                warn!("send msg success");
+                            }
+                        }
+                        {
+                            *self.share_socket_sink.write().await = Some(sink);
+                            *self.share_socket_stream.write().await = Some(stream);
+                        }
                     }
-                }
-                let share_socket_sink = self.share_socket_sink.clone();
-                let share_socket_stream = self.share_socket_stream.clone();
-                let video_des_vec = self.video_des_vec.clone();
-                tokio::spawn(async move {
-                    loop {
-                        sleep(Duration::from_millis(10)).await;
-                        let mut stream = share_socket_stream.write().await;
-                        if let Some(share_stream) = &mut *stream {
-                            if let Some(Ok(message)) = share_stream.next().await {
-                                if let Message::Binary(bts) = &message {
-                                    if let Ok(msg) =
-                                        serde_json::from_slice::<SocketMessage>(bts.as_bytes())
-                                    {
-                                        if msg.get_msg_type().eq("video des") {
-                                            warn!("receive video des!!!");
-                                            if let Ok(des) =
-                                                serde_json::from_slice::<VideoDes>(&msg.get_msg())
-                                            {
-                                                let mut des_v = video_des_vec.write().await;
-                                                des_v.push(des);
-                                            }
-                                        } else if msg.get_msg_type().eq("req video command") {
-                                            warn!("receve push video command!!!");
-                                            let sink = share_socket_sink.clone();
-                                            tokio::spawn(async move {
-                                                Self::push_video_stream(msg, sink).await;
-                                            });
-                                        } else if msg.get_msg_type().eq("duration of video to play")
+                    let share_socket_sink = self.share_socket_sink.clone();
+                    let share_socket_stream = self.share_socket_stream.clone();
+                    let video_des_vec = self.video_des_vec.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            sleep(Duration::from_millis(10)).await;
+                            let mut stream = share_socket_stream.write().await;
+                            if let Some(share_stream) = &mut *stream {
+                                if let Some(Ok(message)) = share_stream.next().await {
+                                    if let Message::Binary(bts) = &message {
+                                        if let Ok(msg) =
+                                            serde_json::from_slice::<SocketMessage>(bts.as_bytes())
                                         {
-                                            let sli: [u8; 8] =
-                                                (*msg.get_msg().as_bytes()).try_into().unwrap();
-                                            *format_duration.write().await =
-                                                i64::from_le_bytes(sli);
+                                            if msg.get_msg_type().eq("video des") {
+                                                warn!("receive video des!!!");
+                                                if let Ok(des) = serde_json::from_slice::<VideoDes>(
+                                                    &msg.get_msg(),
+                                                ) {
+                                                    let mut des_v = video_des_vec.write().await;
+                                                    des_v.push(des);
+                                                }
+                                            } else if msg.get_msg_type().eq("req video command") {
+                                                warn!("receve push video command!!!");
+                                                let sink = share_socket_sink.clone();
+                                                tokio::spawn(async move {
+                                                    Self::push_video_stream(msg, sink).await;
+                                                });
+                                            } else if msg
+                                                .get_msg_type()
+                                                .eq("duration of video to play")
+                                            {
+                                                if let Ok(sli) =
+                                                    (*msg.get_msg().as_bytes()).try_into()
+                                                {
+                                                    *format_duration.write().await =
+                                                        i64::from_le_bytes(sli);
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
     }
@@ -521,9 +530,10 @@ impl WebSocketManager {
                         des.as_bytes().to_vec(),
                     );
                     if let Ok(msg) = serde_json::to_string(&socket_message) {
-                        if let Ok(_) = sock
+                        if sock
                             .send(Message::Binary(Bytes::from(msg.as_bytes().to_vec())))
                             .await
+                            .is_ok()
                         {
                         } else {
                             todo!();
@@ -551,100 +561,108 @@ impl WebSocketManager {
                     "duration of video to play".to_string(),
                     vec,
                 );
-                sink.as_mut()
-                    .unwrap()
-                    .send(Message::Binary(Bytes::from(
-                        serde_json::to_vec(&so_msg).unwrap(),
-                    )))
-                    .await
-                    .unwrap();
+                if let Ok(v) = serde_json::to_vec(&so_msg) {
+                    if let Some(sink) = &mut *sink {
+                        if sink.send(Message::Binary(Bytes::from(v))).await.is_ok() {
+                            warn!("send message success");
+                        }
+                    }
+                }
                 {
                     unsafe {
                         let mut out_ctx: *mut AVFormatContext = null_mut();
-                        let fmt = CString::new("mp4").unwrap(); // 格式要手动指定
-                        let mut res = avformat_alloc_output_context2(
-                            (&mut out_ctx) as *mut *mut AVFormatContext,
-                            null(),
-                            fmt.as_ptr(),
-                            CString::new("stream").unwrap().as_ptr(),
-                        );
-                        if res != 0 {
-                            todo!();
-                        }
-                        // 设置 movflags
-                        let mut opts: *mut AVDictionary = null_mut();
-                        av_dict_set(
-                            &mut opts,
-                            CString::new("movflags").unwrap().as_ptr(),
-                            CString::new("frag_keyframe+empty_moov").unwrap().as_ptr(),
-                            0,
-                        );
-                        // 复制所有流（不重新编码）
-                        for (stream_index, istream) in input.streams().enumerate() {
-                            let ostream = avformat_new_stream(out_ctx, null());
-                            if (*istream.parameters().as_ptr()).codec_type
-                                == AVMediaType::AVMEDIA_TYPE_VIDEO
-                            {
-                                warn!("video tstream");
-                            }
-                            if ostream.is_null() {
-                                todo!();
-                            }
-                            {
-                                let pars = istream.parameters();
-                                res = avcodec_parameters_copy((*ostream).codecpar, pars.as_ptr());
+                        if let Ok(fmt) = CString::new("mp4") {
+                            if let Ok(s) = CString::new("stream") {
+                                // 格式要手动指定
+                                let mut res = avformat_alloc_output_context2(
+                                    (&mut out_ctx) as *mut *mut AVFormatContext,
+                                    null(),
+                                    fmt.as_ptr(),
+                                    s.as_ptr(),
+                                );
                                 if res != 0 {
                                     todo!();
                                 }
-                                println!("Added stream {} ->", stream_index);
+                                // 复制所有流（不重新编码）
+                                for (stream_index, istream) in input.streams().enumerate() {
+                                    let ostream = avformat_new_stream(out_ctx, null());
+                                    if (*istream.parameters().as_ptr()).codec_type
+                                        == AVMediaType::AVMEDIA_TYPE_VIDEO
+                                    {
+                                        warn!("video tstream");
+                                    }
+                                    if ostream.is_null() {
+                                        todo!();
+                                    }
+                                    {
+                                        let pars = istream.parameters();
+                                        res = avcodec_parameters_copy(
+                                            (*ostream).codecpar,
+                                            pars.as_ptr(),
+                                        );
+                                        if res != 0 {
+                                            todo!();
+                                        }
+                                        println!("Added stream {} ->", stream_index);
+                                    }
+                                }
+
+                                if let Ok(s) = CString::new("tcp://127.0.0.1:18859") {
+                                    // 打开输出上下文
+                                    res = avio_open2(
+                                        &mut (*out_ctx).pb,
+                                        s.as_ptr(),
+                                        AVIO_FLAG_WRITE,
+                                        null_mut(),
+                                        null_mut(),
+                                    );
+                                    if res != 0 {
+                                        todo!();
+                                    }
+                                    res = avformat_write_header(out_ctx, null_mut());
+                                    if res != 0 {
+                                        todo!();
+                                    }
+                                    // 循环读取并写入 packet
+                                    for packet in input.packets() {
+                                        if let Ok(mut pkt) = packet {
+                                            let in_stream = pkt.0;
+                                            // 先取到 AVStream* 指针
+                                            let out_stream_ptr = *(*out_ctx)
+                                                .streams
+                                                .offset(in_stream.index() as isize);
+                                            let out_stream = &*out_stream_ptr; // &AVStream, 安全访问字段
+                                            av_packet_rescale_ts(
+                                                pkt.1.as_mut_ptr(),
+                                                (*in_stream.as_ptr()).time_base,
+                                                (*out_stream).time_base,
+                                            );
+                                            (*pkt.1.as_mut_ptr()).stream_index =
+                                                (*out_stream).index;
+                                            // (*pkt.1.as_mut_ptr()).stream_index = ;
+                                            res = av_interleaved_write_frame(
+                                                out_ctx,
+                                                pkt.1.as_mut_ptr(),
+                                            );
+                                            if res != 0 {
+                                                warn!("write err{}", res);
+                                                todo!();
+                                            }
+                                        }
+                                    }
+                                    res = av_write_trailer(out_ctx);
+                                    if res != 0 {
+                                        todo!();
+                                    }
+                                    res = avio_closep(&mut (*out_ctx).pb);
+                                    if res != 0 {
+                                        todo!();
+                                    }
+                                    avformat_free_context(out_ctx);
+                                    warn!("push video stream completed");
+                                }
                             }
                         }
-                        // 打开输出上下文
-                        res = avio_open2(
-                            &mut (*out_ctx).pb,
-                            CString::new("tcp://127.0.0.1:18859").unwrap().as_ptr(),
-                            AVIO_FLAG_WRITE,
-                            null_mut(),
-                            &mut opts,
-                        );
-                        if res != 0 {
-                            todo!();
-                        }
-                        res = avformat_write_header(out_ctx, &mut opts);
-                        if res != 0 {
-                            todo!();
-                        }
-                        // 循环读取并写入 packet
-                        for (_index, packet) in input.packets().enumerate() {
-                            let mut pkt = packet.unwrap();
-                            let in_stream = pkt.0;
-                            // 先取到 AVStream* 指针
-                            let out_stream_ptr =
-                                *(*out_ctx).streams.offset(in_stream.index() as isize);
-                            let out_stream = &*out_stream_ptr; // &AVStream, 安全访问字段
-                            av_packet_rescale_ts(
-                                pkt.1.as_mut_ptr(),
-                                (*in_stream.as_ptr()).time_base,
-                                (*out_stream).time_base,
-                            );
-                            (*pkt.1.as_mut_ptr()).stream_index = (*out_stream).index;
-                            // (*pkt.1.as_mut_ptr()).stream_index = ;
-                            res = av_interleaved_write_frame(out_ctx, pkt.1.as_mut_ptr());
-                            if res != 0 {
-                                warn!("write err{}", res);
-                                todo!();
-                            }
-                        }
-                        res = av_write_trailer(out_ctx);
-                        if res != 0 {
-                            todo!();
-                        }
-                        res = avio_closep(&mut (*out_ctx).pb);
-                        if res != 0 {
-                            todo!();
-                        }
-                        avformat_free_context(out_ctx);
-                        warn!("push video stream completed");
                     }
                 }
             }
@@ -665,9 +683,10 @@ impl WebSocketManager {
                     des.as_bytes().to_vec(),
                 );
                 if let Ok(msg) = serde_json::to_string(&socket_message) {
-                    if let Ok(_) = sock
+                    if sock
                         .send(Message::Binary(Bytes::from(msg.as_bytes().to_vec())))
                         .await
+                        .is_ok()
                     {}
                 }
             }

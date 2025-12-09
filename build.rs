@@ -25,4 +25,6 @@ fn main() {
         res.set_icon("resources/desktop_icon.ico");
         res.compile().unwrap();
     }
+    let vosk_lib_path = "D:/candcppprojects/vosk-win64-0.3.45";
+    println!("cargo:rustc-link-search=native={}", vosk_lib_path);
 }
