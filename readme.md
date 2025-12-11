@@ -14,6 +14,7 @@ core feature based on project
    [wgpu](https://github.com/gfx-rs/wgpu) vulkan renderer
 3. tiny_player is opensource, you can modify code and build your 
    own app under LICENSE
+4. AI subtitle function is ready for tring
 # Usage
 1. currently only support windows
 2. run the tiny_installer.exe
