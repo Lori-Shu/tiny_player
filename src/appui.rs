@@ -60,6 +60,8 @@ pub struct AppUi {
     username_buf: String,
     subtitle: AISubTitle,
     subtitle_flag: bool,
+    chinese_subtitle_flag: bool,
+    show_subtitle_options: bool,
 }
 impl eframe::App for AppUi {
     /// this function will automaticly be called every ui redraw
@@ -126,7 +128,6 @@ impl eframe::App for AppUi {
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     self.update_time_and_time_text();
                     self.paint_control_area(ui, ctx, &now);
-                    ui.add_space(150.0);
                     self.paint_volumn_slider(ui, ctx, now);
                 });
                 if (now - self.last_show_control_ui_instant).as_secs() > 3 {
@@ -239,6 +240,8 @@ impl AppUi {
                             username_buf: String::new(),
                             subtitle: subtitle,
                             subtitle_flag: true,
+                            chinese_subtitle_flag: false,
+                            show_subtitle_options: false,
                         });
                     }
                 }
@@ -348,7 +351,9 @@ impl AppUi {
                         audio_player.set_pts(pts);
                         audio_player.play_raw_data_from_audio_frame(audio_frame.clone());
                         if self.subtitle_flag {
-                            self.subtitle.push_frame_data(audio_frame);
+                            if self.chinese_subtitle_flag {
+                                self.subtitle.push_frame_data(audio_frame);
+                            }
                         }
                     }
                 }
@@ -466,7 +471,7 @@ impl AppUi {
                                 .color(Color32::ORANGE),
                         )));
                 let mut slider_width_style = egui::style::Style::default();
-                slider_width_style.spacing.slider_width = ctx.content_rect().width() - 350.0;
+                slider_width_style.spacing.slider_width = ctx.content_rect().width() - 400.0;
                 slider_width_style.spacing.slider_rail_height = 10.0;
                 slider_width_style.spacing.interact_size = Vec2::new(20.0, 20.0);
                 slider_width_style.visuals.extreme_bg_color =
@@ -492,6 +497,24 @@ impl AppUi {
                     self.frame_show_instant = now.clone();
                     self.current_video_frame = None;
                 }
+                ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+                    let subtitle_btn = egui::Button::new("subtitle")
+                        .min_size(Vec2::new(50.0, 50.0))
+                        .frame(false);
+                    let btn_response = ui.add(subtitle_btn);
+                    if btn_response.hovered() {
+                        self.control_ui_flag = true;
+                        self.last_show_control_ui_instant = now.clone();
+                    }
+                    if btn_response.clicked() {
+                        self.show_subtitle_options = !self.show_subtitle_options;
+                    }
+                    if self.show_subtitle_options {
+                        let cn_checkbox =
+                            egui::Checkbox::new(&mut self.chinese_subtitle_flag, "中文");
+                        ui.add(cn_checkbox);
+                    }
+                });
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     let volumn_img_btn =
                         egui::Button::new(VOLUMN_IMG.atom_size(Vec2::new(50.0, 50.0))).frame(false);
@@ -527,36 +550,49 @@ impl AppUi {
                 .async_ctx
                 .exec_normal_task(tiny_decoder.check_input_exist())
             {
-                ui.add_space(ctx.content_rect().width() - 120.0);
-                let audio_player = &mut self.audio_player;
-                let mut volumn_slider =
-                    egui::Slider::new(&mut audio_player.current_volumn, 0.0..=2.0);
-                volumn_slider = volumn_slider.vertical();
-                volumn_slider = volumn_slider.show_value(false);
-                let mut slider_style = egui::style::Style::default();
-                slider_style.spacing.slider_width = 150.0;
-                slider_style.spacing.slider_rail_height = 10.0;
-                slider_style.spacing.interact_size = Vec2::new(20.0, 20.0);
-                slider_style.visuals.extreme_bg_color =
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                slider_style.visuals.selection.bg_fill =
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                slider_style.visuals.widgets.active.bg_fill =
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                slider_style.visuals.widgets.inactive.bg_fill =
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                ui.set_style(slider_style);
-                let mut slider_response = ui.add(volumn_slider);
-                slider_response = slider_response
-                    .on_hover_text((audio_player.current_volumn * 100.0).to_string());
-                if slider_response.hovered() {
-                    self.control_ui_flag = true;
-                    self.last_show_control_ui_instant = now;
-                }
-                if slider_response.changed() {
-                    warn!("volumn slider dragged!");
-                    audio_player.change_volumn();
-                }
+                ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+                    let be_opacity = ui.opacity();
+                    ui.set_opacity(1.0);
+                    let sub_text = RichText::new(self.subtitle.generated_str())
+                        .size(30.0)
+                        .color(Color32::BLUE)
+                        .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0));
+                    let subtitle_text_button = egui::Button::new(sub_text).frame(false);
+                    ui.add(subtitle_text_button);
+                    ui.set_opacity(be_opacity);
+                });
+                ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.add_space(150.0);
+                    let audio_player = &mut self.audio_player;
+                    let volumn_slider =
+                        egui::Slider::new(&mut audio_player.current_volumn, 0.0..=2.0)
+                            .vertical()
+                            .show_value(false);
+                    let mut slider_style = egui::style::Style::default();
+                    slider_style.spacing.slider_width = 150.0;
+                    slider_style.spacing.slider_rail_height = 10.0;
+                    slider_style.spacing.interact_size = Vec2::new(20.0, 20.0);
+                    slider_style.visuals.extreme_bg_color =
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                    slider_style.visuals.selection.bg_fill =
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                    slider_style.visuals.widgets.active.bg_fill =
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                    slider_style.visuals.widgets.inactive.bg_fill =
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                    ui.set_style(slider_style);
+                    let mut slider_response = ui.add(volumn_slider);
+                    slider_response = slider_response
+                        .on_hover_text((audio_player.current_volumn * 100.0).to_string());
+                    if slider_response.hovered() {
+                        self.control_ui_flag = true;
+                        self.last_show_control_ui_instant = now;
+                    }
+                    if slider_response.changed() {
+                        warn!("volumn slider dragged!");
+                        audio_player.change_volumn();
+                    }
+                });
             }
         });
     }

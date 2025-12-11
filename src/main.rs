@@ -4,12 +4,30 @@
 )]
 #![deny(unused, clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
-use std::{error::Error, fmt::Display, sync::Arc};
+use std::{
+    error::Error,
+    fmt::Display,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+};
 
 use egui::{IconData, ImageSource, Vec2, include_image};
 use log::{Level, warn};
+
+mod ai_sub_title;
+mod appui;
+mod asyncmod;
+mod audio_play;
+mod decode;
+
 const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
-#[derive(Debug)]
+const CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf>> = LazyLock::new(|| {
+    if let Ok(path) = std::env::current_exe() {
+        return Ok(path);
+    }
+    Err(PlayerError::Internal("can not find exe path!".to_string()))
+});
+#[derive(Debug, Clone)]
 pub enum PlayerError {
     Internal(String),
 }
@@ -24,11 +42,7 @@ impl Display for PlayerError {
 }
 impl Error for PlayerError {}
 pub type PlayerResult<T> = std::result::Result<T, PlayerError>;
-mod ai_sub_title;
-mod appui;
-mod asyncmod;
-mod audio_play;
-mod decode;
+
 /// main fun init log, init main ui type Appui
 fn main() {
     if simple_logger::init_with_level(Level::Warn).is_ok() {
@@ -63,84 +77,5 @@ fn main() {
         {
             warn!("eframe start success");
         }
-    }
-}
-#[cfg(test)]
-mod test {
-    #[derive(Debug)]
-    enum DivisionError {
-        // Example: 42 / 0
-        DivideByZero,
-        // Only case for `i64`: `i64::MIN / -1` because the result is `i64::MAX + 1`
-        IntegerOverflow,
-        // Example: 5 / 2 = 2.5
-        NotDivisible,
-    }
-    fn divide(a: i64, b: i64) -> Result<i64, DivisionError> {
-        if b == 0 {
-            return Err(DivisionError::DivideByZero);
-        }
-
-        if a == i64::MIN && b == -1 {
-            return Err(DivisionError::IntegerOverflow);
-        }
-
-        if a % b != 0 {
-            return Err(DivisionError::NotDivisible);
-        }
-
-        Ok(a / b)
-    }
-    #[test]
-    fn testdivide() {
-        let divide = divide(20, 0).unwrap();
-        println!("{:#?}", divide);
-        println!("test success");
-    }
-    #[test]
-    fn dian_bing() {
-        let num = 3 * 5 * 8;
-        let mut n1 = 0;
-        let mut temp = 5 * 8;
-        let mut mul_times = 1;
-        loop {
-            if n1 % 3 == 1 {
-                break;
-            }
-            n1 = temp * mul_times;
-            mul_times += 1;
-        }
-        let mut n2 = 0;
-        temp = 3 * 8;
-        mul_times = 1;
-        loop {
-            if n2 % 5 == 1 {
-                break;
-            }
-            n2 = temp * mul_times;
-            mul_times += 1;
-        }
-        let mut n3 = 0;
-        temp = 3 * 5;
-        mul_times = 1;
-        loop {
-            if n3 % 8 == 1 {
-                break;
-            }
-            n3 = temp * mul_times;
-            mul_times += 1;
-        }
-        println!("n1:{},n2:{},n3:{}", n1, n2, n3);
-        let mut ans = n1 * 2 + n2 * 3 + n3 * 5;
-        loop {
-            if ans >= 200 && ans <= 400 {
-                break;
-            } else if ans < 200 {
-                ans += num;
-            } else {
-                ans -= num;
-            }
-        }
-        println!("answer:{}", ans);
     }
 }
