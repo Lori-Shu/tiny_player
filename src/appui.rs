@@ -58,7 +58,7 @@ pub struct AppUi {
     open_file_dialog: Option<egui_file::FileDialog>,
     share_folder_dialog: Option<egui_file::FileDialog>,
     username_buf: String,
-    subtitle: AISubTitle,
+    subtitle: Arc<RwLock<AISubTitle>>,
     subtitle_flag: bool,
     chinese_subtitle_flag: bool,
     show_subtitle_options: bool,
@@ -238,7 +238,7 @@ impl AppUi {
                             share_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
                             bg_dyn_img: dyn_img,
                             username_buf: String::new(),
-                            subtitle: subtitle,
+                            subtitle: Arc::new(RwLock::new(subtitle)),
                             subtitle_flag: true,
                             chinese_subtitle_flag: false,
                             show_subtitle_options: false,
@@ -352,7 +352,10 @@ impl AppUi {
                         audio_player.play_raw_data_from_audio_frame(audio_frame.clone());
                         if self.subtitle_flag {
                             if self.chinese_subtitle_flag {
-                                self.subtitle.push_frame_data(audio_frame);
+                                self.async_ctx.exec_normal_task(AISubTitle::push_frame_data(
+                                    self.subtitle.clone(),
+                                    audio_frame,
+                                ));
                             }
                         }
                     }
@@ -553,7 +556,8 @@ impl AppUi {
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     let be_opacity = ui.opacity();
                     ui.set_opacity(1.0);
-                    let sub_text = RichText::new(self.subtitle.generated_str())
+                    let subtitle = self.async_ctx.exec_normal_task(self.subtitle.read());
+                    let sub_text = RichText::new(subtitle.generated_str())
                         .size(30.0)
                         .color(Color32::BLUE)
                         .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0));

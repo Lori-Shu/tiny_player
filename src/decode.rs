@@ -1,4 +1,5 @@
 use std::{
+    ffi::CString,
     path::PathBuf,
     ptr::{null, null_mut},
     sync::Arc,
@@ -10,7 +11,7 @@ use ffmpeg_the_third::{
     Rational, Stream,
     ffi::{
         AVBufferRef, AVPixelFormat, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-        avcodec_get_hw_config,
+        avcodec_get_hw_config, avfilter_get_by_name, avfilter_graph_create_filter, avfilter_link,
     },
     filter::Graph,
     format::{self, Pixel},
@@ -20,7 +21,7 @@ use log::warn;
 use time::format_description;
 use tokio::{io::AsyncWriteExt, runtime::Runtime, sync::RwLock, task::JoinHandle, time::sleep};
 
-use crate::{PlayerError, PlayerResult, appui::VideoPathSource};
+use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, appui::VideoPathSource};
 /// in order to make Input impl Sync, create a new Type ,
 /// this type can be manually sync by Rwlock
 pub struct ManualProtectedInput(ffmpeg_the_third::format::context::Input);
@@ -401,7 +402,8 @@ impl TinyDecoder {
     ) {
         let mut p = PathBuf::new();
         if video_packet_cache_vec.read().await.is_some() {
-            if let Ok(exe_path) = std::env::current_exe() {
+            let exe_path = CURRENT_EXE_PATH;
+            if let Ok(exe_path) = exe_path.as_ref() {
                 if let Some(exe_folder) = exe_path.parent() {
                     p = exe_folder.join("app_font.ttf");
                     if tokio::fs::File::open(&p).await.is_err() {
@@ -414,35 +416,115 @@ impl TinyDecoder {
 
             let mut graph = graph.write().await;
             if let Some(graph) = &mut *graph {
-                let args = {
-                    if let Some(font_path_str) = p.to_str() {
-                        let mut font_path_str = font_path_str.replace("\\", "/");
-                        if let Some(idx) = font_path_str.find(":") {
-                            font_path_str.insert_str(idx, "\\");
-                            let spec = format!(
-                                "drawtext=text='Tiny Player':fontfile='{}':fontsize=26:fontcolor=white@0.5:x=w-text_w-10:y=10",
-                                font_path_str
-                            );
-                            format!(
-                                "buffer=video_size={}x{}:pix_fmt={}:time_base={}/{}[in];[in]{}[out];[out]buffersink",
-                                video_frame_rect[0],
-                                video_frame_rect[1],
-                                AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
-                                video_time_base.numerator(),
-                                video_time_base.denominator(),
-                                spec
-                            )
-                        } else {
-                            String::new()
+                if let Some(font_path_str) = p.to_str() {
+                    let mut font_path_str = font_path_str.replace("\\", "/");
+                    if let Some(idx) = font_path_str.find(':') {
+                        font_path_str.insert_str(idx, "\\");
+                        unsafe {
+                            if let Ok(c_str_buffer) = CString::new("buffer") {
+                                if let Ok(c_str_buffersrc) = CString::new("buffersrc") {
+                                    if let Ok(c_str_buffersrc_args) = CString::new(format!(
+                                        "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
+                                        video_frame_rect[0],
+                                        video_frame_rect[1],
+                                        AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
+                                        video_time_base.numerator(),
+                                        video_time_base.denominator(),
+                                    )) {
+                                        if let Ok(c_str_drawtext) = CString::new("drawtext") {
+                                            if let Ok(c_str_draw) = CString::new("draw") {
+                                                if let Ok(c_str_draw_args) = CString::new(format!(
+                                                    "text='Tiny Player':fontfile={}:fontsize=26:fontcolor=white@0.3:x=w-text_w-10:y=10",
+                                                    font_path_str
+                                                )) {
+                                                    if let Ok(c_str_buffersink) =
+                                                        CString::new("buffersink")
+                                                    {
+                                                        if let Ok(c_str_sink) = CString::new("sink")
+                                                        {
+                                                            let buffersrc_filter =
+                                                                avfilter_get_by_name(
+                                                                    c_str_buffer.as_ptr(),
+                                                                );
+                                                            // graph free will automatically free filterctx
+                                                            let mut buffersrc_ctx = null_mut();
+                                                            let draw_filter = avfilter_get_by_name(
+                                                                c_str_drawtext.as_ptr(),
+                                                            );
+                                                            let mut drawtext_ctx = null_mut();
+                                                            let buffersink_filter =
+                                                                avfilter_get_by_name(
+                                                                    c_str_buffersink.as_ptr(),
+                                                                );
+                                                            let mut buffersink_ctx = null_mut();
+                                                            let r = avfilter_graph_create_filter(
+                                                                &mut buffersrc_ctx,
+                                                                buffersrc_filter,
+                                                                c_str_buffersrc.as_ptr(),
+                                                                c_str_buffersrc_args.as_ptr(),
+                                                                null_mut(),
+                                                                graph.as_mut_ptr(),
+                                                            );
+                                                            if r < 0 {
+                                                                warn!("create buffer filter err");
+                                                            }
+                                                            let r = avfilter_graph_create_filter(
+                                                                &mut drawtext_ctx,
+                                                                draw_filter,
+                                                                c_str_draw.as_ptr(),
+                                                                c_str_draw_args.as_ptr(),
+                                                                null_mut(),
+                                                                graph.as_mut_ptr(),
+                                                            );
+                                                            if r < 0 {
+                                                                warn!("create drawtext filter err");
+                                                            }
+                                                            let r = avfilter_graph_create_filter(
+                                                                &mut buffersink_ctx,
+                                                                buffersink_filter,
+                                                                c_str_sink.as_ptr(),
+                                                                null(),
+                                                                null_mut(),
+                                                                graph.as_mut_ptr(),
+                                                            );
+                                                            if r < 0 {
+                                                                warn!(
+                                                                    "create buffersink filter err"
+                                                                );
+                                                            }
+                                                            let r = avfilter_link(
+                                                                buffersrc_ctx,
+                                                                0,
+                                                                drawtext_ctx,
+                                                                0,
+                                                            );
+                                                            if r < 0 {
+                                                                warn!("link src and drawtext err");
+                                                            }
+                                                            let r = avfilter_link(
+                                                                drawtext_ctx,
+                                                                0,
+                                                                buffersink_ctx,
+                                                                0,
+                                                            );
+                                                            if r < 0 {
+                                                                warn!("link drawtext and sink err");
+                                                            }
+                                                            if graph.validate().is_ok() {
+                                                                warn!(
+                                                                    "graph validate success!dump:\n{}",
+                                                                    graph.dump()
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        String::new()
-                    }
-                };
-
-                if graph.parse(&args).is_ok() {
-                    if graph.validate().is_ok() {
-                        warn!("graph validate success!dump:\n{}", graph.dump());
                     }
                 }
             }
@@ -557,13 +639,11 @@ impl TinyDecoder {
                                         };
                                         let mut graph = graph.write().await;
                                         if let Some(graph) = &mut *graph {
-                                            if let Some(mut ctx) = graph.get("Parsed_buffer_0") {
+                                            if let Some(mut ctx) = graph.get("buffersrc") {
                                                 if ctx.source().add(&video_frame_tmp).is_ok() {
                                                     let mut filtered_frame =
                                                         ffmpeg_the_third::frame::Video::empty();
-                                                    if let Some(mut ctx) =
-                                                        graph.get("Parsed_buffersink_2")
-                                                    {
+                                                    if let Some(mut ctx) = graph.get("sink") {
                                                         if ctx
                                                             .sink()
                                                             .frame(&mut filtered_frame)

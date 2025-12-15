@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use ffmpeg_the_third::{ChannelLayout, format::Sample, frame::Audio};
 use log::warn;
+use tokio::sync::RwLock;
 use vosk::{DecodingState, Model, Recognizer};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult};
@@ -35,7 +38,11 @@ impl AISubTitle {
         ))
     }
 
-    pub fn push_frame_data(&mut self, audio_frame: ffmpeg_the_third::frame::Audio) {
+    pub async fn push_frame_data(
+        ai_subtitle: Arc<RwLock<AISubTitle>>,
+        audio_frame: ffmpeg_the_third::frame::Audio,
+    ) {
+        let mut sub_title = ai_subtitle.write().await;
         if let Ok(mut resampler) = ffmpeg_the_third::software::resampler2(
             (
                 audio_frame.format(),
@@ -56,22 +63,22 @@ impl AISubTitle {
                         to_recognize_frame.samples(),
                     )
                 };
-                if let Ok(state) = self.recognizer.accept_waveform(data) {
+                if let Ok(state) = sub_title.recognizer.accept_waveform(data) {
                     if let DecodingState::Finalized = state {
-                        let final_result = self.recognizer.final_result();
+                        let final_result = sub_title.recognizer.final_result();
                         if let Some(result) = final_result.single() {
                             let trimed_result = result.text.replace(" ", "");
-                            self.generated_str.push_str(&trimed_result);
+                            sub_title.generated_str.push_str(&trimed_result);
                             warn!(
                                 "sub str len{} content:{} ",
-                                self.generated_str.len(),
-                                self.generated_str
+                                sub_title.generated_str.len(),
+                                sub_title.generated_str
                             );
                         }
                     }
                 }
-                if self.generated_str.chars().count() > 20 {
-                    self.generated_str.remove(0);
+                if sub_title.generated_str.chars().count() > 20 {
+                    sub_title.generated_str.remove(0);
                 }
             }
         }
