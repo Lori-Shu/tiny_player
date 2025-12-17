@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
 use ffmpeg_the_third::{ChannelLayout, format::Sample, frame::Audio};
-use log::warn;
 use tokio::sync::RwLock;
 use vosk::{DecodingState, Model, Recognizer};
 
-use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult};
+use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, decode::ManualProtectedResampler};
 
 pub struct AISubTitle {
     _recognize_model: Model,
     recognizer: Recognizer,
+    source_buffer: Vec<i16>,
     generated_str: String,
+    subtitle_source_resampler: Arc<RwLock<ManualProtectedResampler>>,
 }
 impl AISubTitle {
     pub fn new() -> PlayerResult<Self> {
@@ -22,13 +23,30 @@ impl AISubTitle {
                 if let Some(recognize_model) = Model::new(model_path_str) {
                     if let Some(mut rez) = Recognizer::new(&recognize_model, 16000.0) {
                         rez.set_max_alternatives(0);
-                        rez.set_words(true);
+                        rez.set_partial_words(true);
                         rez.set_nlsml(true);
-                        return Ok(Self {
-                            _recognize_model: recognize_model,
-                            recognizer: rez,
-                            generated_str: String::new(),
-                        });
+                        if let Ok(resampler) = ffmpeg_the_third::software::resampler2(
+                            (
+                                Sample::F32(ffmpeg_the_third::util::format::sample::Type::Packed),
+                                ChannelLayout::STEREO,
+                                48000,
+                            ),
+                            (
+                                Sample::I16(ffmpeg_the_third::util::format::sample::Type::Packed),
+                                ChannelLayout::MONO,
+                                16000,
+                            ),
+                        ) {
+                            return Ok(Self {
+                                _recognize_model: recognize_model,
+                                recognizer: rez,
+                                source_buffer: vec![],
+                                generated_str: String::new(),
+                                subtitle_source_resampler: Arc::new(RwLock::new(
+                                    ManualProtectedResampler(resampler),
+                                )),
+                            });
+                        }
                     }
                 }
             }
@@ -43,42 +61,36 @@ impl AISubTitle {
         audio_frame: ffmpeg_the_third::frame::Audio,
     ) {
         let mut sub_title = ai_subtitle.write().await;
-        if let Ok(mut resampler) = ffmpeg_the_third::software::resampler2(
-            (
-                audio_frame.format(),
-                audio_frame.ch_layout(),
-                audio_frame.rate(),
-            ),
-            (
-                Sample::I16(ffmpeg_the_third::util::format::sample::Type::Packed),
-                ChannelLayout::MONO,
-                16000,
-            ),
-        ) {
-            let mut to_recognize_frame = Audio::empty();
-            if resampler.run(&audio_frame, &mut to_recognize_frame).is_ok() {
-                let data: &[i16] = unsafe {
-                    std::slice::from_raw_parts(
-                        to_recognize_frame.data(0).as_ptr() as *const i16,
-                        to_recognize_frame.samples(),
-                    )
-                };
-                if let Ok(state) = sub_title.recognizer.accept_waveform(data) {
-                    if let DecodingState::Finalized = state {
-                        let final_result = sub_title.recognizer.final_result();
-                        if let Some(result) = final_result.single() {
-                            let trimed_result = result.text.replace(" ", "");
-                            sub_title.generated_str.push_str(&trimed_result);
-                            warn!(
-                                "sub str len{} content:{} ",
-                                sub_title.generated_str.len(),
-                                sub_title.generated_str
-                            );
-                        }
-                    }
+        let mut to_recognize_frame = Audio::empty();
+        {
+            let mut resampler = sub_title.subtitle_source_resampler.write().await;
+            if resampler
+                .0
+                .run(&audio_frame, &mut to_recognize_frame)
+                .is_ok()
+            {}
+        }
+        let data: &[i16] = unsafe {
+            std::slice::from_raw_parts(
+                to_recognize_frame.data(0).as_ptr() as *const i16,
+                to_recognize_frame.samples(),
+            )
+        };
+        sub_title.source_buffer.extend(data);
+        if sub_title.source_buffer.len() > 3200 {
+            let buf = (&sub_title.source_buffer[0..3200]).to_vec();
+            if let Ok(state) = sub_title.recognizer.accept_waveform(&buf) {
+                sub_title.source_buffer.drain(0..3200);
+                let partial_result = sub_title.recognizer.partial_result();
+                if !partial_result.partial.is_empty() {
+                    let no_space_result = partial_result.partial.replace(" ", "");
+                    sub_title.generated_str = no_space_result;
                 }
-                if sub_title.generated_str.chars().count() > 20 {
-                    sub_title.generated_str.remove(0);
+                if let DecodingState::Finalized = state {
+                    if let Some(res) = sub_title.recognizer.final_result().single() {
+                        let no_space_result = res.text.replace(" ", "");
+                        sub_title.generated_str = no_space_result;
+                    }
                 }
             }
         }

@@ -59,7 +59,7 @@ impl AudioPlayer {
         }
         self.pts_vec.push(pts);
     }
-    pub fn get_last_source_pts(&self) -> Result<i64, String> {
+    pub fn last_source_pts(&self) -> Result<i64, String> {
         if !self.pts_vec.is_empty() {
             return Ok(self.pts_vec[self.pts_vec.len() - 1]);
         } else {

@@ -10,16 +10,20 @@ use std::{
 use ffmpeg_the_third::{
     Rational, Stream,
     ffi::{
-        AVBufferRef, AVPixelFormat, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-        avcodec_get_hw_config, avfilter_get_by_name, avfilter_graph_create_filter, avfilter_link,
+        AVPixelFormat, av_hwdevice_ctx_create, av_hwframe_transfer_data, avcodec_get_hw_config,
+        avfilter_get_by_name, avfilter_graph_create_filter, avfilter_link,
     },
     filter::Graph,
-    format::{self, Pixel},
+    format::{self, Pixel, stream::Disposition},
     frame::Video,
+    software::{
+        resampling,
+        scaling::{self},
+    },
 };
 use log::warn;
 use time::format_description;
-use tokio::{io::AsyncWriteExt, runtime::Runtime, sync::RwLock, task::JoinHandle, time::sleep};
+use tokio::{io::AsyncWriteExt, runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, appui::VideoPathSource};
 /// in order to make Input impl Sync, create a new Type ,
@@ -37,7 +41,11 @@ unsafe impl Sync for ManualProtectedVideoDecoder {}
 pub struct ManualProtectedAudioDecoder(ffmpeg_the_third::decoder::Audio);
 
 unsafe impl Sync for ManualProtectedAudioDecoder {}
-
+pub struct ManualProtectedResampler(pub resampling::Context);
+unsafe impl Sync for ManualProtectedResampler {}
+pub struct ManualProtectedConverter(pub scaling::Context);
+unsafe impl Send for ManualProtectedConverter {}
+unsafe impl Sync for ManualProtectedConverter {}
 pub enum MainStream {
     Video,
     Audio,
@@ -70,12 +78,12 @@ pub struct TinyDecoder {
     decode_task_handle: Option<JoinHandle<()>>,
     hardware_config: Arc<RwLock<bool>>,
     cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
-    async_rt: Arc<Runtime>,
+    runtime_handle: Handle,
     graph: Arc<RwLock<Option<ffmpeg_the_third::filter::Graph>>>,
 }
 impl TinyDecoder {
     /// init Decoder and new Struct
-    pub fn new(runtime: Arc<Runtime>) -> PlayerResult<Self> {
+    pub fn new(runtime_handle: Handle) -> PlayerResult<Self> {
         if ffmpeg_the_third::init().is_ok() {
             return Ok(Self {
                 video_stream_index: Arc::new(RwLock::new(usize::MAX)),
@@ -103,7 +111,7 @@ impl TinyDecoder {
                 decode_task_handle: None,
                 hardware_config: Arc::new(RwLock::new(false)),
                 cover_pic_data: Arc::new(RwLock::new(None)),
-                async_rt: runtime,
+                runtime_handle: runtime_handle,
                 graph: Arc::new(RwLock::new(None)),
             });
         }
@@ -172,16 +180,19 @@ impl TinyDecoder {
             for item in format_input.streams() {
                 let stream_type = item.parameters().medium();
                 if stream_type == ffmpeg_the_third::util::media::Type::Video {
-                    warn!("找到视频流");
-                    video_stream = Some(item);
+                    if item.disposition() == Disposition::ATTACHED_PIC {
+                        warn!("pic stream was found");
+                        cover_stream = Some(item);
+                    } else {
+                        warn!("video stream was found");
+                        video_stream = Some(item);
+                    }
                 } else if stream_type == ffmpeg_the_third::util::media::Type::Audio {
-                    warn!("找到音频流");
+                    warn!("audio stream was found");
                     audio_stream = Some(item);
                 } else if stream_type == ffmpeg_the_third::util::media::Type::Attachment {
-                    warn!("找到attachment流");
+                    warn!("attachment stream was found");
                     cover_stream = Some(item);
-                } else {
-                    warn!("unhandled stream");
                 }
             }
 
@@ -219,7 +230,7 @@ impl TinyDecoder {
             // stream不存储时长,format_input.duration()更可靠
             // format_input.duration() 单位是微妙
             if let VideoPathSource::File(_s) = &path {
-                warn!("dur {} us", format_input.duration());
+                warn!("total duration {} us", format_input.duration());
                 *self.format_duration.write().await = format_input.duration();
                 let adur_ts = {
                     if let MainStream::Audio = self.main_stream {
@@ -382,6 +393,46 @@ impl TinyDecoder {
             }
         }
     }
+    ///convert the hardware output frame to YUV420P
+    async fn convert_hardware_frame(
+        hardware_config: Arc<RwLock<bool>>,
+        hardware_frame_converter: Arc<RwLock<Option<ManualProtectedConverter>>>,
+        video_frame_tmp: Video,
+    ) -> Video {
+        if *hardware_config.read().await {
+            unsafe {
+                let mut transfered_frame = ffmpeg_the_third::frame::Video::empty();
+                if 0 != av_hwframe_transfer_data(
+                    transfered_frame.as_mut_ptr(),
+                    video_frame_tmp.as_ptr(),
+                    0,
+                ) {
+                    warn!("hardware frame transfer to software frame err");
+                }
+
+                transfered_frame.set_pts(video_frame_tmp.pts());
+                let mut default_frame = Video::empty();
+                let mut hardware_frame_converter = hardware_frame_converter.write().await;
+                if let Some(hardware_frame_converter) = &mut *hardware_frame_converter {
+                    if hardware_frame_converter
+                        .0
+                        .run(&transfered_frame, &mut default_frame)
+                        .is_ok()
+                    {
+                        default_frame.set_pts(transfered_frame.pts());
+                        return default_frame;
+                    }
+                } else if let Ok(ctx) = ffmpeg_the_third::software::converter(
+                    (video_frame_tmp.width(), video_frame_tmp.height()),
+                    transfered_frame.format(),
+                    Pixel::YUV420P,
+                ) {
+                    *hardware_frame_converter = Some(ManualProtectedConverter(ctx));
+                }
+            }
+        }
+        video_frame_tmp
+    }
     /// the loop of decode demuxed packet
     async fn frame_decode_process(
         exit_flag: Arc<RwLock<bool>>,
@@ -529,6 +580,7 @@ impl TinyDecoder {
                 }
             }
         }
+        let hardware_frame_converter = Arc::new(RwLock::new(None));
         loop {
             sleep(Duration::from_millis(1)).await;
             if *exit_flag.read().await {
@@ -588,59 +640,16 @@ impl TinyDecoder {
                                             break;
                                         }
 
-                                        let video_frame_tmp = {
-                                            if *hardware_config.read().await {
-                                                unsafe {
-                                                    let mut transfered_frame =
-                                                        ffmpeg_the_third::frame::Video::empty();
-                                                    if 0 != av_hwframe_transfer_data(
-                                                        transfered_frame.as_mut_ptr(),
-                                                        video_frame_tmp.as_ptr(),
-                                                        0,
-                                                    ) {
-                                                        warn!(
-                                                            "hardware frame transfer to software frame err"
-                                                        );
-                                                    }
-
-                                                    transfered_frame.set_pts(video_frame_tmp.pts());
-                                                    let mut default_frame = Video::empty();
-                                                    {
-                                                        if let Ok(ctx) =
-                                                            ffmpeg_the_third::software::converter(
-                                                                (
-                                                                    video_frame_tmp.width(),
-                                                                    video_frame_tmp.height(),
-                                                                ),
-                                                                transfered_frame.format(),
-                                                                Pixel::YUV420P,
-                                                            )
-                                                        {
-                                                            let mut hardware_frame_converter = ctx;
-                                                            if hardware_frame_converter
-                                                                .run(
-                                                                    &transfered_frame,
-                                                                    &mut default_frame,
-                                                                )
-                                                                .is_ok()
-                                                            {
-                                                                default_frame.set_pts(
-                                                                    transfered_frame.pts(),
-                                                                );
-                                                            }
-                                                        }
-
-                                                        default_frame
-                                                    }
-                                                }
-                                            } else {
-                                                video_frame_tmp
-                                            }
-                                        };
+                                        let video_frame = TinyDecoder::convert_hardware_frame(
+                                            hardware_config.clone(),
+                                            hardware_frame_converter.clone(),
+                                            video_frame_tmp,
+                                        )
+                                        .await;
                                         let mut graph = graph.write().await;
                                         if let Some(graph) = &mut *graph {
                                             if let Some(mut ctx) = graph.get("buffersrc") {
-                                                if ctx.source().add(&video_frame_tmp).is_ok() {
+                                                if ctx.source().add(&video_frame).is_ok() {
                                                     let mut filtered_frame =
                                                         ffmpeg_the_third::frame::Video::empty();
                                                     if let Some(mut ctx) = graph.get("sink") {
@@ -780,24 +789,24 @@ impl TinyDecoder {
         None
     }
     /// get v time base used to check time and compare to sync
-    pub fn get_video_time_base(&self) -> &Rational {
+    pub fn video_time_base(&self) -> &Rational {
         &self.video_time_base
     }
     /// get a time base used to check time and compare to sync
-    pub fn get_audio_time_base(&self) -> &Rational {
+    pub fn audio_time_base(&self) -> &Rational {
         &self.audio_time_base
     }
     /// get the calculated end time str
-    pub fn get_end_time_formatted_string(&self) -> &String {
+    pub fn end_time_formatted_string(&self) -> &String {
         &self.end_time_formatted_string
     }
-    /// get_video_frame_rect to config the main colorimage and texture size
-    pub fn get_video_frame_rect(&self) -> &[u32; 2] {
+    /// video_frame_rect to config the main colorimage and texture size
+    pub fn video_frame_rect(&self) -> &[u32; 2] {
         &self.video_frame_rect
     }
     /// get the end audio timestamp used as the main time flow
     /// it is more accurate than just use time second
-    pub fn get_end_ts(&mut self) -> i64 {
+    pub fn end_ts(&mut self) -> i64 {
         // if self.end_audio_ts == 0 {
         //     let adur_ts = {
         //         let dur = self.format_duration.read().await;
@@ -819,12 +828,18 @@ impl TinyDecoder {
     /// the seek would go as I want, to an exact frame
     pub fn seek_timestamp_to_decode(&mut self, ts: i64) {
         {
-            let mut audio_packet_cache_vec =
-                self.async_rt.block_on(self.audio_packet_cache_vec.write());
-            let mut video_packet_cache_vec =
-                self.async_rt.block_on(self.video_packet_cache_vec.write());
-            let mut audio_cache_vec = self.async_rt.block_on(self.audio_frame_cache_vec.write());
-            let mut video_cache_vec = self.async_rt.block_on(self.video_frame_cache_vec.write());
+            let mut audio_packet_cache_vec = self
+                .runtime_handle
+                .block_on(self.audio_packet_cache_vec.write());
+            let mut video_packet_cache_vec = self
+                .runtime_handle
+                .block_on(self.video_packet_cache_vec.write());
+            let mut audio_cache_vec = self
+                .runtime_handle
+                .block_on(self.audio_frame_cache_vec.write());
+            let mut video_cache_vec = self
+                .runtime_handle
+                .block_on(self.video_frame_cache_vec.write());
             if let Some(audio_packet_cache_vec) = &mut *audio_packet_cache_vec {
                 audio_packet_cache_vec.clear();
             }
@@ -838,12 +853,12 @@ impl TinyDecoder {
                 video_cache_vec.clear();
             }
 
-            let mut input = self.async_rt.block_on(self.format_input.write());
+            let mut input = self.runtime_handle.block_on(self.format_input.write());
             let main_stream_idx = {
                 if let MainStream::Audio = self.main_stream {
-                    *self.async_rt.block_on(self.audio_stream_index.read())
+                    *self.runtime_handle.block_on(self.audio_stream_index.read())
                 } else {
-                    *self.async_rt.block_on(self.video_stream_index.read())
+                    *self.runtime_handle.block_on(self.video_stream_index.read())
                 }
             };
             let main_stream_time_base = {
@@ -871,7 +886,7 @@ impl TinyDecoder {
                     }
                 }
             }
-            self.async_rt.block_on(self.flush_decoders());
+            self.runtime_handle.block_on(self.flush_decoders());
         }
     }
     /// use the file detail to compute the video duration and make str to inform the user
@@ -901,20 +916,17 @@ impl TinyDecoder {
             warn!("end_time_err");
         }
     }
-    pub fn get_cover_pic_data(&self) -> Arc<RwLock<Option<Vec<u8>>>> {
+    pub fn cover_pic_data(&self) -> Arc<RwLock<Option<Vec<u8>>>> {
         self.cover_pic_data.clone()
     }
     pub async fn check_input_exist(&self) -> bool {
         let input = self.format_input.write().await;
         input.is_some()
     }
-    pub fn get_format_duration(&self) -> Arc<RwLock<i64>> {
-        self.format_duration.clone()
-    }
-    pub fn get_main_stream(&self) -> &MainStream {
+    pub fn main_stream(&self) -> &MainStream {
         &self.main_stream
     }
-    pub fn get_video_stream_idx(&self) -> Arc<RwLock<usize>> {
+    pub fn video_stream_idx(&self) -> Arc<RwLock<usize>> {
         self.video_stream_index.clone()
     }
     async fn stop_demux_and_decode(&mut self) {
@@ -960,12 +972,12 @@ impl TinyDecoder {
                         let hw_config = avcodec_get_hw_config(codec.as_ptr(), 0);
 
                         if hw_config.is_null() {
-                            warn!("currently dont support hardware accelerate");
+                            warn!("currently doesn't support hardware accelerate");
                             return Ok(decoder);
                         } else {
-                            let mut hw_device_ctx: *mut AVBufferRef = null_mut();
+                            let mut hw_device_ctx = null_mut();
                             if 0 != av_hwdevice_ctx_create(
-                                &mut hw_device_ctx as *mut *mut AVBufferRef,
+                                &mut hw_device_ctx,
                                 (*hw_config).device_type,
                                 null(),
                                 null_mut(),
@@ -977,6 +989,7 @@ impl TinyDecoder {
                             (*decoder.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
 
                             *self.hardware_config.write().await = true;
+                            warn!("hardware decode acceleration is on!");
                             return Ok(decoder);
                         }
                     }
@@ -989,8 +1002,8 @@ impl TinyDecoder {
 impl Drop for TinyDecoder {
     fn drop(&mut self) {
         if self.demux_task_handle.is_some() {
-            let runtime = self.async_rt.clone();
-            runtime.block_on(self.stop_demux_and_decode());
+            let runtime_handle = self.runtime_handle.clone();
+            runtime_handle.block_on(self.stop_demux_and_decode());
         }
     }
 }

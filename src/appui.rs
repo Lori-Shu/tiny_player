@@ -1,26 +1,24 @@
 use std::{
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use egui::{
     AtomExt, Color32, ColorImage, Context, ImageData, ImageSource, Layout, Pos2, Rect, RichText,
-    TextureHandle, TextureOptions, Ui, Vec2, Vec2b, ViewportBuilder, ViewportId, WidgetText,
+    TextBuffer, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId, WidgetText,
     include_image,
 };
 
 use image::DynamicImage;
 use log::warn;
-use reqwest::{Method, Url};
 use time::format_description;
 use tokio::sync::RwLock;
 
 use crate::{
     PlayerError, PlayerResult,
     ai_sub_title::AISubTitle,
-    asyncmod::{AsyncContext, SocketMessage, VideoDes},
+    asyncmod::{AsyncContext, VideoDes},
     decode::MainStream,
 };
 
@@ -33,6 +31,17 @@ const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png"
 pub const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
 const EMOJI_FONT: &[u8] = include_bytes!("../resources/fonts/seguiemj.ttf");
 /// the main struct stores all the vars which are related to ui
+struct UiFlags {
+    pause_flag: bool,
+    fullscreen_flag: bool,
+    control_ui_flag: bool,
+    err_window_flag: bool,
+    playlist_window_flag: bool,
+    subtitle_flag: bool,
+    chinese_subtitle_flag: bool,
+    show_subtitle_options_flag: bool,
+    show_volumn_slider_flag: bool,
+}
 pub struct AppUi {
     video_texture_handle: Option<TextureHandle>,
     tiny_decoder: crate::decode::TinyDecoder,
@@ -41,27 +50,19 @@ pub struct AppUi {
     main_color_image: Option<ColorImage>,
     bg_dyn_img: DynamicImage,
     frame_show_instant: Instant,
-    pause_flag: bool,
+    ui_flags: UiFlags,
     play_time: time::Time,
     time_text: String,
-    fullscreen_flag: bool,
-    control_ui_flag: bool,
-    err_window_flag: bool,
     err_window_msg: String,
-    network_window_flag: bool,
     last_show_control_ui_instant: Instant,
     app_start_instant: Instant,
     current_video_frame: Option<ffmpeg_the_third::frame::Video>,
     async_ctx: AsyncContext,
-    content_str: String,
     opened_file: Option<std::path::PathBuf>,
     open_file_dialog: Option<egui_file::FileDialog>,
-    share_folder_dialog: Option<egui_file::FileDialog>,
-    username_buf: String,
+    scan_folder_dialog: Option<egui_file::FileDialog>,
     subtitle: Arc<RwLock<AISubTitle>>,
-    subtitle_flag: bool,
-    chinese_subtitle_flag: bool,
-    show_subtitle_options: bool,
+    video_des: Arc<RwLock<Vec<VideoDes>>>,
 }
 impl eframe::App for AppUi {
     /// this function will automaticly be called every ui redraw
@@ -82,7 +83,7 @@ impl eframe::App for AppUi {
                     .async_ctx
                     .exec_normal_task(self.tiny_decoder.check_input_exist())
                 {
-                    if !self.pause_flag {
+                    if !self.ui_flags.pause_flag {
                         /*
                         if now is next_frame_time or a little beyond get and show a new frame
                          */
@@ -108,15 +109,15 @@ impl eframe::App for AppUi {
                  */
                 self.paint_video_image(ctx, ui);
                 self.paint_frame_info_text(ui, ctx, &now);
-                if self.control_ui_flag {
+                if self.ui_flags.control_ui_flag {
                     ui.set_opacity(1.0);
                 } else {
                     ui.set_opacity(0.0);
                 }
                 ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        self.paint_file_btn(ui, ctx, &now);
-                        self.paint_network_button(ui, ctx, &now);
+                    self.paint_file_btn(ui, ctx, &now);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        self.paint_playlist_button(ui, ctx, &now);
                     });
                 });
 
@@ -128,10 +129,10 @@ impl eframe::App for AppUi {
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     self.update_time_and_time_text();
                     self.paint_control_area(ui, ctx, &now);
-                    self.paint_volumn_slider(ui, ctx, now);
+                    self.paint_subtitle(ui, ctx);
                 });
                 if (now - self.last_show_control_ui_instant).as_secs() > 3 {
-                    self.control_ui_flag = false;
+                    self.ui_flags.control_ui_flag = false;
                 }
                 self.detect_file_drag(ctx, &now);
             });
@@ -190,7 +191,7 @@ impl AppUi {
             }
         };
         if let Ok(async_ctx) = AsyncContext::new() {
-            let rt = async_ctx.get_runtime();
+            let rt = async_ctx.runtime_handle();
             let f_dialog = egui_file::FileDialog::open_file(None);
             if let Ok((color_image, dyn_img)) = {
                 if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
@@ -221,27 +222,32 @@ impl AppUi {
                             play_time: play_time,
                             main_color_image: Some(color_image),
                             frame_show_instant: Instant::now(),
-                            pause_flag: true,
+                            ui_flags: UiFlags {
+                                pause_flag: true,
+                                fullscreen_flag: false,
+                                control_ui_flag: true,
+                                err_window_flag: false,
+                                playlist_window_flag: false,
+                                subtitle_flag: true,
+                                chinese_subtitle_flag: false,
+                                show_subtitle_options_flag: false,
+                                show_volumn_slider_flag: false,
+                            },
+
                             time_text: String::new(),
-                            fullscreen_flag: false,
-                            control_ui_flag: true,
-                            err_window_flag: false,
+
                             err_window_msg: String::new(),
-                            network_window_flag: false,
+
                             last_show_control_ui_instant: Instant::now(),
                             app_start_instant: Instant::now(),
                             current_video_frame: None,
                             async_ctx: async_ctx,
-                            content_str: String::new(),
                             opened_file: None,
                             open_file_dialog: Some(f_dialog),
-                            share_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
+                            scan_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
                             bg_dyn_img: dyn_img,
-                            username_buf: String::new(),
                             subtitle: Arc::new(RwLock::new(subtitle)),
-                            subtitle_flag: true,
-                            chinese_subtitle_flag: false,
-                            show_subtitle_options: false,
+                            video_des: Arc::new(RwLock::new(vec![])),
                         });
                     }
                 }
@@ -279,12 +285,12 @@ impl AppUi {
             });
 
             let sec_num = {
-                if let MainStream::Audio = tiny_decoder.get_main_stream() {
-                    let audio_time_base = tiny_decoder.get_audio_time_base();
+                if let MainStream::Audio = tiny_decoder.main_stream() {
+                    let audio_time_base = tiny_decoder.audio_time_base();
                     play_ts * audio_time_base.numerator() as i64
                         / audio_time_base.denominator() as i64
                 } else {
-                    let v_time_base = tiny_decoder.get_video_time_base();
+                    let v_time_base = tiny_decoder.video_time_base();
 
                     play_ts * v_time_base.numerator() as i64 / v_time_base.denominator() as i64
                 }
@@ -299,7 +305,7 @@ impl AppUi {
                     if let Ok(formatter) = format_description::parse("[hour]:[minute]:[second]") {
                         if let Ok(mut now_str) = time.format(&formatter) {
                             now_str.push_str("|");
-                            now_str.push_str(tiny_decoder.get_end_time_formatted_string());
+                            now_str.push_str(tiny_decoder.end_time_formatted_string());
                             self.time_text = now_str;
                             self.play_time = time;
                         }
@@ -312,7 +318,7 @@ impl AppUi {
     }
     fn update_color_image(&mut self) {
         let tiny_decoder = &self.tiny_decoder;
-        let frame_rect = tiny_decoder.get_video_frame_rect();
+        let frame_rect = tiny_decoder.video_frame_rect();
         let color_image = ColorImage::filled(
             [frame_rect[0] as usize, frame_rect[1] as usize],
             Color32::from_rgba_unmultiplied(0, 200, 0, 200),
@@ -342,7 +348,7 @@ impl AppUi {
 
         let audio_player = &mut self.audio_player;
         let tiny_decoder = &mut self.tiny_decoder;
-        if let MainStream::Audio = tiny_decoder.get_main_stream() {
+        if let MainStream::Audio = tiny_decoder.main_stream() {
             if audio_player.len() < 30 {
                 let frame_fu = tiny_decoder.pull_one_audio_play_frame();
 
@@ -350,18 +356,20 @@ impl AppUi {
                     if let Some(pts) = audio_frame.pts() {
                         audio_player.set_pts(pts);
                         audio_player.play_raw_data_from_audio_frame(audio_frame.clone());
-                        if self.subtitle_flag {
-                            if self.chinese_subtitle_flag {
-                                self.async_ctx.exec_normal_task(AISubTitle::push_frame_data(
-                                    self.subtitle.clone(),
-                                    audio_frame,
-                                ));
+                        if self.ui_flags.subtitle_flag {
+                            if self.ui_flags.chinese_subtitle_flag {
+                                self.async_ctx
+                                    .runtime_handle()
+                                    .spawn(AISubTitle::push_frame_data(
+                                        self.subtitle.clone(),
+                                        audio_frame,
+                                    ));
                             }
                         }
                     }
                 }
             }
-            if let Ok(pts) = audio_player.get_last_source_pts() {
+            if let Ok(pts) = audio_player.last_source_pts() {
                 self.set_current_play_pts(pts);
             }
         }
@@ -375,7 +383,7 @@ impl AppUi {
         let file_image_button = egui::Button::new(VIDEO_FILE_IMG.atom_size(btn_rect)).frame(false);
         let file_img_btn_response = ui.add(file_image_button);
         if file_img_btn_response.hovered() {
-            self.control_ui_flag = true;
+            self.ui_flags.control_ui_flag = true;
             self.last_show_control_ui_instant = now.clone();
         }
         if file_img_btn_response.clicked() {
@@ -383,7 +391,7 @@ impl AppUi {
                 dialog.open();
             }
         }
-        if self.err_window_flag {
+        if self.ui_flags.err_window_flag {
             egui::Window::new("err window")
                 .default_pos(Pos2::new(
                     ctx.content_rect().width() / 2.0,
@@ -392,7 +400,7 @@ impl AppUi {
                 .show(ctx, |ui| {
                     ui.label(&self.err_window_msg);
                     if ui.button("close").clicked() {
-                        self.err_window_flag = false;
+                        self.ui_flags.err_window_flag = false;
                     }
                 });
         }
@@ -412,7 +420,7 @@ impl AppUi {
                 warn!("accept file path{}", path.display().to_string());
             } else {
                 self.err_window_msg = "please choose a valid video or audio file !!!".to_string();
-                self.err_window_flag = true;
+                self.ui_flags.err_window_flag = true;
             }
         }
     }
@@ -425,7 +433,7 @@ impl AppUi {
             .exec_normal_task(tiny_decoder.check_input_exist())
         {
             let play_or_pause_image_source;
-            if self.pause_flag {
+            if self.ui_flags.pause_flag {
                 play_or_pause_image_source = PLAY_IMG;
             } else {
                 play_or_pause_image_source = PAUSE_IMG;
@@ -440,13 +448,13 @@ impl AppUi {
             ui.add_space(ctx.content_rect().width() / 2.0 - 100.0);
             let btn_response = ui.add_sized(Vec2::new(100.0, 100.0), play_or_pause_btn);
             if btn_response.hovered() {
-                self.control_ui_flag = true;
+                self.ui_flags.control_ui_flag = true;
                 self.last_show_control_ui_instant = now.clone();
             }
             if btn_response.clicked() || ctx.input(|s| s.key_released(egui::Key::Space)) {
-                self.pause_flag = !self.pause_flag;
+                self.ui_flags.pause_flag = !self.ui_flags.pause_flag;
                 let audio_player = &self.audio_player;
-                if self.pause_flag {
+                if self.ui_flags.pause_flag {
                     audio_player.pause_play();
                 } else {
                     audio_player.continue_play();
@@ -465,14 +473,13 @@ impl AppUi {
                 let mut timestamp = self
                     .async_ctx
                     .exec_normal_task(async { self.main_stream_current_timestamp.write().await });
-                let progress_slider =
-                    egui::Slider::new(&mut *timestamp, 0..=tiny_decoder.get_end_ts())
-                        .show_value(false)
-                        .text(WidgetText::RichText(Arc::new(
-                            RichText::new(self.time_text.clone())
-                                .size(20.0)
-                                .color(Color32::ORANGE),
-                        )));
+                let progress_slider = egui::Slider::new(&mut *timestamp, 0..=tiny_decoder.end_ts())
+                    .show_value(false)
+                    .text(WidgetText::RichText(Arc::new(
+                        RichText::new(self.time_text.clone())
+                            .size(20.0)
+                            .color(Color32::ORANGE),
+                    )));
                 let mut slider_width_style = egui::style::Style::default();
                 slider_width_style.spacing.slider_width = ctx.content_rect().width() - 400.0;
                 slider_width_style.spacing.slider_rail_height = 10.0;
@@ -484,11 +491,11 @@ impl AppUi {
                 slider_width_style.visuals.widgets.active.bg_fill =
                     Color32::from_rgba_unmultiplied(0, 0, 0, 100);
                 slider_width_style.visuals.widgets.inactive.bg_fill =
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                    Color32::from_rgba_unmultiplied(255, 165, 0, 100);
                 ui.set_style(slider_width_style);
                 let slider_response = ui.add(progress_slider);
                 if slider_response.hovered() {
-                    self.control_ui_flag = true;
+                    self.ui_flags.control_ui_flag = true;
                     self.last_show_control_ui_instant = Instant::now();
                 }
                 if slider_response.changed() {
@@ -501,20 +508,22 @@ impl AppUi {
                     self.current_video_frame = None;
                 }
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-                    let subtitle_btn = egui::Button::new("subtitle")
-                        .min_size(Vec2::new(50.0, 50.0))
-                        .frame(false);
+                    let rich_text = egui::RichText::new("subtitle")
+                        .color(Color32::ORANGE)
+                        .size(10.0);
+                    let subtitle_btn = egui::Button::new(rich_text).frame(false);
                     let btn_response = ui.add(subtitle_btn);
                     if btn_response.hovered() {
-                        self.control_ui_flag = true;
+                        self.ui_flags.control_ui_flag = true;
                         self.last_show_control_ui_instant = now.clone();
                     }
                     if btn_response.clicked() {
-                        self.show_subtitle_options = !self.show_subtitle_options;
+                        self.ui_flags.show_subtitle_options_flag =
+                            !self.ui_flags.show_subtitle_options_flag;
                     }
-                    if self.show_subtitle_options {
+                    if self.ui_flags.show_subtitle_options_flag {
                         let cn_checkbox =
-                            egui::Checkbox::new(&mut self.chinese_subtitle_flag, "中文");
+                            egui::Checkbox::new(&mut self.ui_flags.chinese_subtitle_flag, "中文");
                         ui.add(cn_checkbox);
                     }
                 });
@@ -523,8 +532,46 @@ impl AppUi {
                         egui::Button::new(VOLUMN_IMG.atom_size(Vec2::new(50.0, 50.0))).frame(false);
                     let btn_response = ui.add(volumn_img_btn);
                     if btn_response.hovered() {
-                        self.control_ui_flag = true;
+                        self.ui_flags.control_ui_flag = true;
                         self.last_show_control_ui_instant = now.clone();
+                    }
+                    if btn_response.clicked() {
+                        self.ui_flags.show_volumn_slider_flag =
+                            !self.ui_flags.show_volumn_slider_flag;
+                    }
+                    if self.ui_flags.show_volumn_slider_flag {
+                        ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+                            ui.add_space(150.0);
+                            let audio_player = &mut self.audio_player;
+                            let volumn_slider =
+                                egui::Slider::new(&mut audio_player.current_volumn, 0.0..=2.0)
+                                    .vertical()
+                                    .show_value(false);
+                            let mut slider_style = egui::style::Style::default();
+                            slider_style.spacing.slider_width = 150.0;
+                            slider_style.spacing.slider_rail_height = 10.0;
+                            slider_style.spacing.interact_size = Vec2::new(20.0, 20.0);
+                            slider_style.visuals.extreme_bg_color =
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                            slider_style.visuals.selection.bg_fill =
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 100);
+                            slider_style.visuals.widgets.active.bg_fill =
+                                Color32::from_rgba_unmultiplied(0, 0, 100, 100);
+                            slider_style.visuals.widgets.inactive.bg_fill =
+                                Color32::from_rgba_unmultiplied(255, 165, 0, 100);
+                            ui.set_style(slider_style);
+                            let mut slider_response = ui.add(volumn_slider);
+                            slider_response = slider_response
+                                .on_hover_text((audio_player.current_volumn * 100.0).to_string());
+                            if slider_response.hovered() {
+                                self.ui_flags.control_ui_flag = true;
+                                self.last_show_control_ui_instant = *now;
+                            }
+                            if slider_response.changed() {
+                                warn!("volumn slider dragged!");
+                                audio_player.change_volumn();
+                            }
+                        });
                     }
                 });
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
@@ -533,20 +580,20 @@ impl AppUi {
                             .frame(false);
                     let btn_response = ui.add(fullscreen_image_btn);
                     if btn_response.hovered() {
-                        self.control_ui_flag = true;
+                        self.ui_flags.control_ui_flag = true;
                         self.last_show_control_ui_instant = now.clone();
                     }
                     if btn_response.clicked() {
-                        self.fullscreen_flag = !self.fullscreen_flag;
+                        self.ui_flags.fullscreen_flag = !self.ui_flags.fullscreen_flag;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                            self.fullscreen_flag,
+                            self.ui_flags.fullscreen_flag,
                         ));
                     }
                 });
             }
         });
     }
-    fn paint_volumn_slider(&mut self, ui: &mut Ui, ctx: &Context, now: Instant) {
+    fn paint_subtitle(&mut self, ui: &mut Ui, ctx: &Context) {
         ui.horizontal(|ui| {
             let tiny_decoder = &self.tiny_decoder;
             if self
@@ -557,45 +604,25 @@ impl AppUi {
                     let be_opacity = ui.opacity();
                     ui.set_opacity(1.0);
                     let subtitle = self.async_ctx.exec_normal_task(self.subtitle.read());
-                    let sub_text = RichText::new(subtitle.generated_str())
-                        .size(30.0)
-                        .color(Color32::BLUE)
-                        .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0));
+
+                    let sub_text = {
+                        let generated_str = subtitle.generated_str();
+                        let len_in_chars = generated_str.chars().count();
+                        let ui_str = {
+                            if len_in_chars > 20 {
+                                generated_str.char_range(len_in_chars - 20..len_in_chars)
+                            } else {
+                                generated_str.char_range(0..len_in_chars)
+                            }
+                        };
+                        RichText::new(ui_str)
+                            .size(30.0)
+                            .color(Color32::ORANGE)
+                            .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0))
+                    };
                     let subtitle_text_button = egui::Button::new(sub_text).frame(false);
                     ui.add(subtitle_text_button);
                     ui.set_opacity(be_opacity);
-                });
-                ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.add_space(150.0);
-                    let audio_player = &mut self.audio_player;
-                    let volumn_slider =
-                        egui::Slider::new(&mut audio_player.current_volumn, 0.0..=2.0)
-                            .vertical()
-                            .show_value(false);
-                    let mut slider_style = egui::style::Style::default();
-                    slider_style.spacing.slider_width = 150.0;
-                    slider_style.spacing.slider_rail_height = 10.0;
-                    slider_style.spacing.interact_size = Vec2::new(20.0, 20.0);
-                    slider_style.visuals.extreme_bg_color =
-                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                    slider_style.visuals.selection.bg_fill =
-                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                    slider_style.visuals.widgets.active.bg_fill =
-                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                    slider_style.visuals.widgets.inactive.bg_fill =
-                        Color32::from_rgba_unmultiplied(0, 0, 0, 100);
-                    ui.set_style(slider_style);
-                    let mut slider_response = ui.add(volumn_slider);
-                    slider_response = slider_response
-                        .on_hover_text((audio_player.current_volumn * 100.0).to_string());
-                    if slider_response.hovered() {
-                        self.control_ui_flag = true;
-                        self.last_show_control_ui_instant = now;
-                    }
-                    if slider_response.changed() {
-                        warn!("volumn slider dragged!");
-                        audio_player.change_volumn();
-                    }
                 });
             }
         });
@@ -650,21 +677,21 @@ impl AppUi {
             .async_ctx
             .exec_normal_task(self.main_stream_current_timestamp.read());
         let main_stream_time_base = {
-            if let MainStream::Audio = tiny_decoder.get_main_stream() {
-                tiny_decoder.get_audio_time_base()
+            if let MainStream::Audio = tiny_decoder.main_stream() {
+                tiny_decoder.audio_time_base()
             } else {
-                tiny_decoder.get_video_time_base()
+                tiny_decoder.video_time_base()
             }
         };
         if pts
             + 1 * main_stream_time_base.denominator() as i64
                 / main_stream_time_base.numerator() as i64
                 / 2
-            >= tiny_decoder.get_end_ts()
-        // tiny_decoder.get_end_audio_ts() * audio_time_base.numerator() as i64
+            >= tiny_decoder.end_ts()
+        // tiny_decoder.end_audio_ts() * audio_time_base.numerator() as i64
         //     / audio_time_base.denominator() as i64
         {
-            let end = tiny_decoder.get_end_ts();
+            let end = tiny_decoder.end_ts();
             warn!("play end! end_ts:{end},current_ts:{pts} ");
             return true;
         }
@@ -686,7 +713,7 @@ impl AppUi {
     /// if video time-audio time is too high(more than 1 second),default return true
     fn check_video_wait_for_audio(&mut self) -> bool {
         let tiny_decoder = &self.tiny_decoder;
-        if let MainStream::Video = tiny_decoder.get_main_stream() {
+        if let MainStream::Video = tiny_decoder.main_stream() {
             return true;
         }
         if let Some(frame) = &self.current_video_frame {
@@ -694,8 +721,8 @@ impl AppUi {
                 .async_ctx
                 .exec_normal_task(async { *self.main_stream_current_timestamp.read().await });
             {
-                let video_time_base = tiny_decoder.get_video_time_base();
-                let audio_time_base = tiny_decoder.get_audio_time_base();
+                let video_time_base = tiny_decoder.video_time_base();
+                let audio_time_base = tiny_decoder.audio_time_base();
                 if let Some(f_ts) = frame.pts() {
                     let v_time = f_ts * 1000 * video_time_base.numerator() as i64
                         / video_time_base.denominator() as i64;
@@ -713,8 +740,8 @@ impl AppUi {
         true
     }
 
-    fn paint_network_window(&mut self, ctx: &Context, now: &Instant) {
-        if self.network_window_flag {
+    fn paint_playlist_window(&mut self, ctx: &Context, now: &Instant) {
+        if self.ui_flags.playlist_window_flag {
             let viewport_id = ViewportId::from_hash_of("content_window");
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd_to(
@@ -727,146 +754,31 @@ impl AppUi {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            let online_btn = {
-                                if self.async_ctx.get_online_flag() {
-                                    egui::Button::new("status:online")
-                                } else {
-                                    egui::Button::new("status:offline")
-                                        .shortcut_text("click to try online")
-                                }
-                            };
-                            let singleline = egui::TextEdit::singleline(&mut self.username_buf)
-                                .hint_text("type in your temporary usename");
-                            ui.add(singleline);
-                            if ui.add(online_btn).clicked() {
-                                self.async_ctx.login_server(
-                                    self.username_buf.clone(),
-                                    self.tiny_decoder.get_format_duration(),
-                                );
-                            }
-                            if self.async_ctx.get_online_flag() {
-                                let msg_scroll_area =
-                                    egui::ScrollArea::new(Vec2b::new(false, true))
-                                        .max_height(200.0);
-                                ui.set_min_height(300.0);
-                                msg_scroll_area.id_salt("msg_scroll_area").show(ui, |ui| {
-                                    for item in self.async_ctx.get_chat_msg_vec() {
-                                        if let Ok(msg) = String::from_utf8(item.get_msg().clone()) {
-                                            let rich_text = egui::RichText::new(format!(
-                                                "{}    :{}",
-                                                item.get_name(),
-                                                msg
-                                            ))
-                                            .size(20.0);
-
-                                            ui.add(egui::Label::new(rich_text));
-                                        }
-                                    }
-                                });
-                                let input_scroll_area =
-                                    egui::ScrollArea::new(Vec2b::new(false, true))
-                                        .max_height(200.0);
-                                ui.set_min_height(300.0);
-                                input_scroll_area
-                                    .id_salt("input_scroll_area")
-                                    .show(ui, |ui| {
-                                        ui.text_edit_multiline(&mut self.content_str);
-                                    });
-                                if ui.button("send message").clicked()
-                                    || ctx.input(|s| s.key_released(egui::Key::Enter))
-                                {
-                                    let detail = self.async_ctx.get_user_detail();
-                                    let mes = SocketMessage::new(
-                                        detail.id.clone(),
-                                        detail.username.clone(),
-                                        "server".to_string(),
-                                        "chat".to_string(),
-                                        "chat msg".to_string(),
-                                        self.content_str.to_string().as_bytes().to_vec(),
-                                    );
-                                    self.async_ctx.ws_send_chat_msg(mes);
-                                    self.content_str.clear();
-                                }
-                                if ui.button("send req").clicked() {
-                                    if let Ok(url) = Url::from_str("http://bing.com") {
-                                        if let Ok(r) =
-                                            self.async_ctx.req_external_url(Method::GET, url)
+                            let video_urls_scroll = egui::ScrollArea::vertical().max_height(200.0);
+                            ui.set_min_height(300.0);
+                            video_urls_scroll.show(ui, |ui| {
+                                let video_des_arc = self.video_des.clone();
+                                let videos = self.async_ctx.exec_normal_task(video_des_arc.read());
+                                for i in &*videos {
+                                    if ui.button(&i.name).clicked() {
+                                        if self
+                                            .change_format_input(&PathBuf::from(&i.path), now)
+                                            .is_ok()
                                         {
-                                            self.content_str.clear();
-                                            self.content_str.push_str(r.as_str());
+                                            warn!("change_format_input success");
                                         }
                                     }
                                 }
-                            }
-                        });
-                        ui.vertical(|ui| {
-                            if self.async_ctx.get_online_flag() {
-                                let video_links_scroll =
-                                    egui::ScrollArea::vertical().max_height(200.0);
-                                ui.set_min_height(300.0);
-                                video_links_scroll.show(ui, |ui| {
-                                    let videos = self.async_ctx.get_online_videos().clone();
-                                    for i in videos {
-                                        if ui.button(&i.name).clicked() {
-                                            self.async_ctx.watch_shared_video(i.clone());
-                                            if self
-                                                .change_format_input(
-                                                    Path::new("tcp://127.0.0.1:18858"),
-                                                    now,
-                                                )
-                                                .is_ok()
-                                            {
-                                                warn!("change_format_input success");
-                                            }
-                                        }
-                                    }
-                                });
-                                if let Some(dialog) = &mut self.share_folder_dialog {
-                                    dialog.show(ctx);
-                                    if ui.button("share video").clicked() {
-                                        dialog.open();
-                                    }
-                                    if dialog.selected() {
-                                        if let Some(path) = dialog.path() {
-                                            if let Ok(ite) = path.read_dir() {
-                                                let mut share_targets = vec![];
-                                                for entry in ite {
-                                                    if let Ok(en) = entry {
-                                                        if let Ok(t) = en.file_type() {
-                                                            if t.is_file() {
-                                                                if let Some(file_name) =
-                                                                    en.file_name().to_str()
-                                                                {
-                                                                    if file_name.ends_with(".ts")
-                                                                        || file_name
-                                                                            .ends_with(".mp4")
-                                                                        || file_name
-                                                                            .ends_with(".mkv")
-                                                                    {
-                                                                        if let Some(p_str) = path
-                                                                            .join(&file_name)
-                                                                            .to_str()
-                                                                        {
-                                                                            share_targets
-                                                                            .push(VideoDes {
-                                                                            name: file_name
-                                                                                .to_string(),
-                                                                            path: p_str.to_string(),
-                                                                            user_id: self
-                                                                                .async_ctx
-                                                                                .get_user_detail()
-                                                                                .id,
-                                                                        });
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                self.async_ctx.share_video(share_targets);
-                                            }
-                                        }
+                            });
+                            if let Some(dialog) = &mut self.scan_folder_dialog {
+                                dialog.show(ctx);
+                                if ui.button("scan video folder").clicked() {
+                                    dialog.open();
+                                }
+                                if dialog.selected() {
+                                    if let Some(path) = dialog.path() {
+                                        self.async_ctx
+                                            .read_video_folder(path, self.video_des.clone());
                                     }
                                 }
                             }
@@ -893,7 +805,7 @@ impl AppUi {
     fn reset_main_tex_to_cover_pic(&mut self) {
         if let Some(v_tex) = &mut self.video_texture_handle {
             let tiny_decoder = &self.tiny_decoder;
-            let pic_data = tiny_decoder.get_cover_pic_data();
+            let pic_data = tiny_decoder.cover_pic_data();
             let cover_data = self.async_ctx.exec_normal_task(pic_data.read());
             if let Some(data_vec) = &*cover_data {
                 if let Ok(img) = image::load_from_memory(&data_vec) {
@@ -921,7 +833,7 @@ impl AppUi {
                 }
             };
 
-            self.pause_flag = true;
+            self.ui_flags.pause_flag = true;
             self.async_ctx.exec_normal_task(async {
                 if tiny_decoder.set_file_path_and_init_par(path).await.is_ok() {
                     warn!("reset file path success!");
@@ -956,7 +868,7 @@ impl AppUi {
             .is_some()
         {
             let video_exist = {
-                let v_stream_idx = self.tiny_decoder.get_video_stream_idx();
+                let v_stream_idx = self.tiny_decoder.video_stream_idx();
                 let video_stream_idx = self.async_ctx.exec_normal_task(v_stream_idx.read());
                 if *video_stream_idx == usize::MAX {
                     false
@@ -979,11 +891,9 @@ impl AppUi {
                             if let Some(pts) = v_frame.pts() {
                                 if let Some(current_video_frame) = &self.current_video_frame {
                                     if let Some(cur_pts) = current_video_frame.pts() {
-                                        if let MainStream::Audio = tiny_decoder.get_main_stream() {
-                                            let audio_time_base =
-                                                tiny_decoder.get_audio_time_base();
-                                            let video_time_base =
-                                                tiny_decoder.get_video_time_base();
+                                        if let MainStream::Audio = tiny_decoder.main_stream() {
+                                            let audio_time_base = tiny_decoder.audio_time_base();
+                                            let video_time_base = tiny_decoder.video_time_base();
                                             let a_time = cur_mainstream_ts
                                                 * 1000
                                                 * audio_time_base.numerator() as i64
@@ -996,8 +906,7 @@ impl AppUi {
                                             }
                                         }
                                         if self.frame_show_instant != now {
-                                            let video_time_base =
-                                                tiny_decoder.get_video_time_base();
+                                            let video_time_base = tiny_decoder.video_time_base();
                                             let ts_res = (pts - cur_pts)
                                                 * 1000
                                                 * video_time_base.numerator() as i64
@@ -1039,7 +948,7 @@ impl AppUi {
                             self.current_video_frame = Some(v_frame);
                         }
 
-                        if let MainStream::Video = tiny_decoder.get_main_stream() {
+                        if let MainStream::Video = tiny_decoder.main_stream() {
                             if let Some(f) = self.current_video_frame.as_ref() {
                                 if let Some(pts) = f.pts() {
                                     self.set_current_play_pts(pts);
@@ -1053,7 +962,7 @@ impl AppUi {
             }
         }
         if self.check_play_is_at_endtail() {
-            self.pause_flag = true;
+            self.ui_flags.pause_flag = true;
         }
     }
     fn detect_file_drag(&mut self, ctx: &Context, now: &Instant) {
@@ -1066,16 +975,16 @@ impl AppUi {
                     } else {
                         self.err_window_msg =
                             "please choose a valid video or audio file !!!".to_string();
-                        self.err_window_flag = true;
+                        self.ui_flags.err_window_flag = true;
                     }
                 }
             }
         });
     }
-    fn paint_network_button(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
+    fn paint_playlist_button(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let mut orange_color = Color32::ORANGE.to_srgba_unmultiplied();
         orange_color[3] = 100;
-        let btn_text = RichText::new("network")
+        let btn_text = RichText::new("playlist")
             .color(Color32::from_rgba_unmultiplied(
                 orange_color[0],
                 orange_color[1],
@@ -1086,14 +995,14 @@ impl AppUi {
         let open_btn = egui::Button::new(btn_text).frame(false);
         let btn_response = ui.add(open_btn);
         if btn_response.hovered() {
-            self.control_ui_flag = true;
+            self.ui_flags.control_ui_flag = true;
             self.last_show_control_ui_instant = now.clone();
         }
         if btn_response.clicked() {
-            self.network_window_flag = !self.network_window_flag;
+            self.ui_flags.playlist_window_flag = !self.ui_flags.playlist_window_flag;
         }
-        if self.network_window_flag {
-            self.paint_network_window(ctx, now);
+        if self.ui_flags.playlist_window_flag {
+            self.paint_playlist_window(ctx, now);
         }
     }
 }

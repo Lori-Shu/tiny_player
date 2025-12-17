@@ -1,5 +1,61 @@
 #[cfg(test)]
 mod test {
+    use std::{
+        task::Poll,
+        time::{Duration, Instant},
+    };
+
+    use tokio::time::sleep;
+
+    struct PrintFuture {
+        end_time: Option<Instant>,
+    }
+    impl PrintFuture {
+        fn new() -> Self {
+            Self {
+                end_time: Instant::now().checked_add(Duration::from_secs(5)),
+            }
+        }
+    }
+    impl Future for PrintFuture {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if let Some(end_time) = &self.end_time {
+                let now = Instant::now().duration_since(*end_time);
+                if now.is_zero() {
+                    println!("future poll---wait");
+                    let waker = cx.waker().clone();
+                    tokio::spawn(async move {
+                        sleep(Duration::from_secs(1)).await;
+                        waker.wake_by_ref();
+                    });
+
+                    return Poll::Pending;
+                } else {
+                    println!("future finished success!!!");
+                    return Poll::Ready(());
+                }
+            } else {
+                println!("no end time , print this msg");
+                return Poll::Ready(());
+            }
+        }
+    }
+    #[test]
+    fn test_future() {
+        if let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(async {
+                PrintFuture::new().await;
+            });
+        }
+    }
     fn compute_medium(arr: &[i32], i: &usize, j: &usize, k: &usize) -> usize {
         let a = arr[*i];
         let b = arr[*j];
@@ -195,8 +251,9 @@ mod test {
         // 3, 34, 4, 12, 5, 2 sum 9
         // 1, 2, 3 sum 6
         // 5 ,10 ,12 ,13 ,15 ,18  sum 30
-        let arr = vec![5, 10, 12, 13, 15, 18];
-        let sum = 30;
+        // 4,8,5 sum 9
+        let arr = vec![4, 8, 5];
+        let sum = 9;
         let mut ans_arr = vec![];
         println!(
             "result:{},chose indices{:?}",
@@ -247,23 +304,22 @@ mod test {
                     condition_arr[index as usize] = 0;
                 }
                 index -= 1;
-                continue;
-            }
-            if pre_value > *sum {
-                condition_arr[index as usize] = 2;
-                continue;
-            }
-            if condition_arr[index as usize] == 1 {
+            } else if condition_arr[index as usize] == 1 {
                 condition_arr[index as usize] = 2;
                 ans_arr.remove(ans_arr.len() - 1);
                 pre_value = pre_value - arr[index as usize];
                 index += 1;
-                continue;
+            } else {
+                // 第一次到达下标 尝试添加
+                if pre_value > *sum {
+                    condition_arr[index as usize] = 2;
+                    continue;
+                }
+                ans_arr.push(index);
+                pre_value = pre_value + arr[index as usize];
+                condition_arr[index as usize] = 1;
+                index += 1;
             }
-            ans_arr.push(index);
-            pre_value = pre_value + arr[index as usize];
-            condition_arr[index as usize] = 1;
-            index += 1;
         }
         false
     }
