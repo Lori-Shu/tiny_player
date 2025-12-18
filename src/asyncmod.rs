@@ -50,6 +50,9 @@ impl AsyncContext {
                                 if file_name.ends_with(".ts")
                                     || file_name.ends_with(".mp4")
                                     || file_name.ends_with(".mkv")
+                                    || file_name.ends_with(".flac")
+                                    || file_name.ends_with(".mp3")
+                                    || file_name.ends_with(".m4a")
                                 {
                                     if let Some(p_str) = path.join(&file_name).to_str() {
                                         video_targets.push(VideoDes {

@@ -385,9 +385,7 @@ impl TinyDecoder {
                                 warn!("demux process hit the end");
                             }
                         }
-                        None => {
-                            warn!("input is end eof");
-                        }
+                        None => {}
                     }
                 }
             }

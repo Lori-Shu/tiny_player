@@ -6,8 +6,8 @@ use std::{
 
 use egui::{
     AtomExt, Color32, ColorImage, Context, ImageData, ImageSource, Layout, Pos2, Rect, RichText,
-    TextBuffer, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId, WidgetText,
-    include_image,
+    TextBuffer, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId, Widget,
+    WidgetText, include_image,
 };
 
 use image::DynamicImage;
@@ -30,6 +30,31 @@ const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.
 const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png");
 pub const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
 const EMOJI_FONT: &[u8] = include_bytes!("../resources/fonts/seguiemj.ttf");
+struct PlayerTextButton {
+    text: String,
+    font_size: f32,
+}
+impl PlayerTextButton {
+    pub fn new(text: String, font_size: f32) -> Self {
+        Self { text, font_size }
+    }
+}
+impl Widget for PlayerTextButton {
+    fn ui(self, ui: &mut Ui) -> egui::Response {
+        let mut orange_color = Color32::ORANGE.to_srgba_unmultiplied();
+        orange_color[3] = 100;
+        let btn_text = RichText::new(&self.text)
+            .color(Color32::from_rgba_unmultiplied(
+                orange_color[0],
+                orange_color[1],
+                orange_color[2],
+                orange_color[3],
+            ))
+            .size(self.font_size);
+        let open_btn = egui::Button::new(btn_text).frame(false);
+        ui.add(open_btn)
+    }
+}
 /// the main struct stores all the vars which are related to ui
 struct UiFlags {
     pause_flag: bool,
@@ -752,15 +777,18 @@ impl AppUi {
             let viewport_builder = ViewportBuilder::default().with_close_button(false);
             ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            let video_urls_scroll = egui::ScrollArea::vertical().max_height(200.0);
-                            ui.set_min_height(300.0);
-                            video_urls_scroll.show(ui, |ui| {
-                                let video_des_arc = self.video_des.clone();
-                                let videos = self.async_ctx.exec_normal_task(video_des_arc.read());
-                                for i in &*videos {
-                                    if ui.button(&i.name).clicked() {
+                    ui.vertical(|ui| {
+                        let video_urls_scroll = egui::ScrollArea::vertical().max_height(200.0);
+                        ui.set_min_height(300.0);
+
+                        video_urls_scroll.show(ui, |ui| {
+                            let video_des_arc = self.video_des.clone();
+                            let videos = self.async_ctx.exec_normal_task(video_des_arc.read());
+                            for i in &*videos {
+                                ui.vertical_centered_justified(|ui| {
+                                    let player_text_button =
+                                        PlayerTextButton::new(i.name.clone(), 20.0);
+                                    if ui.add(player_text_button).clicked() {
                                         if self
                                             .change_format_input(&PathBuf::from(&i.path), now)
                                             .is_ok()
@@ -768,21 +796,27 @@ impl AppUi {
                                             warn!("change_format_input success");
                                         }
                                     }
-                                }
-                            });
-                            if let Some(dialog) = &mut self.scan_folder_dialog {
-                                dialog.show(ctx);
-                                if ui.button("scan video folder").clicked() {
-                                    dialog.open();
-                                }
-                                if dialog.selected() {
-                                    if let Some(path) = dialog.path() {
-                                        self.async_ctx
-                                            .read_video_folder(path, self.video_des.clone());
-                                    }
-                                }
+                                });
                             }
                         });
+                        if let Some(dialog) = &mut self.scan_folder_dialog {
+                            dialog.show(ctx);
+                            if ui.button("scan video folder").clicked() {
+                                dialog.open();
+                            }
+                            if dialog.selected() {
+                                {
+                                    let video_des_arc = self.video_des.clone();
+                                    let mut videos =
+                                        self.async_ctx.exec_normal_task(video_des_arc.write());
+                                    videos.clear();
+                                }
+                                if let Some(path) = dialog.path() {
+                                    self.async_ctx
+                                        .read_video_folder(path, self.video_des.clone());
+                                }
+                            }
+                        }
                     });
                 });
             });
@@ -809,10 +843,11 @@ impl AppUi {
             let cover_data = self.async_ctx.exec_normal_task(pic_data.read());
             if let Some(data_vec) = &*cover_data {
                 if let Ok(img) = image::load_from_memory(&data_vec) {
+                    let rgba8_img = img.to_rgba8();
                     v_tex.set(
                         ImageData::Color(Arc::new(ColorImage::from_rgba_unmultiplied(
-                            [img.width() as usize, img.height() as usize],
-                            img.as_bytes(),
+                            [rgba8_img.width() as usize, rgba8_img.height() as usize],
+                            &rgba8_img.to_vec(),
                         ))),
                         TextureOptions::LINEAR,
                     );
