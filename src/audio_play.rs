@@ -21,6 +21,8 @@ impl AudioPlayer {
     }
     pub fn play_raw_data_from_audio_frame(&self, audio_frame: ffmpeg_the_third::frame::Audio) {
         let audio_data: &[f32] = bytemuck::cast_slice(audio_frame.data(0));
+        let audio_data =
+            &audio_data[0..audio_frame.samples() * audio_frame.ch_layout().channels() as usize];
         let source = rodio::buffer::SamplesBuffer::new(
             audio_frame.ch_layout().channels() as u16,
             audio_frame.rate(),
