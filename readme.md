@@ -28,3 +28,5 @@ core feature based on project
 1. if you use a laptop and player runs at a very low frame 
 rate, turn off "BatteryBoost" in nvidia driver which is to save 
 energy.
+# Screenshot
+![app screenshot](./project_show_img.png)
