@@ -1,13 +1,15 @@
+use std::collections::VecDeque;
+
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
     stream: Option<rodio::OutputStream>,
-    pub current_volumn: f32,
-    pts_vec: Vec<i64>,
+    current_volumn: f32,
+    pts_vec: VecDeque<i64>,
 }
 impl AudioPlayer {
     pub fn new() -> Self {
         let mut sel = Self {
-            pts_vec: vec![],
+            pts_vec: VecDeque::new(),
             current_volumn: 1.0,
             stream: None,
             sink: None,
@@ -55,11 +57,11 @@ impl AudioPlayer {
             sink.play();
         }
     }
-    pub fn set_pts(&mut self, pts: i64) {
+    pub fn push_pts(&mut self, pts: i64) {
         if self.pts_vec.len() > 30 {
-            self.pts_vec.remove(0);
+            self.pts_vec.pop_front();
         }
-        self.pts_vec.push(pts);
+        self.pts_vec.push_back(pts);
     }
     pub fn last_source_pts(&self) -> Result<i64, String> {
         if !self.pts_vec.is_empty() {
@@ -74,5 +76,11 @@ impl AudioPlayer {
         } else {
             0
         }
+    }
+    pub fn current_volumn(&self) -> &f32 {
+        &self.current_volumn
+    }
+    pub fn current_volumn_mut(&mut self) -> &mut f32 {
+        &mut self.current_volumn
     }
 }

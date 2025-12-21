@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use ffmpeg_the_third::{ChannelLayout, format::Sample, frame::Audio};
 use tokio::sync::RwLock;
@@ -7,16 +7,15 @@ use vosk::{DecodingState, Model, Recognizer};
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, decode::ManualProtectedResampler};
 
 pub struct AISubTitle {
-    _recognize_model: Model,
+    _chinese_recognize_model: Model,
     recognizer: Recognizer,
-    source_buffer: Vec<i16>,
+    source_buffer: VecDeque<i16>,
     generated_str: String,
     subtitle_source_resampler: Arc<RwLock<ManualProtectedResampler>>,
 }
 impl AISubTitle {
     pub fn new() -> PlayerResult<Self> {
-        let exe_path = CURRENT_EXE_PATH;
-        let current_exe_path = exe_path.as_ref().map_err(|e| e.clone())?;
+        let current_exe_path = CURRENT_EXE_PATH.as_ref().map_err(|e| e.clone())?;
         if let Some(folder_path) = current_exe_path.parent() {
             let model_path = folder_path.join("model/vosk-model-small-cn-0.22");
             if let Some(model_path_str) = model_path.to_str() {
@@ -38,9 +37,9 @@ impl AISubTitle {
                             ),
                         ) {
                             return Ok(Self {
-                                _recognize_model: recognize_model,
+                                _chinese_recognize_model: recognize_model,
                                 recognizer: rez,
-                                source_buffer: vec![],
+                                source_buffer: VecDeque::new(),
                                 generated_str: String::new(),
                                 subtitle_source_resampler: Arc::new(RwLock::new(
                                     ManualProtectedResampler(resampler),
@@ -78,9 +77,8 @@ impl AISubTitle {
         };
         sub_title.source_buffer.extend(data);
         if sub_title.source_buffer.len() > 3200 {
-            let buf = (&sub_title.source_buffer[0..3200]).to_vec();
+            let buf = sub_title.source_buffer.drain(0..3200).collect::<Vec<i16>>();
             if let Ok(state) = sub_title.recognizer.accept_waveform(&buf) {
-                sub_title.source_buffer.drain(0..3200);
                 let partial_result = sub_title.recognizer.partial_result();
                 if !partial_result.partial.is_empty() {
                     let no_space_result = partial_result.partial.replace(" ", "");

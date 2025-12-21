@@ -254,38 +254,39 @@ mod test {
         // 4,8,5 sum 9
         let arr = vec![4, 8, 5];
         let sum = 9;
-        let mut ans_arr = vec![];
-        println!(
-            "result:{},chose indices{:?}",
-            is_sub_set_sum_recursion(&arr, &mut ans_arr, &sum, 0, 0),
-            ans_arr
-        );
+        // let mut ans_arr = vec![];
+        // println!(
+        //     "result:{},chose indices{:?}",
+        //     is_sub_set_sum_recursion(&arr, &mut ans_arr, &sum, 0, 0),
+        //     ans_arr
+        // );
         println!("result:{}", is_sub_set_sum(&arr, &sum));
     }
-    fn is_sub_set_sum_recursion(
-        arr: &[i32],
-        ans_arr: &mut Vec<usize>,
-        sum: &i32,
-        temp_sum: i32,
-        index: usize,
-    ) -> bool {
-        if temp_sum > *sum {
-            return false;
-        }
-        if temp_sum == *sum {
-            return true;
-        }
-        if index >= arr.len() {
-            return false;
-        }
-        ans_arr.push(index);
-        let a0 = is_sub_set_sum_recursion(arr, ans_arr, sum, temp_sum + arr[index], index + 1);
-        if !a0 {
-            ans_arr.remove(ans_arr.len() - 1);
-            return is_sub_set_sum_recursion(arr, ans_arr, sum, temp_sum, index + 1);
-        }
-        a0
-    }
+    // fn is_sub_set_sum_recursion(
+    //     arr: &[i32],
+    //     ans_arr: &mut Vec<usize>,
+    //     sum: &i32,
+    //     temp_sum: i32,
+    //     index: usize,
+    // ) -> bool {
+    //     if temp_sum > *sum {
+    //         return false;
+    //     }
+    //     if temp_sum == *sum {
+    //         return true;
+    //     }
+    //     if index >= arr.len() {
+    //         return false;
+    //     }
+    //     ans_arr.push(index);
+    //     let result_chose = is_sub_set_sum_recursion(arr, ans_arr, sum, temp_sum + arr[index], index + 1);
+    //     if !result_chose {
+    //         ans_arr.remove(ans_arr.len() - 1);
+    //         let result_skip=is_sub_set_sum_recursion(arr, ans_arr, sum, temp_sum, index + 1);
+    //         return result_skip;
+    //     }
+    //     result_chose
+    // }
     fn is_sub_set_sum(arr: &[i32], sum: &i32) -> bool {
         let mut condition_arr = vec![0_u8; arr.len()];
         let mut index = 0_i32;

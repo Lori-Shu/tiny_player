@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     ffi::CString,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::Arc,
     time::Duration,
@@ -28,7 +28,7 @@ use log::warn;
 use time::format_description;
 use tokio::{io::AsyncWriteExt, runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
 
-use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, appui::VideoPathSource};
+use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult};
 /// in order to make Input impl Sync, create a new Type ,
 /// this type can be manually sync by Rwlock
 pub struct ManualProtectedInput(ffmpeg_the_third::format::context::Input);
@@ -154,30 +154,18 @@ impl TinyDecoder {
     }
     /// called when user selected a file path to play
     /// init all the details from the file selected
-    pub async fn set_file_path_and_init_par(
-        &mut self,
-        path: VideoPathSource,
-    ) -> Result<(), String> {
+    pub async fn set_file_path_and_init_par(&mut self, path: &Path) -> Result<(), String> {
         warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
         if self.demux_task_handle.is_some() {
             self.stop_demux_and_decode().await;
             self.reset_tiny_decoder_states().await;
         }
-        let format_input = if let VideoPathSource::TcpStream(s) = &path {
-            if let Ok(input) = ffmpeg_the_third::format::input(s) {
+        let format_input = {
+            if let Ok(input) = ffmpeg_the_third::format::input(path) {
                 Ok(input)
             } else {
                 Err(PlayerError::Internal("input construct err!".to_string()))
             }
-        } else if let VideoPathSource::File(s) = &path {
-            // let test_path = "http://127.0.0.1:23552/videos/泪桥/泪桥.m3u8";
-            if let Ok(input) = ffmpeg_the_third::format::input(s) {
-                Ok(input)
-            } else {
-                Err(PlayerError::Internal("input construct err!".to_string()))
-            }
-        } else {
-            Err(PlayerError::Internal("no input!".to_string()))
         };
         warn!("input construct finished");
         let mut cover_stream = None;
@@ -235,24 +223,22 @@ impl TinyDecoder {
 
             // format_input.duration() 能较准确得到视频文件的总时常，mkv等格式可能存在
             // stream不存储时长,format_input.duration()更可靠
-            // format_input.duration() 单位是微妙
-            if let VideoPathSource::File(_s) = &path {
-                warn!("total duration {} us", format_input.duration());
-                *self.format_duration.write().await = format_input.duration();
-                let adur_ts = {
-                    if let MainStream::Audio = self.main_stream {
-                        format_input.duration() * self.audio_time_base.denominator() as i64
-                            / self.audio_time_base.numerator() as i64
-                            / 1000_000
-                    } else {
-                        format_input.duration() * self.video_time_base.denominator() as i64
-                            / self.video_time_base.numerator() as i64
-                            / 1000_000
-                    }
-                };
-                self.end_timestamp = adur_ts;
-                self.compute_and_set_end_time_str(adur_ts);
-            }
+            // format_input.duration() 单位是us
+            warn!("total duration {} us", format_input.duration());
+            *self.format_duration.write().await = format_input.duration();
+            let adur_ts = {
+                if let MainStream::Audio = self.main_stream {
+                    format_input.duration() * self.audio_time_base.denominator() as i64
+                        / self.audio_time_base.numerator() as i64
+                        / 1000_000
+                } else {
+                    format_input.duration() * self.video_time_base.denominator() as i64
+                        / self.video_time_base.numerator() as i64
+                        / 1000_000
+                }
+            };
+            self.end_timestamp = adur_ts;
+            self.compute_and_set_end_time_str(adur_ts);
 
             if let Some(video_stream) = &video_stream {
                 if let Ok(video_decoder) =
@@ -474,8 +460,7 @@ impl TinyDecoder {
     ) {
         let mut p = PathBuf::new();
         if video_packet_cache_queue.read().await.is_some() {
-            let exe_path = CURRENT_EXE_PATH;
-            if let Ok(exe_path) = exe_path.as_ref() {
+            if let Ok(exe_path) = CURRENT_EXE_PATH.as_ref() {
                 if let Some(exe_folder) = exe_path.parent() {
                     p = exe_folder.join("app_font.ttf");
                     if tokio::fs::File::open(&p).await.is_err() {
@@ -704,7 +689,7 @@ impl TinyDecoder {
         }
     }
     /// start the demux and decode task,pass in tokio runtime
-    pub async fn start_process_input(&mut self) {
+    async fn start_process_input(&mut self) {
         let audio_stream_index = self.audio_stream_index.clone();
         let video_stream_index = self.video_stream_index.clone();
         let format_input = self.format_input.clone();
@@ -965,7 +950,7 @@ impl TinyDecoder {
     pub fn cover_pic_data(&self) -> Arc<RwLock<Option<Vec<u8>>>> {
         self.cover_pic_data.clone()
     }
-    pub async fn check_input_exist(&self) -> bool {
+    pub async fn is_input_exist(&self) -> bool {
         let input = self.format_input.write().await;
         input.is_some()
     }
@@ -989,7 +974,7 @@ impl TinyDecoder {
             }
         }
     }
-    pub async fn flush_decoders(&self) {
+    async fn flush_decoders(&self) {
         let mut a_decoder = self.audio_decoder.write().await;
         if let Some(a) = &mut *a_decoder {
             a.0.flush();

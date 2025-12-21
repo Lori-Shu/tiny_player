@@ -2,7 +2,8 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
-#![deny(unused, clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+#![deny(unused)]
+#![deny(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
     error::Error,
@@ -16,12 +17,12 @@ use log::{Level, warn};
 
 mod ai_sub_title;
 mod appui;
-mod asyncmod;
+mod async_context;
 mod audio_play;
 mod decode;
 
 const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
-const CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf>> = LazyLock::new(|| {
+static CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf>> = LazyLock::new(|| {
     if let Ok(path) = std::env::current_exe() {
         return Ok(path);
     }

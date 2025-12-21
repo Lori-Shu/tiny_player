@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use crate::{
     PlayerError, PlayerResult,
     ai_sub_title::AISubTitle,
-    asyncmod::{AsyncContext, VideoDes},
+    async_context::{AsyncContext, VideoDes},
     decode::MainStream,
 };
 
@@ -67,6 +67,7 @@ struct UiFlags {
     show_subtitle_options_flag: bool,
     show_volumn_slider_flag: bool,
 }
+
 pub struct AppUi {
     video_texture_handle: Option<TextureHandle>,
     tiny_decoder: crate::decode::TinyDecoder,
@@ -106,7 +107,7 @@ impl eframe::App for AppUi {
 
                 if self
                     .async_ctx
-                    .exec_normal_task(self.tiny_decoder.check_input_exist())
+                    .exec_normal_task(self.tiny_decoder.is_input_exist())
                 {
                     if !self.ui_flags.pause_flag {
                         /*
@@ -302,7 +303,7 @@ impl AppUi {
         let tiny_decoder = &self.tiny_decoder;
         if self
             .async_ctx
-            .exec_normal_task(tiny_decoder.check_input_exist())
+            .exec_normal_task(tiny_decoder.is_input_exist())
         {
             let play_ts = self.async_ctx.exec_normal_task(async {
                 let ts = self.main_stream_current_timestamp.read().await;
@@ -379,7 +380,7 @@ impl AppUi {
 
                 if let Some(audio_frame) = self.async_ctx.exec_normal_task(frame_fu) {
                     if let Some(pts) = audio_frame.pts() {
-                        audio_player.set_pts(pts);
+                        audio_player.push_pts(pts);
                         audio_player.play_raw_data_from_audio_frame(audio_frame.clone());
                         if self.ui_flags.subtitle_flag {
                             if self.ui_flags.chinese_subtitle_flag {
@@ -455,7 +456,7 @@ impl AppUi {
 
         if self
             .async_ctx
-            .exec_normal_task(tiny_decoder.check_input_exist())
+            .exec_normal_task(tiny_decoder.is_input_exist())
         {
             let play_or_pause_image_source;
             if self.ui_flags.pause_flag {
@@ -493,7 +494,7 @@ impl AppUi {
             let tiny_decoder = &mut self.tiny_decoder;
             if self
                 .async_ctx
-                .exec_normal_task(tiny_decoder.check_input_exist())
+                .exec_normal_task(tiny_decoder.is_input_exist())
             {
                 let mut timestamp = self
                     .async_ctx
@@ -569,7 +570,7 @@ impl AppUi {
                             ui.add_space(150.0);
                             let audio_player = &mut self.audio_player;
                             let volumn_slider =
-                                egui::Slider::new(&mut audio_player.current_volumn, 0.0..=2.0)
+                                egui::Slider::new(audio_player.current_volumn_mut(), 0.0..=2.0)
                                     .vertical()
                                     .show_value(false);
                             let mut slider_style = egui::style::Style::default();
@@ -587,7 +588,7 @@ impl AppUi {
                             ui.set_style(slider_style);
                             let mut slider_response = ui.add(volumn_slider);
                             slider_response = slider_response
-                                .on_hover_text((audio_player.current_volumn * 100.0).to_string());
+                                .on_hover_text((audio_player.current_volumn() * 100.0).to_string());
                             if slider_response.hovered() {
                                 self.ui_flags.control_ui_flag = true;
                                 self.last_show_control_ui_instant = *now;
@@ -623,7 +624,7 @@ impl AppUi {
             let tiny_decoder = &self.tiny_decoder;
             if self
                 .async_ctx
-                .exec_normal_task(tiny_decoder.check_input_exist())
+                .exec_normal_task(tiny_decoder.is_input_exist())
             {
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     let be_opacity = ui.opacity();
@@ -857,24 +858,14 @@ impl AppUi {
     }
     fn change_format_input(&mut self, path: &Path, now: &Instant) -> Result<(), String> {
         let tiny_decoder = &mut self.tiny_decoder;
-        if let Some(path_str) = path.to_str() {
-            let path = {
-                warn!("input path===={:?}", path);
 
-                if path_str.starts_with("tcp") {
-                    VideoPathSource::TcpStream(path.to_path_buf())
-                } else {
-                    VideoPathSource::File(path.to_path_buf())
-                }
-            };
+        self.ui_flags.pause_flag = true;
+        self.async_ctx.exec_normal_task(async {
+            if tiny_decoder.set_file_path_and_init_par(path).await.is_ok() {
+                warn!("reset file path success!");
+            }
+        });
 
-            self.ui_flags.pause_flag = true;
-            self.async_ctx.exec_normal_task(async {
-                if tiny_decoder.set_file_path_and_init_par(path).await.is_ok() {
-                    warn!("reset file path success!");
-                }
-            });
-        }
         let au_pl = &mut self.audio_player;
         au_pl.source_queue_skip_to_end();
 
@@ -1040,8 +1031,4 @@ impl AppUi {
             self.paint_playlist_window(ctx, now);
         }
     }
-}
-pub enum VideoPathSource {
-    File(PathBuf),
-    TcpStream(PathBuf),
 }
