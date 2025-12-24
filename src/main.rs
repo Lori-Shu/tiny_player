@@ -12,6 +12,10 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use eframe::{
+    egui_wgpu::{WgpuSetup, WgpuSetupCreateNew},
+    wgpu::{Backends, InstanceDescriptor},
+};
 use egui::{IconData, ImageSource, Vec2, include_image};
 use log::{Level, warn};
 
@@ -53,6 +57,13 @@ fn main() {
     if let Ok(tiny_app_ui) = appui::AppUi::new() {
         let mut options = eframe::NativeOptions::default();
         options.renderer = eframe::Renderer::Wgpu;
+        options.wgpu_options.wgpu_setup = WgpuSetup::CreateNew(WgpuSetupCreateNew {
+            instance_descriptor: InstanceDescriptor {
+                backends: Backends::VULKAN,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         if let ImageSource::Bytes { bytes, .. } = WINDOW_ICON {
             if let Ok(img) = image::load_from_memory(&bytes) {
                 options.viewport.icon = Some(Arc::new(IconData {

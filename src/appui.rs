@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     PlayerError, PlayerResult,
-    ai_sub_title::AISubTitle,
+    ai_sub_title::{AISubTitle, UsedModel},
     async_context::{AsyncContext, VideoDes},
     decode::MainStream,
 };
@@ -30,6 +30,16 @@ const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.
 const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png");
 pub const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
 const EMOJI_FONT: &[u8] = include_bytes!("../resources/fonts/seguiemj.ttf");
+static THEME_COLOR: LazyLock<Color32> = LazyLock::new(|| {
+    let mut orange_color = Color32::ORANGE.to_srgba_unmultiplied();
+    orange_color[3] = 200;
+    Color32::from_rgba_unmultiplied(
+        orange_color[0],
+        orange_color[1],
+        orange_color[2],
+        orange_color[3],
+    )
+});
 struct PlayerTextButton {
     text: String,
     font_size: f32,
@@ -63,7 +73,6 @@ struct UiFlags {
     err_window_flag: bool,
     playlist_window_flag: bool,
     subtitle_flag: bool,
-    chinese_subtitle_flag: bool,
     show_subtitle_options_flag: bool,
     show_volumn_slider_flag: bool,
 }
@@ -89,6 +98,7 @@ pub struct AppUi {
     scan_folder_dialog: Option<egui_file::FileDialog>,
     subtitle: Arc<RwLock<AISubTitle>>,
     video_des: Arc<RwLock<Vec<VideoDes>>>,
+    used_model: UsedModel,
 }
 impl eframe::App for AppUi {
     /// this function will automaticly be called every ui redraw
@@ -255,10 +265,10 @@ impl AppUi {
                                 err_window_flag: false,
                                 playlist_window_flag: false,
                                 subtitle_flag: true,
-                                chinese_subtitle_flag: false,
                                 show_subtitle_options_flag: false,
                                 show_volumn_slider_flag: false,
                             },
+                            used_model: UsedModel::Empty,
 
                             time_text: String::new(),
 
@@ -383,12 +393,21 @@ impl AppUi {
                         audio_player.push_pts(pts);
                         audio_player.play_raw_data_from_audio_frame(audio_frame.clone());
                         if self.ui_flags.subtitle_flag {
-                            if self.ui_flags.chinese_subtitle_flag {
+                            if let UsedModel::Chinese = &self.used_model {
                                 self.async_ctx
                                     .runtime_handle()
                                     .spawn(AISubTitle::push_frame_data(
                                         self.subtitle.clone(),
                                         audio_frame,
+                                        UsedModel::Chinese,
+                                    ));
+                            } else if let UsedModel::English = &self.used_model {
+                                self.async_ctx
+                                    .runtime_handle()
+                                    .spawn(AISubTitle::push_frame_data(
+                                        self.subtitle.clone(),
+                                        audio_frame,
+                                        UsedModel::English,
                                     ));
                             }
                         }
@@ -548,9 +567,9 @@ impl AppUi {
                             !self.ui_flags.show_subtitle_options_flag;
                     }
                     if self.ui_flags.show_subtitle_options_flag {
-                        let cn_checkbox =
-                            egui::Checkbox::new(&mut self.ui_flags.chinese_subtitle_flag, "中文");
-                        ui.add(cn_checkbox);
+                        ui.radio_value(&mut self.used_model, UsedModel::Empty, "closed");
+                        ui.radio_value(&mut self.used_model, UsedModel::Chinese, "中文");
+                        ui.radio_value(&mut self.used_model, UsedModel::English, "English");
                     }
                 });
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
@@ -635,15 +654,23 @@ impl AppUi {
                         let generated_str = subtitle.generated_str();
                         let len_in_chars = generated_str.chars().count();
                         let ui_str = {
-                            if len_in_chars > 20 {
-                                generated_str.char_range(len_in_chars - 20..len_in_chars)
+                            if let UsedModel::Chinese = &self.used_model {
+                                if len_in_chars > 20 {
+                                    generated_str.char_range(len_in_chars - 20..len_in_chars)
+                                } else {
+                                    generated_str.char_range(0..len_in_chars)
+                                }
                             } else {
-                                generated_str.char_range(0..len_in_chars)
+                                if len_in_chars > 30 {
+                                    generated_str.char_range(len_in_chars - 30..len_in_chars)
+                                } else {
+                                    generated_str.char_range(0..len_in_chars)
+                                }
                             }
                         };
                         RichText::new(ui_str)
-                            .size(30.0)
-                            .color(Color32::ORANGE)
+                            .size(50.0)
+                            .color(THEME_COLOR.clone())
                             .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0))
                     };
                     let subtitle_text_button = egui::Button::new(sub_text).frame(false);

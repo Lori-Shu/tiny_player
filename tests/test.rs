@@ -252,76 +252,114 @@ mod test {
         // 1, 2, 3 sum 6
         // 5 ,10 ,12 ,13 ,15 ,18  sum 30
         // 4,8,5 sum 9
-        let arr = vec![4, 8, 5];
-        let sum = 9;
-        // let mut ans_arr = vec![];
-        // println!(
-        //     "result:{},chose indices{:?}",
-        //     is_sub_set_sum_recursion(&arr, &mut ans_arr, &sum, 0, 0),
-        //     ans_arr
-        // );
-        println!("result:{}", is_sub_set_sum(&arr, &sum));
-    }
-    // fn is_sub_set_sum_recursion(
-    //     arr: &[i32],
-    //     ans_arr: &mut Vec<usize>,
-    //     sum: &i32,
-    //     temp_sum: i32,
-    //     index: usize,
-    // ) -> bool {
-    //     if temp_sum > *sum {
-    //         return false;
-    //     }
-    //     if temp_sum == *sum {
-    //         return true;
-    //     }
-    //     if index >= arr.len() {
-    //         return false;
-    //     }
-    //     ans_arr.push(index);
-    //     let result_chose = is_sub_set_sum_recursion(arr, ans_arr, sum, temp_sum + arr[index], index + 1);
-    //     if !result_chose {
-    //         ans_arr.remove(ans_arr.len() - 1);
-    //         let result_skip=is_sub_set_sum_recursion(arr, ans_arr, sum, temp_sum, index + 1);
-    //         return result_skip;
-    //     }
-    //     result_chose
-    // }
-    fn is_sub_set_sum(arr: &[i32], sum: &i32) -> bool {
-        let mut condition_arr = vec![0_u8; arr.len()];
-        let mut index = 0_i32;
-        let mut pre_value = 0;
+        let arr = vec![1, 2, 3];
+        let sum = 6;
         let mut ans_arr = vec![];
-        loop {
-            if index < 0 {
-                break;
-            }
-            if pre_value == *sum {
-                println!("chose indices{:?}", ans_arr);
-                return true;
-            }
-            if index as usize == arr.len() || condition_arr[index as usize] == 2 {
-                if (index as usize) < arr.len() {
-                    condition_arr[index as usize] = 0;
-                }
-                index -= 1;
-            } else if condition_arr[index as usize] == 1 {
-                condition_arr[index as usize] = 2;
-                ans_arr.remove(ans_arr.len() - 1);
-                pre_value = pre_value - arr[index as usize];
-                index += 1;
-            } else {
-                // 第一次到达下标 尝试添加
-                if pre_value > *sum {
-                    condition_arr[index as usize] = 2;
-                    continue;
-                }
-                ans_arr.push(index);
-                pre_value = pre_value + arr[index as usize];
-                condition_arr[index as usize] = 1;
-                index += 1;
-            }
-        }
-        false
+        println!(
+            "result:{},chose indices{:?}",
+            is_sub_set_sum_recursion(&arr, &sum, &mut ans_arr, arr.iter().sum::<i32>(), 0, 0),
+            ans_arr
+        );
+        // println!("result:{}", is_sub_set_sum(&arr, &sum));
+        // println!("result:{}", is_sub_set_sum_dp(&arr, &sum));
     }
+    fn is_sub_set_sum_recursion(
+        arr: &[i32],
+        sum: &i32,
+        ans_arr: &mut Vec<usize>,
+        left_elements_sum: i32,
+        temp_sum: i32,
+        index: usize,
+    ) -> bool {
+        if temp_sum > *sum {
+            return false;
+        }
+        if temp_sum == *sum {
+            return true;
+        }
+        if index >= arr.len() {
+            return false;
+        }
+        let upper_bound = temp_sum + left_elements_sum;
+        if upper_bound < *sum {
+            return false;
+        }
+        ans_arr.push(index);
+        let result_chose = is_sub_set_sum_recursion(
+            arr,
+            sum,
+            ans_arr,
+            left_elements_sum - arr[index],
+            temp_sum + arr[index],
+            index + 1,
+        );
+        if !result_chose {
+            ans_arr.remove(ans_arr.len() - 1);
+            let result_skip = is_sub_set_sum_recursion(
+                arr,
+                sum,
+                ans_arr,
+                left_elements_sum - arr[index],
+                temp_sum,
+                index + 1,
+            );
+            return result_skip;
+        }
+        result_chose
+    }
+    // fn is_sub_set_sum(arr: &[i32], sum: &i32) -> bool {
+    //     let mut condition_arr = vec![0_u8; arr.len()];
+    //     let mut index = 0_i32;
+    //     let mut pre_value = 0;
+    //     let mut ans_arr = vec![];
+    //     loop {
+    //         if index < 0 {
+    //             break;
+    //         }
+    //         if pre_value == *sum {
+    //             println!("chose indices{:?}", ans_arr);
+    //             return true;
+    //         }
+    //         if index as usize == arr.len() || condition_arr[index as usize] == 2 {
+    //             if (index as usize) < arr.len() {
+    //                 condition_arr[index as usize] = 0;
+    //             }
+    //             index -= 1;
+    //         } else if condition_arr[index as usize] == 1 {
+    //             condition_arr[index as usize] = 2;
+    //             ans_arr.remove(ans_arr.len() - 1);
+    //             pre_value = pre_value - arr[index as usize];
+    //             index += 1;
+    //         } else {
+    //             // 第一次到达下标 尝试添加
+    //             if pre_value > *sum {
+    //                 condition_arr[index as usize] = 2;
+    //                 continue;
+    //             }
+    //             ans_arr.push(index);
+    //             pre_value = pre_value + arr[index as usize];
+    //             condition_arr[index as usize] = 1;
+    //             index += 1;
+    //         }
+    //     }
+    //     false
+    // }
+    // fn is_sub_set_sum_dp(arr: &[i32], sum: &i32) -> bool {
+    //     let mut is_eq_temp_sum = vec![vec![false; (*sum + 1) as usize]; arr.len()];
+    //     is_eq_temp_sum[0][arr[0] as usize] = true;
+    //     for index in 0..is_eq_temp_sum.len() {
+    //         is_eq_temp_sum[index][0] = true;
+    //     }
+    //     for index in 1..is_eq_temp_sum.len() {
+    //         for temp_sum in 1..(*sum + 1) {
+    //             let mut is_eq_sum_tmp = false;
+    //             if temp_sum - arr[index] >= 0 {
+    //                 is_eq_sum_tmp = is_eq_temp_sum[index - 1][(temp_sum - arr[index]) as usize];
+    //             }
+    //             is_eq_temp_sum[index][temp_sum as usize] =
+    //                 is_eq_temp_sum[index - 1][temp_sum as usize] || is_eq_sum_tmp;
+    //         }
+    //     }
+    //     is_eq_temp_sum[arr.len() - 1][*sum as usize]
+    // }
 }

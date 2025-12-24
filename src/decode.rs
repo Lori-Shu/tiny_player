@@ -638,7 +638,7 @@ impl TinyDecoder {
                     if let Some(frames) = &mut *v_frame_vec {
                         let mut v_decoder = video_decoder.write().await;
                         // warn!("video frame vec len{}", frames.len());
-                        if packets.len() > 0 && frames.len() < 10 {
+                        if packets.len() > 0 && frames.len() < 5 {
                             if let Some(front_packet) = packets.pop_front() {
                                 if let Some(decoder) = &mut *v_decoder {
                                     if decoder.0.send_packet(&front_packet).is_ok() {
