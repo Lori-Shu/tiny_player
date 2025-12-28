@@ -65,9 +65,9 @@ impl AudioPlayer {
     }
     pub fn last_source_pts(&self) -> Result<i64, String> {
         if !self.pts_vec.is_empty() {
-            return Ok(self.pts_vec[self.pts_vec.len() - 1]);
+            Ok(self.pts_vec[self.pts_vec.len() - 1])
         } else {
-            return Err("audio source len is 0".to_string());
+            Err("audio source len is 0".to_string())
         }
     }
     pub fn len(&self) -> usize {

@@ -110,7 +110,7 @@ impl eframe::App for AppUi {
 
                  */
                 let now = Instant::now();
-                if let None = self.video_texture_handle {
+                if self.video_texture_handle.is_none() {
                     self.load_video_texture(ctx);
                     self.frame_show_instant = now;
                 }
@@ -252,10 +252,10 @@ impl AppUi {
                     if let Ok(subtitle) = AISubTitle::new() {
                         return Ok(Self {
                             video_texture_handle: None,
-                            tiny_decoder: tiny_decoder,
-                            audio_player: audio_player,
+                            tiny_decoder,
+                            audio_player,
                             main_stream_current_timestamp: Arc::new(RwLock::new(0)),
-                            play_time: play_time,
+                            play_time,
                             main_color_image: Some(color_image),
                             frame_show_instant: Instant::now(),
                             ui_flags: UiFlags {
@@ -277,7 +277,7 @@ impl AppUi {
                             last_show_control_ui_instant: Instant::now(),
                             app_start_instant: Instant::now(),
                             current_video_frame: None,
-                            async_ctx: async_ctx,
+                            async_ctx,
                             opened_file: None,
                             open_file_dialog: Some(f_dialog),
                             scan_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
@@ -340,7 +340,7 @@ impl AppUi {
                 if !time.eq(&self.play_time) {
                     if let Ok(formatter) = format_description::parse("[hour]:[minute]:[second]") {
                         if let Ok(mut now_str) = time.format(&formatter) {
-                            now_str.push_str("|");
+                            now_str.push('|');
                             now_str.push_str(tiny_decoder.end_time_formatted_string());
                             self.time_text = now_str;
                             self.play_time = time;
@@ -357,7 +357,7 @@ impl AppUi {
         let frame_rect = tiny_decoder.video_frame_rect();
         let color_image = ColorImage::filled(
             [frame_rect[0] as usize, frame_rect[1] as usize],
-            Color32::from_rgba_unmultiplied(0, 200, 0, 200),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 255),
         );
         if let Some(img) = &mut self.main_color_image {
             *img = color_image;
@@ -429,7 +429,7 @@ impl AppUi {
         let file_img_btn_response = ui.add(file_image_button);
         if file_img_btn_response.hovered() {
             self.ui_flags.control_ui_flag = true;
-            self.last_show_control_ui_instant = now.clone();
+            self.last_show_control_ui_instant = *now;
         }
         if file_img_btn_response.clicked() {
             if let Some(dialog) = &mut self.open_file_dialog {
@@ -462,7 +462,9 @@ impl AppUi {
 
         if let Some(path) = self.opened_file.take() {
             if self.change_format_input(path.as_path(), now).is_ok() {
-                warn!("accept file path{}", path.display().to_string());
+                if let Some(p_str) = path.to_str() {
+                    warn!("accept file path{}", p_str);
+                }
             } else {
                 self.err_window_msg = "please choose a valid video or audio file !!!".to_string();
                 self.ui_flags.err_window_flag = true;
@@ -477,12 +479,11 @@ impl AppUi {
             .async_ctx
             .exec_normal_task(tiny_decoder.is_input_exist())
         {
-            let play_or_pause_image_source;
-            if self.ui_flags.pause_flag {
-                play_or_pause_image_source = PLAY_IMG;
+            let play_or_pause_image_source = if self.ui_flags.pause_flag {
+                PLAY_IMG
             } else {
-                play_or_pause_image_source = PAUSE_IMG;
-            }
+                PAUSE_IMG
+            };
             let btn_rect = Vec2::new(
                 ctx.content_rect().width() / 10.0,
                 ctx.content_rect().width() / 10.0,
@@ -494,7 +495,7 @@ impl AppUi {
             let btn_response = ui.add_sized(Vec2::new(100.0, 100.0), play_or_pause_btn);
             if btn_response.hovered() {
                 self.ui_flags.control_ui_flag = true;
-                self.last_show_control_ui_instant = now.clone();
+                self.last_show_control_ui_instant = *now;
             }
             if btn_response.clicked() || ctx.input(|s| s.key_released(egui::Key::Space)) {
                 self.ui_flags.pause_flag = !self.ui_flags.pause_flag;
@@ -549,7 +550,7 @@ impl AppUi {
 
                     tiny_decoder.seek_timestamp_to_decode(*timestamp);
                     audio_player.source_queue_skip_to_end();
-                    self.frame_show_instant = now.clone();
+                    self.frame_show_instant = *now;
                     self.current_video_frame = None;
                 }
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
@@ -560,7 +561,7 @@ impl AppUi {
                     let btn_response = ui.add(subtitle_btn);
                     if btn_response.hovered() {
                         self.ui_flags.control_ui_flag = true;
-                        self.last_show_control_ui_instant = now.clone();
+                        self.last_show_control_ui_instant = *now;
                     }
                     if btn_response.clicked() {
                         self.ui_flags.show_subtitle_options_flag =
@@ -578,7 +579,7 @@ impl AppUi {
                     let btn_response = ui.add(volumn_img_btn);
                     if btn_response.hovered() {
                         self.ui_flags.control_ui_flag = true;
-                        self.last_show_control_ui_instant = now.clone();
+                        self.last_show_control_ui_instant = *now;
                     }
                     if btn_response.clicked() {
                         self.ui_flags.show_volumn_slider_flag =
@@ -626,7 +627,7 @@ impl AppUi {
                     let btn_response = ui.add(fullscreen_image_btn);
                     if btn_response.hovered() {
                         self.ui_flags.control_ui_flag = true;
-                        self.last_show_control_ui_instant = now.clone();
+                        self.last_show_control_ui_instant = *now;
                     }
                     if btn_response.clicked() {
                         self.ui_flags.fullscreen_flag = !self.ui_flags.fullscreen_flag;
@@ -660,17 +661,19 @@ impl AppUi {
                                 } else {
                                     generated_str.char_range(0..len_in_chars)
                                 }
-                            } else {
+                            } else if let UsedModel::English = &self.used_model {
                                 if len_in_chars > 30 {
                                     generated_str.char_range(len_in_chars - 30..len_in_chars)
                                 } else {
                                     generated_str.char_range(0..len_in_chars)
                                 }
+                            } else {
+                                generated_str
                             }
                         };
                         RichText::new(ui_str)
                             .size(50.0)
-                            .color(THEME_COLOR.clone())
+                            .color(*THEME_COLOR)
                             .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0))
                     };
                     let subtitle_text_button = egui::Button::new(sub_text).frame(false);
@@ -737,7 +740,7 @@ impl AppUi {
             }
         };
         if pts
-            + 1 * main_stream_time_base.denominator() as i64
+            + main_stream_time_base.denominator() as i64
                 / main_stream_time_base.numerator() as i64
                 / 2
             >= tiny_decoder.end_ts()
@@ -870,12 +873,12 @@ impl AppUi {
             let pic_data = tiny_decoder.cover_pic_data();
             let cover_data = self.async_ctx.exec_normal_task(pic_data.read());
             if let Some(data_vec) = &*cover_data {
-                if let Ok(img) = image::load_from_memory(&data_vec) {
+                if let Ok(img) = image::load_from_memory(data_vec) {
                     let rgba8_img = img.to_rgba8();
                     v_tex.set(
                         ImageData::Color(Arc::new(ColorImage::from_rgba_unmultiplied(
                             [rgba8_img.width() as usize, rgba8_img.height() as usize],
-                            &rgba8_img.to_vec(),
+                            &rgba8_img,
                         ))),
                         TextureOptions::LINEAR,
                     );
@@ -917,17 +920,13 @@ impl AppUi {
         self.add_audio_source();
 
         if now
-            .checked_duration_since(self.frame_show_instant.clone())
+            .checked_duration_since(self.frame_show_instant)
             .is_some()
         {
             let video_exist = {
                 let v_stream_idx = self.tiny_decoder.video_stream_idx();
                 let video_stream_idx = self.async_ctx.exec_normal_task(v_stream_idx.read());
-                if *video_stream_idx == usize::MAX {
-                    false
-                } else {
-                    true
-                }
+                !*video_stream_idx == usize::MAX
             };
             if video_exist {
                 if self.check_video_wait_for_audio() {
@@ -1021,10 +1020,12 @@ impl AppUi {
     fn detect_file_drag(&mut self, ctx: &Context, now: &Instant) {
         ctx.input(|input| {
             let dropped_files = &input.raw.dropped_files;
-            if dropped_files.len() > 0 {
+            if !dropped_files.is_empty() {
                 if let Some(path) = &dropped_files[0].path {
                     if self.change_format_input(path.as_path(), now).is_ok() {
-                        warn!("filepath{}", path.display().to_string());
+                        if let Some(p_str) = path.to_str() {
+                            warn!("filepath{}", p_str);
+                        }
                     } else {
                         self.err_window_msg =
                             "please choose a valid video or audio file !!!".to_string();
@@ -1049,7 +1050,7 @@ impl AppUi {
         let btn_response = ui.add(open_btn);
         if btn_response.hovered() {
             self.ui_flags.control_ui_flag = true;
-            self.last_show_control_ui_instant = now.clone();
+            self.last_show_control_ui_instant = *now;
         }
         if btn_response.clicked() {
             self.ui_flags.playlist_window_flag = !self.ui_flags.playlist_window_flag;

@@ -1,5 +1,6 @@
 use std::{path::Path, sync::Arc};
 
+use log::warn;
 use tokio::{
     runtime::{Handle, Runtime},
     sync::RwLock,
@@ -55,7 +56,7 @@ impl AsyncContext {
                                     || file_name.ends_with(".m4a")
                                     || file_name.ends_with(".wav")
                                 {
-                                    if let Some(p_str) = path.join(&file_name).to_str() {
+                                    if let Some(p_str) = path.join(file_name).to_str() {
                                         video_targets.push(VideoDes {
                                             name: file_name.to_string(),
                                             path: p_str.to_string(),
@@ -65,6 +66,8 @@ impl AsyncContext {
                             }
                         }
                     }
+                } else {
+                    warn!("read dir element err");
                 }
             }
         }

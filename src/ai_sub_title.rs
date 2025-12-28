@@ -102,7 +102,7 @@ impl AISubTitle {
             )
         };
         sub_title.source_buffer.extend(data);
-        if let UsedModel::Chinese = used_model {
+        if let UsedModel::Chinese = &used_model {
             if sub_title.source_buffer.len() > 3200 {
                 let buf = sub_title.source_buffer.drain(0..3200).collect::<Vec<i16>>();
                 if let Ok(state) = sub_title.cn_recognizer.accept_waveform(&buf) {
@@ -119,7 +119,7 @@ impl AISubTitle {
                     }
                 }
             }
-        } else {
+        } else if let UsedModel::English = &used_model {
             if sub_title.source_buffer.len() > 3200 {
                 let buf = sub_title.source_buffer.drain(0..3200).collect::<Vec<i16>>();
                 if let Ok(state) = sub_title.en_recognizer.accept_waveform(&buf) {

@@ -1,6 +1,6 @@
 [package]
 name = "tiny_player"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
 description = "a tiny video player"
 authors = ["Lori-Shu"]
@@ -29,3 +29,4 @@ futures-util = "0.3.31"
 vosk = "0.3.1"
 [build-dependencies]
 winresource = "0.1.23"
+fs_extra = "1.3.0"
