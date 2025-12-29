@@ -42,7 +42,7 @@ impl AISubTitle {
                                     en_rez.set_max_alternatives(0);
                                     en_rez.set_partial_words(true);
                                     en_rez.set_nlsml(true);
-                                    if let Ok(resampler) = ffmpeg_the_third::software::resampler2(
+                                    let resampler = ffmpeg_the_third::software::resampler2(
                             (
                                 Sample::F32(ffmpeg_the_third::util::format::sample::Type::Packed),
                                 ChannelLayout::STEREO,
@@ -53,19 +53,18 @@ impl AISubTitle {
                                 ChannelLayout::MONO,
                                 16000,
                             ),
-                        ) {
-                            return Ok(Self {
-                                _chinese_recognize_model: cn_recognize_model,
-                                _english_recognize_model:en_recognize_model,
-                                cn_recognizer: cn_rez,
-                                en_recognizer:en_rez,
-                                source_buffer: VecDeque::new(),
-                                generated_str: String::new(),
-                                subtitle_source_resampler: Arc::new(RwLock::new(
-                                    ManualProtectedResampler(resampler),
-                                )),
-                            });
-                        }
+                        ).map_err(|e|PlayerError::Internal(e.to_string()))?;
+                                    return Ok(Self {
+                                        _chinese_recognize_model: cn_recognize_model,
+                                        _english_recognize_model: en_recognize_model,
+                                        cn_recognizer: cn_rez,
+                                        en_recognizer: en_rez,
+                                        source_buffer: VecDeque::new(),
+                                        generated_str: String::new(),
+                                        subtitle_source_resampler: Arc::new(RwLock::new(
+                                            ManualProtectedResampler(resampler),
+                                        )),
+                                    });
                                 }
                             }
                         }
@@ -95,8 +94,8 @@ impl AISubTitle {
                 warn!("subtitle frame convert err!");
             }
         }
-        let data: &[i16] = unsafe {
-            std::slice::from_raw_parts(
+        let data = unsafe {
+            std::slice::from_raw_parts::<'static, i16>(
                 to_recognize_frame.data(0).as_ptr() as *const i16,
                 to_recognize_frame.samples(),
             )

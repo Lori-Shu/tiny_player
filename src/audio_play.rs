@@ -1,28 +1,34 @@
 use std::collections::VecDeque;
 
+use log::warn;
+
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
-    stream: Option<rodio::OutputStream>,
+    _stream: Option<rodio::OutputStream>,
     current_volumn: f32,
     pts_vec: VecDeque<i64>,
 }
 impl AudioPlayer {
     pub fn new() -> Self {
-        let mut sel = Self {
-            pts_vec: VecDeque::new(),
-            current_volumn: 1.0,
-            stream: None,
-            sink: None,
-        };
         if let Ok(stream) = rodio::OutputStreamBuilder::open_default_stream() {
-            let sink = rodio::Sink::connect_new(stream.mixer());
-            sel.sink = Some(sink);
-            sel.stream = Some(stream);
+            Self {
+                sink: Some(rodio::Sink::connect_new(stream.mixer())),
+                _stream: Some(stream),
+                current_volumn: 1.0,
+                pts_vec: VecDeque::new(),
+            }
+        } else {
+            warn!("rodio  open stream err");
+            Self {
+                sink: None,
+                _stream: None,
+                current_volumn: 1.0,
+                pts_vec: VecDeque::new(),
+            }
         }
-        sel
     }
     pub fn play_raw_data_from_audio_frame(&self, audio_frame: ffmpeg_the_third::frame::Audio) {
-        let audio_data: &[f32] = bytemuck::cast_slice(audio_frame.data(0));
+        let audio_data = bytemuck::cast_slice::<u8, f32>(audio_frame.data(0));
         let audio_data =
             &audio_data[0..audio_frame.samples() * audio_frame.ch_layout().channels() as usize];
         let source = rodio::buffer::SamplesBuffer::new(
@@ -35,9 +41,10 @@ impl AudioPlayer {
         }
     }
 
-    pub fn change_volumn(&self) {
+    pub fn change_volumn(&mut self, volumn: f32) {
         if let Some(sink) = &self.sink {
-            sink.set_volume(self.current_volumn);
+            sink.set_volume(volumn);
+            self.current_volumn = volumn;
         }
     }
     pub fn source_queue_skip_to_end(&mut self) {
@@ -79,8 +86,5 @@ impl AudioPlayer {
     }
     pub fn current_volumn(&self) -> &f32 {
         &self.current_volumn
-    }
-    pub fn current_volumn_mut(&mut self) -> &mut f32 {
-        &mut self.current_volumn
     }
 }

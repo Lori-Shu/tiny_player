@@ -99,6 +99,7 @@ pub struct AppUi {
     subtitle: Arc<RwLock<AISubTitle>>,
     video_des: Arc<RwLock<Vec<VideoDes>>>,
     used_model: UsedModel,
+    audio_volumn: f32,
 }
 impl eframe::App for AppUi {
     /// this function will automaticly be called every ui redraw
@@ -284,6 +285,7 @@ impl AppUi {
                             bg_dyn_img: dyn_img,
                             subtitle: Arc::new(RwLock::new(subtitle)),
                             video_des: Arc::new(RwLock::new(vec![])),
+                            audio_volumn: 1.0,
                         });
                     }
                 }
@@ -590,7 +592,7 @@ impl AppUi {
                             ui.add_space(150.0);
                             let audio_player = &mut self.audio_player;
                             let volumn_slider =
-                                egui::Slider::new(audio_player.current_volumn_mut(), 0.0..=2.0)
+                                egui::Slider::new(&mut self.audio_volumn, 0.0..=2.0)
                                     .vertical()
                                     .show_value(false);
                             let mut slider_style = egui::style::Style::default();
@@ -615,7 +617,7 @@ impl AppUi {
                             }
                             if slider_response.changed() {
                                 warn!("volumn slider dragged!");
-                                audio_player.change_volumn();
+                                audio_player.change_volumn(self.audio_volumn);
                             }
                         });
                     }
@@ -843,8 +845,10 @@ impl AppUi {
                                     videos.clear();
                                 }
                                 if let Some(path) = dialog.path() {
-                                    self.async_ctx
-                                        .read_video_folder(path, self.video_des.clone());
+                                    self.async_ctx.exec_normal_task(AppUi::read_video_folder(
+                                        path,
+                                        self.video_des.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -1057,6 +1061,40 @@ impl AppUi {
         }
         if self.ui_flags.playlist_window_flag {
             self.paint_playlist_window(ctx, now);
+        }
+    }
+    pub async fn read_video_folder(path: &Path, video_des: Arc<RwLock<Vec<VideoDes>>>) {
+        let mut video_targets = video_des.write().await;
+        if let Ok(ite) = path.read_dir() {
+            for entry in ite {
+                if let Ok(en) = entry {
+                    if let Ok(t) = en.file_type() {
+                        if t.is_file() {
+                            if let Some(file_name) = en.file_name().to_str() {
+                                if file_name.ends_with(".ts")
+                                    || file_name.ends_with(".mp4")
+                                    || file_name.ends_with(".mkv")
+                                    || file_name.ends_with(".flac")
+                                    || file_name.ends_with(".mp3")
+                                    || file_name.ends_with(".m4a")
+                                    || file_name.ends_with(".wav")
+                                    || file_name.ends_with(".ogg")
+                                    || file_name.ends_with(".opus")
+                                {
+                                    if let Some(p_str) = path.join(file_name).to_str() {
+                                        video_targets.push(VideoDes {
+                                            name: file_name.to_string(),
+                                            path: p_str.to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    warn!("read dir element err");
+                }
+            }
         }
     }
 }

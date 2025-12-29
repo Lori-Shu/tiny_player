@@ -10,10 +10,10 @@ use std::{
 use ffmpeg_the_third::{
     ChannelLayout, Rational, Stream,
     ffi::{
-        AV_CHANNEL_LAYOUT_STEREO, AVPixelFormat, SwrContext, av_hwdevice_ctx_create,
-        av_hwframe_transfer_data, avcodec_get_hw_config, avfilter_get_by_name,
-        avfilter_graph_create_filter, avfilter_link, swr_alloc_set_opts2, swr_convert_frame,
-        swr_free, swr_init,
+        AV_CHANNEL_LAYOUT_STEREO, AVPixelFormat, AVSEEK_FLAG_BACKWARD, SwrContext,
+        av_hwdevice_ctx_create, av_hwframe_transfer_data, avcodec_get_hw_config,
+        avfilter_get_by_name, avfilter_graph_create_filter, avfilter_link, swr_alloc_set_opts2,
+        swr_convert_frame, swr_free, swr_init,
     },
     filter::Graph,
     format::{Pixel, sample::Type, stream::Disposition},
@@ -270,7 +270,6 @@ impl TinyDecoder {
                     audio_decoder.set_ch_layout(ChannelLayout::STEREO);
                 }
                 let mut swr_ctx = null_mut();
-
                 let r = swr_alloc_set_opts2(
                     &mut swr_ctx,
                     &AV_CHANNEL_LAYOUT_STEREO,
@@ -591,12 +590,6 @@ impl TinyDecoder {
                 break;
             }
 
-            /*
-                    注意这里packetcachevec的锁和decoer的锁同时拿到，
-                    其余地方若需要同时使用需要用同样地顺序避免死锁,
-                    同时拿到多锁是为了避免改变input时
-                    遇到decoder和packet不匹配的情况
-            */
             if audio_packet_cache_queue.read().await.is_some() {
                 let mut audio_packet_cache_vec = audio_packet_cache_queue.write().await;
                 let mut a_frame_vec = audio_frame_cache_queue.write().await;
@@ -886,7 +879,7 @@ impl TinyDecoder {
                         ts,
                         ts + main_stream_time_base.denominator() as i64
                             / main_stream_time_base.numerator() as i64,
-                        ffmpeg_the_third::ffi::AVSEEK_FLAG_ANY,
+                        AVSEEK_FLAG_BACKWARD,
                     );
                     if res != 0 {
                         warn!("seek err num:{res}");
