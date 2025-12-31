@@ -20,9 +20,10 @@ use ffmpeg_the_third::{
     frame::Video,
     software::{resampling, scaling},
 };
-use log::warn;
+
 use time::format_description;
 use tokio::{io::AsyncWriteExt, runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
+use tracing::{Instrument, Level, info, span, warn};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult};
 /// this wrapper type should be protected manually to
@@ -160,14 +161,14 @@ impl TinyDecoder {
     /// called when user selected a file path to play
     /// init all the details from the file selected
     pub async fn set_file_path_and_init_par(&mut self, path: &Path) -> PlayerResult<()> {
-        warn!("ffmpeg version{}", ffmpeg_the_third::format::version());
+        info!("ffmpeg version{}", ffmpeg_the_third::format::version());
         if self.demux_task_handle.is_some() {
             self.stop_demux_and_decode().await;
             self.reset_tiny_decoder_states().await;
         }
         let format_input = ffmpeg_the_third::format::input(path)
             .map_err(|e| PlayerError::Internal(e.to_string()))?;
-        warn!("input construct finished");
+        info!("input construct finished");
         let mut cover_stream = None;
         let mut video_stream = None;
         let mut audio_stream = None;
@@ -175,26 +176,26 @@ impl TinyDecoder {
             let stream_type = item.parameters().medium();
             if stream_type == ffmpeg_the_third::util::media::Type::Video {
                 if item.disposition() == Disposition::ATTACHED_PIC {
-                    warn!("pic stream was found");
+                    info!("pic stream was found");
                     cover_stream = Some(item);
                 } else {
-                    warn!("video stream was found");
+                    info!("video stream was found");
                     video_stream = Some(item);
                 }
             } else if stream_type == ffmpeg_the_third::util::media::Type::Audio {
-                warn!("audio stream was found");
+                info!("audio stream was found");
                 audio_stream = Some(item);
             } else if stream_type == ffmpeg_the_third::util::media::Type::Attachment {
-                warn!("attachment stream was found");
+                info!("attachment stream was found");
                 cover_stream = Some(item);
             }
         }
 
         if audio_stream.is_none() && video_stream.is_none() {
-            warn!("no valid stream found");
+            info!("no valid stream found");
         }
         if let Some(stream) = &cover_stream {
-            warn!("cover stream found");
+            info!("cover stream found");
             let mut mutex_guard = self.cover_stream_index.write().await;
             *mutex_guard = stream.index();
         }
@@ -203,7 +204,7 @@ impl TinyDecoder {
             let mut mutex_guard = self.audio_stream_index.write().await;
             *mutex_guard = stream.index();
             self.audio_time_base = stream.time_base();
-            warn!("audio time_base==={}", self.audio_time_base);
+            info!("audio time_base==={}", self.audio_time_base);
             *self.audio_packet_cache_queue.write().await = Some(VecDeque::new());
             *self.audio_frame_cache_queue.write().await = Some(VecDeque::new());
         }
@@ -212,7 +213,7 @@ impl TinyDecoder {
             let mut mutex_guard = self.video_stream_index.write().await;
             *mutex_guard = stream.index();
             self.video_time_base = stream.time_base();
-            warn!("video time_base==={}", self.video_time_base);
+            info!("video time_base==={}", self.video_time_base);
             if audio_stream.is_none() {
                 self.main_stream = MainStream::Video;
             }
@@ -222,7 +223,7 @@ impl TinyDecoder {
 
         // format_input.duration() can get the precise duration of the media file
         // format_input.duration() number unit is us
-        warn!("total duration {} us", format_input.duration());
+        info!("total duration {} us", format_input.duration());
         *self.format_duration.write().await = format_input.duration();
         let adur_ts = {
             if let MainStream::Audio = self.main_stream {
@@ -251,7 +252,7 @@ impl TinyDecoder {
             .map_err(|e| PlayerError::Internal(e.to_string()))?;
             self.converter_ctx = Some(converter);
 
-            warn!("video decode format{:#?}", video_decoder.format());
+            info!("video decode format{:#?}", video_decoder.format());
             self.video_frame_rect = [video_decoder.width(), video_decoder.height()];
             let mut v_decoder = self.video_decoder.write().await;
             *v_decoder = Some(ManualProtectedVideoDecoder(video_decoder));
@@ -282,11 +283,11 @@ impl TinyDecoder {
                     null_mut(),
                 );
                 if r < 0 {
-                    warn!("swr ctx create err");
+                    info!("swr ctx create err");
                 }
                 let r = swr_init(swr_ctx);
                 if r < 0 {
-                    warn!("swr init err");
+                    info!("swr init err");
                 }
                 self.resampler_ctx = Some(swr_ctx);
             }
@@ -301,7 +302,7 @@ impl TinyDecoder {
             let mut input = self.format_input.write().await;
             *input = Some(ManualProtectedInput(format_input));
         }
-        warn!("par init finished!!!");
+        info!("par init finished!!!");
         self.start_process_input().await;
         Ok(())
     }
@@ -320,6 +321,7 @@ impl TinyDecoder {
         cover_stream_index: Arc<RwLock<usize>>,
         cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
     ) {
+        info!("enter demux");
         loop {
             sleep(Duration::from_millis(1)).await;
             if *exit_flag.read().await {
@@ -340,19 +342,19 @@ impl TinyDecoder {
                         }
                     }
 
-                    //     warn!(
+                    //     info!(
                     //         "audio packet vec len{},video packet vec len{}",
                     //         a_packets.len(),
                     //         v_packets.len()
                     //     );
                 } else if let Some(a_packets) = &*audio_packet_cache_vec {
                     if a_packets.len() >= 200 {
-                        // warn!("packet vec len{}",cache_len);
+                        // info!("packet vec len{}",cache_len);
                         continue;
                     }
                 } else if let Some(v_packets) = &*video_packet_cache_vec {
                     if v_packets.len() >= 200 {
-                        // warn!("packet vec len{}",cache_len);
+                        // info!("packet vec len{}",cache_len);
                         continue;
                     }
                 }
@@ -384,7 +386,7 @@ impl TinyDecoder {
                             }
                         }
                         Some(Err(ffmpeg_the_third::util::error::Error::Eof)) => {
-                            warn!("demux process hit the end");
+                            info!("demux process hit the end");
                         }
                         None => {}
                         _ => {}
@@ -407,7 +409,7 @@ impl TinyDecoder {
                     video_frame_tmp.as_ptr(),
                     0,
                 ) {
-                    warn!("hardware frame transfer to software frame err");
+                    info!("hardware frame transfer to software frame err");
                 }
 
                 transfered_frame.set_pts(video_frame_tmp.pts());
@@ -455,6 +457,7 @@ impl TinyDecoder {
         video_time_base: Rational,
         video_frame_rect: [u32; 2],
     ) {
+        info!("enter decode");
         let mut p = PathBuf::new();
         if video_packet_cache_queue.read().await.is_some() {
             if let Ok(exe_path) = CURRENT_EXE_PATH.as_ref() {
@@ -520,7 +523,7 @@ impl TinyDecoder {
                                                                 graph.as_mut_ptr(),
                                                             );
                                                             if r < 0 {
-                                                                warn!("create buffer filter err");
+                                                                info!("create buffer filter err");
                                                             }
                                                             let r = avfilter_graph_create_filter(
                                                                 &mut drawtext_ctx,
@@ -531,7 +534,7 @@ impl TinyDecoder {
                                                                 graph.as_mut_ptr(),
                                                             );
                                                             if r < 0 {
-                                                                warn!("create drawtext filter err");
+                                                                info!("create drawtext filter err");
                                                             }
                                                             let r = avfilter_graph_create_filter(
                                                                 &mut buffersink_ctx,
@@ -542,7 +545,7 @@ impl TinyDecoder {
                                                                 graph.as_mut_ptr(),
                                                             );
                                                             if r < 0 {
-                                                                warn!(
+                                                                info!(
                                                                     "create buffersink filter err"
                                                                 );
                                                             }
@@ -553,7 +556,7 @@ impl TinyDecoder {
                                                                 0,
                                                             );
                                                             if r < 0 {
-                                                                warn!("link src and drawtext err");
+                                                                info!("link src and drawtext err");
                                                             }
                                                             let r = avfilter_link(
                                                                 drawtext_ctx,
@@ -562,10 +565,10 @@ impl TinyDecoder {
                                                                 0,
                                                             );
                                                             if r < 0 {
-                                                                warn!("link drawtext and sink err");
+                                                                info!("link drawtext and sink err");
                                                             }
                                                             if graph.validate().is_ok() {
-                                                                warn!(
+                                                                info!(
                                                                     "graph validate success!dump:\n{}",
                                                                     graph.dump()
                                                                 );
@@ -596,7 +599,7 @@ impl TinyDecoder {
                 if let Some(packets) = &mut *audio_packet_cache_vec {
                     if let Some(frames) = &mut *a_frame_vec {
                         let mut audio_decoder = audio_decoder.write().await;
-                        // warn!("audio frame vec len{}", frames.len());
+                        // info!("audio frame vec len{}", frames.len());
                         if !packets.is_empty() && frames.len() < 10 {
                             if let Some(front_packet) = packets.pop_front() {
                                 if let Some(decoder) = &mut *audio_decoder {
@@ -628,7 +631,7 @@ impl TinyDecoder {
                 if let Some(packets) = &mut *video_packet_cache_vec {
                     if let Some(frames) = &mut *v_frame_vec {
                         let mut v_decoder = video_decoder.write().await;
-                        // warn!("video frame vec len{}", frames.len());
+                        // info!("video frame vec len{}", frames.len());
                         if !packets.is_empty() && frames.len() < 5 {
                             if let Some(front_packet) = packets.pop_front() {
                                 if let Some(decoder) = &mut *v_decoder {
@@ -691,6 +694,8 @@ impl TinyDecoder {
         let demux_exit_flag = self.demux_exit_flag.clone();
 
         self.demux_task_handle = Some(self.runtime_handle.spawn(async move {
+            let demux_span = span!(Level::INFO, "demux");
+            let _demux_entered = demux_span.enter();
             Self::packet_demux_process(
                 audio_stream_index,
                 video_stream_index,
@@ -701,6 +706,7 @@ impl TinyDecoder {
                 cov_stream_index,
                 cover_pic_data,
             )
+            .in_current_span()
             .await;
         }));
 
@@ -717,6 +723,8 @@ impl TinyDecoder {
         let video_time_base = self.video_time_base;
         let video_frame_rect = self.video_frame_rect;
         self.decode_task_handle = Some(self.runtime_handle.spawn(async move {
+            let demux_span = span!(Level::INFO, "decode");
+            let _demux_entered = demux_span.enter();
             Self::frame_decode_process(
                 decode_exit_flag,
                 audio_decoder,
@@ -730,6 +738,7 @@ impl TinyDecoder {
                 video_time_base,
                 video_frame_rect,
             )
+            .in_current_span()
             .await;
         }));
     }
@@ -760,7 +769,7 @@ impl TinyDecoder {
                                         return Some(res);
                                     }
                                 } else {
-                                    warn!("resample err{}", r);
+                                    info!("resample err{}", r);
                                 }
                             }
                         }
@@ -785,7 +794,7 @@ impl TinyDecoder {
                 if let Some(v_frame_vec) = &mut *v_frame_vec {
                     if !v_frame_vec.is_empty() {
                         if let Some(raw_frame) = v_frame_vec.pop_front() {
-                            // warn!("raw frame pts{}", raw_frame.pts().unwrap());
+                            // info!("raw frame pts{}", raw_frame.pts().unwrap());
 
                             if converter_ctx.run(&raw_frame, &mut res).is_ok() {
                                 if let Some(pts) = raw_frame.pts() {
@@ -869,7 +878,7 @@ impl TinyDecoder {
                 }
             };
             unsafe {
-                warn!("seek timestamp:{}", ts);
+                info!("seek timestamp:{}", ts);
                 if let Some(input) = &mut *input {
                     let res = ffmpeg_the_third::ffi::avformat_seek_file(
                         input.0.as_mut_ptr(),
@@ -882,7 +891,7 @@ impl TinyDecoder {
                         AVSEEK_FLAG_BACKWARD,
                     );
                     if res != 0 {
-                        warn!("seek err num:{res}");
+                        info!("seek err num:{res}");
                     }
                 }
             }
@@ -905,7 +914,7 @@ impl TinyDecoder {
         let min = (min_num % 60) as u8;
         let hour_num = min_num / 60;
         let hour = hour_num as u8;
-        warn!("hour{},min{},sec{}", hour, min, sec);
+        info!("hour{},min{},sec{}", hour, min, sec);
         if let Ok(time) = time::Time::from_hms(hour, min, sec) {
             if let Ok(formatter) = format_description::parse("[hour]:[minute]:[second]") {
                 if let Ok(s) = time.format(&formatter) {
@@ -913,7 +922,7 @@ impl TinyDecoder {
                 }
             }
         } else {
-            warn!("end_time_err");
+            info!("end_time_err");
         }
     }
     /// give an Arc of cover_pic_data out  
@@ -938,13 +947,13 @@ impl TinyDecoder {
         *self.demux_exit_flag.write().await = true;
         if let Some(handle) = &mut self.demux_task_handle {
             if handle.await.is_ok() {
-                warn!("demux thread join success");
+                info!("demux thread join success");
             }
         }
         *self.decode_exit_flag.write().await = true;
         if let Some(handle) = &mut self.decode_task_handle {
             if handle.await.is_ok() {
-                warn!("decode thread join success");
+                info!("decode thread join success");
             }
         }
     }

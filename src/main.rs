@@ -17,7 +17,9 @@ use eframe::{
     wgpu::{Backends, InstanceDescriptor},
 };
 use egui::{IconData, ImageSource, Vec2, include_image};
-use log::{Level, warn};
+
+use tracing::{Level, info, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod ai_sub_title;
 mod appui;
@@ -28,9 +30,10 @@ mod decode;
 const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
 static CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf>> = LazyLock::new(|| {
     if let Ok(path) = std::env::current_exe() {
-        return Ok(path);
+        Ok(path)
+    } else {
+        Err(PlayerError::Internal("exe path get err".to_string()))
     }
-    Err(PlayerError::Internal("can not find exe path!".to_string()))
 });
 #[derive(Debug, Clone)]
 pub enum PlayerError {
@@ -47,13 +50,20 @@ impl Display for PlayerError {
 }
 impl Error for PlayerError {}
 pub type PlayerResult<T> = std::result::Result<T, PlayerError>;
-
+// static CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf> =
+//     LazyLock;
 /// main fun init log, init main ui type Appui
 fn main() {
-    if simple_logger::init_with_level(Level::Warn).is_ok() {
-        warn!("logger init success\napp banner!!====================");
-    }
-
+    let targets_filter = tracing_subscriber::filter::Targets::default()
+        .with_default(Level::WARN)
+        .with_target("tiny_player", Level::INFO);
+    let subscriber = tracing_subscriber::registry::Registry::default()
+        .with(tracing_subscriber::fmt::layer())
+        .with(targets_filter);
+    subscriber.init();
+    let span = tracing::span!(Level::INFO, "main");
+    let _main_entered = span.enter();
+    info!("enter main span");
     if let Ok(tiny_app_ui) = appui::AppUi::new() {
         let mut options = eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,

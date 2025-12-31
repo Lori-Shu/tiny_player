@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use log::warn;
+use tracing::warn;
 
 pub struct AudioPlayer {
     sink: Option<rodio::Sink>,
@@ -18,7 +18,7 @@ impl AudioPlayer {
                 pts_vec: VecDeque::new(),
             }
         } else {
-            warn!("rodio  open stream err");
+            warn!("rodio open stream err");
             Self {
                 sink: None,
                 _stream: None,

@@ -11,9 +11,9 @@ use egui::{
 };
 
 use image::DynamicImage;
-use log::warn;
-use time::format_description;
+
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 use crate::{
     PlayerError, PlayerResult,
@@ -43,25 +43,23 @@ static THEME_COLOR: LazyLock<Color32> = LazyLock::new(|| {
 struct PlayerTextButton {
     text: String,
     font_size: f32,
+    frame: bool,
 }
 impl PlayerTextButton {
-    pub fn new(text: String, font_size: f32) -> Self {
-        Self { text, font_size }
+    pub fn new(text: impl Into<String>, font_size: f32, frame: bool) -> Self {
+        Self {
+            text: text.into(),
+            font_size,
+            frame,
+        }
     }
 }
 impl Widget for PlayerTextButton {
     fn ui(self, ui: &mut Ui) -> egui::Response {
-        let mut orange_color = Color32::ORANGE.to_srgba_unmultiplied();
-        orange_color[3] = 100;
         let btn_text = RichText::new(&self.text)
-            .color(Color32::from_rgba_unmultiplied(
-                orange_color[0],
-                orange_color[1],
-                orange_color[2],
-                orange_color[3],
-            ))
+            .color(*THEME_COLOR)
             .size(self.font_size);
-        let open_btn = egui::Button::new(btn_text).frame(false);
+        let open_btn = egui::Button::new(btn_text).frame(self.frame);
         ui.add(open_btn)
     }
 }
@@ -338,14 +336,16 @@ impl AppUi {
             let min = (min_num % 60) as u8;
             let hour_num = min_num / 60;
             let hour = hour_num as u8;
-            if let Ok(time) = time::Time::from_hms(hour, min, sec) {
-                if !time.eq(&self.play_time) {
-                    if let Ok(formatter) = format_description::parse("[hour]:[minute]:[second]") {
-                        if let Ok(mut now_str) = time.format(&formatter) {
+            if let Ok(cur_time) = time::Time::from_hms(hour, min, sec) {
+                if !cur_time.eq(&self.play_time) {
+                    if let Ok(formatter) =
+                        time::format_description::parse("[hour]:[minute]:[second]")
+                    {
+                        if let Ok(mut now_str) = cur_time.format(&formatter) {
                             now_str.push('|');
                             now_str.push_str(tiny_decoder.end_time_formatted_string());
                             self.time_text = now_str;
-                            self.play_time = time;
+                            self.play_time = cur_time;
                         }
                     }
                 }
@@ -521,15 +521,22 @@ impl AppUi {
                 let mut timestamp = self
                     .async_ctx
                     .exec_normal_task(async { self.main_stream_current_timestamp.write().await });
+                let mut slider_color = THEME_COLOR.to_srgba_unmultiplied();
+                slider_color[3] = 100;
                 let progress_slider = egui::Slider::new(&mut *timestamp, 0..=tiny_decoder.end_ts())
                     .show_value(false)
                     .text(WidgetText::RichText(Arc::new(
-                        RichText::new(self.time_text.clone())
-                            .size(20.0)
-                            .color(Color32::ORANGE),
+                        RichText::new(self.time_text.clone()).size(20.0).color(
+                            Color32::from_rgba_unmultiplied(
+                                slider_color[0],
+                                slider_color[1],
+                                slider_color[2],
+                                slider_color[3],
+                            ),
+                        ),
                     )));
                 let mut slider_width_style = egui::style::Style::default();
-                slider_width_style.spacing.slider_width = ctx.content_rect().width() - 400.0;
+                slider_width_style.spacing.slider_width = ctx.content_rect().width() - 450.0;
                 slider_width_style.spacing.slider_rail_height = 10.0;
                 slider_width_style.spacing.interact_size = Vec2::new(20.0, 20.0);
                 slider_width_style.visuals.extreme_bg_color =
@@ -556,11 +563,13 @@ impl AppUi {
                     self.current_video_frame = None;
                 }
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-                    let rich_text = egui::RichText::new("subtitle")
-                        .color(Color32::ORANGE)
-                        .size(10.0);
-                    let subtitle_btn = egui::Button::new(rich_text).frame(false);
+                    let subtitle_btn = PlayerTextButton::new("AI ST", 20.0, true);
+                    let be_op = ui.opacity();
+                    if be_op != 0.0 {
+                        ui.set_opacity(0.3);
+                    }
                     let btn_response = ui.add(subtitle_btn);
+                    ui.set_opacity(be_op);
                     if btn_response.hovered() {
                         self.ui_flags.control_ui_flag = true;
                         self.last_show_control_ui_instant = *now;
@@ -649,8 +658,6 @@ impl AppUi {
                 .exec_normal_task(tiny_decoder.is_input_exist())
             {
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-                    let be_opacity = ui.opacity();
-                    ui.set_opacity(1.0);
                     let subtitle = self.async_ctx.exec_normal_task(self.subtitle.read());
 
                     let sub_text = {
@@ -679,6 +686,8 @@ impl AppUi {
                             .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0))
                     };
                     let subtitle_text_button = egui::Button::new(sub_text).frame(false);
+                    let be_opacity = ui.opacity();
+                    ui.set_opacity(1.0);
                     ui.add(subtitle_text_button);
                     ui.set_opacity(be_opacity);
                 });
@@ -820,13 +829,13 @@ impl AppUi {
                             for i in &*videos {
                                 ui.vertical_centered_justified(|ui| {
                                     let player_text_button =
-                                        PlayerTextButton::new(i.name.clone(), 20.0);
+                                        PlayerTextButton::new(i.name.clone(), 20.0, true);
                                     if ui.add(player_text_button).clicked() {
                                         if self
                                             .change_format_input(&PathBuf::from(&i.path), now)
                                             .is_ok()
                                         {
-                                            warn!("change_format_input success");
+                                            info!("change_format_input success");
                                         }
                                     }
                                 });
@@ -1040,18 +1049,15 @@ impl AppUi {
         });
     }
     fn paint_playlist_button(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
-        let mut orange_color = Color32::ORANGE.to_srgba_unmultiplied();
-        orange_color[3] = 100;
-        let btn_text = RichText::new("playlist")
-            .color(Color32::from_rgba_unmultiplied(
-                orange_color[0],
-                orange_color[1],
-                orange_color[2],
-                orange_color[3],
-            ))
-            .size(30.0);
-        let open_btn = egui::Button::new(btn_text).frame(false);
+        let btn_text = RichText::new("playlist").color(*THEME_COLOR).size(30.0);
+        let open_btn = egui::Button::new(btn_text);
+        let be_op = ui.opacity();
+        if be_op != 0.0 {
+            ui.set_opacity(0.3);
+        }
         let btn_response = ui.add(open_btn);
+        ui.set_opacity(be_op);
+
         if btn_response.hovered() {
             self.ui_flags.control_ui_flag = true;
             self.last_show_control_ui_instant = *now;

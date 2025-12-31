@@ -1,8 +1,9 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use ffmpeg_the_third::{ChannelLayout, format::Sample, frame::Audio};
-use log::warn;
+
 use tokio::sync::RwLock;
+use tracing::warn;
 use vosk::{DecodingState, Model, Recognizer};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, decode::ManualProtectedResampler};
