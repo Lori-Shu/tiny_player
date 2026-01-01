@@ -1,33 +1,115 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use tracing::warn;
+use rodio::Sink;
+use tokio::{runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
+use tracing::{Instrument, Level, span};
+
+use crate::{
+    PlayerError, PlayerResult,
+    ai_sub_title::{AISubTitle, UsedModel},
+    decode::{MainStream, TinyDecoder},
+};
 
 pub struct AudioPlayer {
-    sink: Option<rodio::Sink>,
-    _stream: Option<rodio::OutputStream>,
+    sink: Arc<RwLock<rodio::Sink>>,
+    _stream: rodio::OutputStream,
     current_volumn: f32,
-    pts_vec: VecDeque<i64>,
+    pts_que: Arc<RwLock<VecDeque<i64>>>,
+    runtime_handle: Handle,
+    _play_task_thread_handle: JoinHandle<()>,
 }
 impl AudioPlayer {
-    pub fn new() -> Self {
-        if let Ok(stream) = rodio::OutputStreamBuilder::open_default_stream() {
-            Self {
-                sink: Some(rodio::Sink::connect_new(stream.mixer())),
-                _stream: Some(stream),
-                current_volumn: 1.0,
-                pts_vec: VecDeque::new(),
-            }
-        } else {
-            warn!("rodio open stream err");
-            Self {
-                sink: None,
-                _stream: None,
-                current_volumn: 1.0,
-                pts_vec: VecDeque::new(),
+    pub fn new(
+        runtime_handle: Handle,
+        tiny_decoder: Arc<RwLock<TinyDecoder>>,
+        used_model: Arc<RwLock<UsedModel>>,
+        ai_subtitle: Arc<RwLock<AISubTitle>>,
+    ) -> PlayerResult<Self> {
+        let stream = rodio::OutputStreamBuilder::open_default_stream()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+        let sink = Arc::new(RwLock::new(rodio::Sink::connect_new(stream.mixer())));
+        let pts_que = Arc::new(RwLock::new(VecDeque::new()));
+        let to_move_sink = sink.clone();
+        let to_move_pts_que = pts_que.clone();
+        let play_task_thread_handle = runtime_handle.spawn(async move {
+            let audio_play_span = span!(Level::INFO, "audio play");
+            let _enter = audio_play_span.enter();
+            AudioPlayer::play_task(
+                tiny_decoder,
+                to_move_sink,
+                to_move_pts_que,
+                used_model,
+                ai_subtitle,
+            )
+            .in_current_span()
+            .await
+        });
+        Ok(Self {
+            sink,
+            _stream: stream,
+            current_volumn: 1.0,
+            pts_que,
+            runtime_handle,
+            _play_task_thread_handle: play_task_thread_handle,
+        })
+    }
+    async fn play_task(
+        tiny_decoder: Arc<RwLock<TinyDecoder>>,
+        sink: Arc<RwLock<Sink>>,
+        pts_que: Arc<RwLock<VecDeque<i64>>>,
+        used_model: Arc<RwLock<UsedModel>>,
+        ai_subtitle: Arc<RwLock<AISubTitle>>,
+    ) {
+        loop {
+            sleep(Duration::from_millis(1)).await;
+            /*
+            add audio frame data to the audio player
+             */
+            {
+                let mut tiny_decoder = tiny_decoder.write().await;
+                let sink = sink.read().await;
+                if let MainStream::Audio = tiny_decoder.main_stream() {
+                    if sink.len() < 10 {
+                        if let Some(audio_frame) = tiny_decoder.pull_one_audio_play_frame().await {
+                            let mut pts_que = pts_que.write().await;
+                            if let Some(pts) = audio_frame.pts() {
+                                if pts_que.len() > 10 {
+                                    pts_que.pop_front();
+                                }
+                                pts_que.push_back(pts);
+                                AudioPlayer::play_raw_data_from_audio_frame(
+                                    &sink,
+                                    audio_frame.clone(),
+                                )
+                                .await;
+                                let used_model = used_model.read().await;
+                                let used_model_ref = &*used_model;
+                                if let UsedModel::Chinese = used_model_ref {
+                                    AISubTitle::push_frame_data(
+                                        ai_subtitle.clone(),
+                                        audio_frame,
+                                        UsedModel::Chinese,
+                                    )
+                                    .await;
+                                } else if let UsedModel::English = used_model_ref {
+                                    AISubTitle::push_frame_data(
+                                        ai_subtitle.clone(),
+                                        audio_frame,
+                                        UsedModel::English,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    pub fn play_raw_data_from_audio_frame(&self, audio_frame: ffmpeg_the_third::frame::Audio) {
+    async fn play_raw_data_from_audio_frame(
+        sink: &Sink,
+        audio_frame: ffmpeg_the_third::frame::Audio,
+    ) {
         let audio_data = bytemuck::cast_slice::<u8, f32>(audio_frame.data(0));
         let audio_data =
             &audio_data[0..audio_frame.samples() * audio_frame.ch_layout().channels() as usize];
@@ -36,53 +118,46 @@ impl AudioPlayer {
             audio_frame.rate(),
             audio_data,
         );
-        if let Some(sink) = &self.sink {
-            sink.append(source);
-        }
+        sink.append(source);
     }
 
     pub fn change_volumn(&mut self, volumn: f32) {
-        if let Some(sink) = &self.sink {
-            sink.set_volume(volumn);
-            self.current_volumn = volumn;
-        }
+        let sink = self.sink.clone();
+        let sink = self.runtime_handle.block_on(sink.read());
+        sink.set_volume(volumn);
+        self.current_volumn = volumn;
     }
     pub fn source_queue_skip_to_end(&mut self) {
-        if let Some(sink) = &self.sink {
-            sink.clear();
-            self.pts_vec.clear();
-            sink.play();
-        }
+        let sink = self.sink.clone();
+        let sink = self.runtime_handle.block_on(sink.read());
+        let pts_que = self.pts_que.clone();
+        let mut pts_que = self.runtime_handle.block_on(pts_que.write());
+        sink.clear();
+        pts_que.clear();
     }
-    pub fn pause_play(&self) {
-        if let Some(sink) = &self.sink {
-            sink.pause();
-        }
+    pub fn pause(&self) {
+        let sink = self.sink.clone();
+        let sink = self.runtime_handle.block_on(sink.read());
+        sink.pause();
     }
-    pub fn continue_play(&self) {
-        if let Some(sink) = &self.sink {
-            sink.play();
-        }
+    pub fn play(&self) {
+        let sink = self.sink.clone();
+        let sink = self.runtime_handle.block_on(sink.read());
+        sink.play();
     }
-    pub fn push_pts(&mut self, pts: i64) {
-        if self.pts_vec.len() > 30 {
-            self.pts_vec.pop_front();
-        }
-        self.pts_vec.push_back(pts);
-    }
-    pub fn last_source_pts(&self) -> Result<i64, String> {
-        if !self.pts_vec.is_empty() {
-            Ok(self.pts_vec[self.pts_vec.len() - 1])
+    pub fn last_source_pts(&self) -> PlayerResult<i64> {
+        let pts_que = self.pts_que.clone();
+        let pts_que = self.runtime_handle.block_on(pts_que.read());
+        if !pts_que.is_empty() {
+            Ok(pts_que[pts_que.len() - 1])
         } else {
-            Err("audio source len is 0".to_string())
+            Err(PlayerError::Internal("audio source len is 0".to_string()))
         }
     }
-    pub fn len(&self) -> usize {
-        if let Some(sink) = &self.sink {
-            sink.len()
-        } else {
-            0
-        }
+    pub fn _len(&self) -> usize {
+        let sink = self.sink.clone();
+        let sink = self.runtime_handle.block_on(sink.read());
+        sink.len()
     }
     pub fn current_volumn(&self) -> &f32 {
         &self.current_volumn

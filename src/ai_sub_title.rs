@@ -1,9 +1,17 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, ptr::null_mut, sync::Arc};
 
-use ffmpeg_the_third::{ChannelLayout, format::Sample, frame::Audio};
+use ffmpeg_the_third::{
+    ChannelLayout,
+    ffi::{
+        AV_CHANNEL_LAYOUT_MONO, AV_CHANNEL_LAYOUT_STEREO, swr_alloc_set_opts2, swr_convert_frame,
+        swr_free, swr_init,
+    },
+    format::sample::Type,
+    frame::Audio,
+};
 
-use tokio::sync::RwLock;
-use tracing::warn;
+use tokio::{runtime::Handle, sync::RwLock};
+use tracing::{info, warn};
 use vosk::{DecodingState, Model, Recognizer};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, decode::ManualProtectedResampler};
@@ -21,9 +29,10 @@ pub struct AISubTitle {
     source_buffer: VecDeque<i16>,
     generated_str: String,
     subtitle_source_resampler: Arc<RwLock<ManualProtectedResampler>>,
+    runtime_handle: Handle,
 }
 impl AISubTitle {
-    pub fn new() -> PlayerResult<Self> {
+    pub fn new(runtime_handle: Handle) -> PlayerResult<Self> {
         let current_exe_path = CURRENT_EXE_PATH.as_ref().map_err(|e| e.clone())?;
         if let Some(folder_path) = current_exe_path.parent() {
             let chinese_model_path = folder_path.join("model/vosk-model-small-cn-0.22");
@@ -43,29 +52,41 @@ impl AISubTitle {
                                     en_rez.set_max_alternatives(0);
                                     en_rez.set_partial_words(true);
                                     en_rez.set_nlsml(true);
-                                    let resampler = ffmpeg_the_third::software::resampler2(
-                            (
-                                Sample::F32(ffmpeg_the_third::util::format::sample::Type::Packed),
-                                ChannelLayout::STEREO,
-                                48000,
-                            ),
-                            (
-                                Sample::I16(ffmpeg_the_third::util::format::sample::Type::Packed),
-                                ChannelLayout::MONO,
-                                16000,
-                            ),
-                        ).map_err(|e|PlayerError::Internal(e.to_string()))?;
-                                    return Ok(Self {
-                                        _chinese_recognize_model: cn_recognize_model,
-                                        _english_recognize_model: en_recognize_model,
-                                        cn_recognizer: cn_rez,
-                                        en_recognizer: en_rez,
-                                        source_buffer: VecDeque::new(),
-                                        generated_str: String::new(),
-                                        subtitle_source_resampler: Arc::new(RwLock::new(
-                                            ManualProtectedResampler(resampler),
-                                        )),
-                                    });
+
+                                    unsafe {
+                                        let mut swr_ctx = null_mut();
+                                        let r = swr_alloc_set_opts2(
+                                        &mut swr_ctx,
+                                        &AV_CHANNEL_LAYOUT_MONO,
+                                        ffmpeg_the_third::ffi::AVSampleFormat::AV_SAMPLE_FMT_S16,
+                                        16000,
+                                        &AV_CHANNEL_LAYOUT_STEREO,
+                                        ffmpeg_the_third::ffi::AVSampleFormat::AV_SAMPLE_FMT_FLT,
+                                        48000,
+                                        0,
+                                        null_mut(),
+                                        );
+                                        if r < 0 {
+                                            info!("swr ctx create err");
+                                        }
+                                        let r = swr_init(swr_ctx);
+                                        if r < 0 {
+                                            info!("swr init err");
+                                        }
+
+                                        return Ok(Self {
+                                            _chinese_recognize_model: cn_recognize_model,
+                                            _english_recognize_model: en_recognize_model,
+                                            cn_recognizer: cn_rez,
+                                            en_recognizer: en_rez,
+                                            source_buffer: VecDeque::new(),
+                                            generated_str: String::new(),
+                                            subtitle_source_resampler: Arc::new(RwLock::new(
+                                                ManualProtectedResampler(swr_ctx),
+                                            )),
+                                            runtime_handle,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -85,13 +106,17 @@ impl AISubTitle {
     ) {
         let mut sub_title = ai_subtitle.write().await;
         let mut to_recognize_frame = Audio::empty();
-        {
-            let mut resampler = sub_title.subtitle_source_resampler.write().await;
-            if resampler
-                .0
-                .run(&audio_frame, &mut to_recognize_frame)
-                .is_err()
-            {
+        to_recognize_frame.set_format(ffmpeg_the_third::format::Sample::I16(Type::Packed));
+        to_recognize_frame.set_ch_layout(ChannelLayout::MONO);
+        to_recognize_frame.set_rate(16000);
+        unsafe {
+            let resampler = sub_title.subtitle_source_resampler.read().await;
+
+            if 0 > swr_convert_frame(
+                resampler.0,
+                to_recognize_frame.as_mut_ptr(),
+                audio_frame.as_ptr(),
+            ) {
                 warn!("subtitle frame convert err!");
             }
         }
@@ -138,5 +163,14 @@ impl AISubTitle {
     }
     pub fn generated_str(&self) -> &str {
         &self.generated_str
+    }
+}
+impl Drop for AISubTitle {
+    fn drop(&mut self) {
+        let resampler = self.subtitle_source_resampler.clone();
+        let mut resampler = self.runtime_handle.block_on(resampler.write());
+        unsafe {
+            swr_free(&mut resampler.0);
+        }
     }
 }

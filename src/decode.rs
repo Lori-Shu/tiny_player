@@ -18,7 +18,7 @@ use ffmpeg_the_third::{
     filter::Graph,
     format::{Pixel, sample::Type, stream::Disposition},
     frame::Video,
-    software::{resampling, scaling},
+    software::scaling,
 };
 
 use time::format_description;
@@ -47,7 +47,8 @@ unsafe impl Sync for ManualProtectedAudioDecoder {}
 /// this wrapper type should be protected manually to
 /// keep memory safe in multi threads
 /// means need to wrap an Arc and a Lock to use it in multi threads
-pub struct ManualProtectedResampler(pub resampling::Context);
+pub struct ManualProtectedResampler(pub *mut SwrContext);
+unsafe impl Send for ManualProtectedResampler {}
 unsafe impl Sync for ManualProtectedResampler {}
 /// this wrapper type should be protected manually to
 /// keep memory safe in multi threads
@@ -78,8 +79,8 @@ pub struct TinyDecoder {
     format_input: Arc<RwLock<Option<ManualProtectedInput>>>,
     video_decoder: Arc<RwLock<Option<ManualProtectedVideoDecoder>>>,
     audio_decoder: Arc<RwLock<Option<ManualProtectedAudioDecoder>>>,
-    converter_ctx: Option<ffmpeg_the_third::software::scaling::Context>,
-    resampler_ctx: Option<*mut SwrContext>,
+    converter_ctx: Option<ManualProtectedConverter>,
+    resampler_ctx: Option<ManualProtectedResampler>,
     video_frame_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::frame::Video>>>>,
     audio_frame_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::frame::Audio>>>>,
     audio_packet_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>>,
@@ -250,7 +251,7 @@ impl TinyDecoder {
                 Pixel::RGBA,
             )
             .map_err(|e| PlayerError::Internal(e.to_string()))?;
-            self.converter_ctx = Some(converter);
+            self.converter_ctx = Some(ManualProtectedConverter(converter));
 
             info!("video decode format{:#?}", video_decoder.format());
             self.video_frame_rect = [video_decoder.width(), video_decoder.height()];
@@ -289,7 +290,7 @@ impl TinyDecoder {
                 if r < 0 {
                     info!("swr init err");
                 }
-                self.resampler_ctx = Some(swr_ctx);
+                self.resampler_ctx = Some(ManualProtectedResampler(swr_ctx));
             }
 
             let mut a_decoder = self.audio_decoder.write().await;
@@ -758,7 +759,7 @@ impl TinyDecoder {
                         if let Some(raw_frame) = a_frame_vec.pop_front() {
                             unsafe {
                                 let r = swr_convert_frame(
-                                    *resampler_ctx,
+                                    resampler_ctx.0,
                                     res.as_mut_ptr(),
                                     raw_frame.as_ptr(),
                                 );
@@ -796,7 +797,7 @@ impl TinyDecoder {
                         if let Some(raw_frame) = v_frame_vec.pop_front() {
                             // info!("raw frame pts{}", raw_frame.pts().unwrap());
 
-                            if converter_ctx.run(&raw_frame, &mut res).is_ok() {
+                            if converter_ctx.0.run(&raw_frame, &mut res).is_ok() {
                                 if let Some(pts) = raw_frame.pts() {
                                     res.set_pts(Some(pts));
                                 }
@@ -828,7 +829,7 @@ impl TinyDecoder {
     }
     /// get the end audio timestamp used as the main time flow
     /// it is more accurate than just use time second
-    pub fn end_ts(&mut self) -> i64 {
+    pub fn end_ts(&self) -> i64 {
         self.end_timestamp
     }
     /// seek the input to a selected timestamp
@@ -1021,13 +1022,9 @@ impl TinyDecoder {
 impl Drop for TinyDecoder {
     /// handle some struct that have to be free manually
     fn drop(&mut self) {
-        if self.demux_task_handle.is_some() {
-            let runtime_handle = self.runtime_handle.clone();
-            runtime_handle.block_on(self.stop_demux_and_decode());
-        }
         if let Some(ctx) = &mut self.resampler_ctx {
             unsafe {
-                swr_free(ctx);
+                swr_free(&mut ctx.0);
             }
         }
     }
