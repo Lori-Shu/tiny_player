@@ -20,6 +20,7 @@ use crate::{
     ai_sub_title::{AISubTitle, UsedModel},
     async_context::{AsyncContext, VideoDes},
     decode::{MainStream, TinyDecoder},
+    present_data_manage::PresentDataManager,
 };
 
 const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
@@ -65,7 +66,7 @@ impl Widget for PlayerTextButton {
 }
 /// the main struct stores all the vars which are related to ui
 struct UiFlags {
-    pause_flag: bool,
+    pause_flag: Arc<RwLock<bool>>,
     fullscreen_flag: bool,
     control_ui_flag: bool,
     err_window_flag: bool,
@@ -76,10 +77,11 @@ struct UiFlags {
 
 pub struct AppUi {
     video_texture_handle: Option<TextureHandle>,
-    audio_player: crate::audio_play::AudioPlayer,
     tiny_decoder: Arc<RwLock<crate::decode::TinyDecoder>>,
+    audio_player: crate::audio_play::AudioPlayer,
+    _present_data_manager: PresentDataManager,
     main_stream_current_timestamp: Arc<RwLock<i64>>,
-    main_color_image: Option<ColorImage>,
+    main_color_image: ColorImage,
     bg_dyn_img: DynamicImage,
     frame_show_instant: Instant,
     ui_flags: UiFlags,
@@ -88,7 +90,7 @@ pub struct AppUi {
     err_window_msg: String,
     last_show_control_ui_instant: Instant,
     app_start_instant: Instant,
-    current_video_frame: Option<ffmpeg_the_third::frame::Video>,
+    current_video_frame: Arc<RwLock<Option<ffmpeg_the_third::frame::Video>>>,
     async_ctx: AsyncContext,
     opened_file: Option<std::path::PathBuf>,
     open_file_dialog: Option<egui_file::FileDialog>,
@@ -119,24 +121,22 @@ impl eframe::App for AppUi {
                         .async_ctx
                         .exec_normal_task(tiny_decoder.is_input_exist())
                     {
-                        if !self.ui_flags.pause_flag {
+                        let pause_flag = self.ui_flags.pause_flag.clone();
+                        if !*self.async_ctx.exec_normal_task(pause_flag.read()) {
                             /*
                             if now is next_frame_time or a little beyond get and show a new frame
                              */
-                            if let Ok(_keepawake) = keepawake::Builder::default()
+                            if keepawake::Builder::default()
                                 .display(true)
                                 .idle(true)
                                 .app_name("tiny_player")
                                 .reason("video play")
                                 .create()
+                                .is_err()
                             {
-                                self.data_manage_and_sync(&mut *tiny_decoder, now);
+                                warn!("keep awake err");
                             }
-                        } else {
-                            /*
-                            player paused
-                             */
-                            self.frame_show_instant = now;
+                            self.copy_video_data_to_img(&mut *tiny_decoder);
                         }
                     }
                 }
@@ -242,23 +242,32 @@ impl AppUi {
         let tiny_decoder = Arc::new(RwLock::new(tiny_decoder));
         let used_model = Arc::new(RwLock::new(UsedModel::Empty));
         let subtitle = Arc::new(RwLock::new(AISubTitle::new(rt.clone())?));
-        let audio_player = crate::audio_play::AudioPlayer::new(
+        let audio_player = crate::audio_play::AudioPlayer::new(rt.clone())?;
+        let current_video_frame = Arc::new(RwLock::new(None));
+        let main_stream_current_timestamp = Arc::new(RwLock::new(0));
+        let pause_flag = Arc::new(RwLock::new(true));
+        let _present_data_manager = PresentDataManager::new(
             rt,
             tiny_decoder.clone(),
             used_model.clone(),
             subtitle.clone(),
-        )?;
-
+            current_video_frame.clone(),
+            audio_player.sink(),
+            audio_player.pts_que(),
+            main_stream_current_timestamp.clone(),
+            pause_flag.clone(),
+        );
         Ok(Self {
             video_texture_handle: None,
             tiny_decoder,
             audio_player,
-            main_stream_current_timestamp: Arc::new(RwLock::new(0)),
+            _present_data_manager,
+            main_stream_current_timestamp,
             play_time,
-            main_color_image: Some(color_image),
+            main_color_image: color_image,
             frame_show_instant: Instant::now(),
             ui_flags: UiFlags {
-                pause_flag: true,
+                pause_flag,
                 fullscreen_flag: false,
                 control_ui_flag: true,
                 err_window_flag: false,
@@ -274,7 +283,7 @@ impl AppUi {
 
             last_show_control_ui_instant: Instant::now(),
             app_start_instant: Instant::now(),
-            current_video_frame: None,
+            current_video_frame,
             async_ctx,
             opened_file: None,
             open_file_dialog: Some(f_dialog),
@@ -356,31 +365,20 @@ impl AppUi {
             [frame_rect[0] as usize, frame_rect[1] as usize],
             Color32::from_rgba_unmultiplied(0, 0, 0, 255),
         );
-        if let Some(img) = &mut self.main_color_image {
-            *img = color_image;
-        }
+
+        self.main_color_image = color_image;
     }
     fn load_video_texture(&mut self, ctx: &egui::Context) {
         /*
         从image背景图加载视频显示用texture
          */
-        if let Some(main_color_image) = &self.main_color_image {
-            let t = ctx.load_texture(
-                "video_texture",
-                ImageData::Color(Arc::new(main_color_image.clone())),
-                TextureOptions::LINEAR,
-            );
-            self.video_texture_handle = Some(t);
-        }
-    }
-
-    fn update_current_timestamp(&mut self) {
-        /*
-        add audio frame data to the audio player
-         */
-        if let Ok(pts) = self.audio_player.last_source_pts() {
-            self.set_current_play_pts(pts);
-        }
+        let main_color_image = &self.main_color_image;
+        let t = ctx.load_texture(
+            "video_texture",
+            ImageData::Color(Arc::new(main_color_image.clone())),
+            TextureOptions::LINEAR,
+        );
+        self.video_texture_handle = Some(t);
     }
 
     fn paint_file_btn(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
@@ -443,7 +441,9 @@ impl AppUi {
             .async_ctx
             .exec_normal_task(tiny_decoder.is_input_exist())
         {
-            let play_or_pause_image_source = if self.ui_flags.pause_flag {
+            let pause_flag = self.ui_flags.pause_flag.clone();
+            let play_or_pause_image_source = if *self.async_ctx.exec_normal_task(pause_flag.read())
+            {
                 PLAY_IMG
             } else {
                 PAUSE_IMG
@@ -462,9 +462,11 @@ impl AppUi {
                 self.last_show_control_ui_instant = *now;
             }
             if btn_response.clicked() || ctx.input(|s| s.key_released(egui::Key::Space)) {
-                self.ui_flags.pause_flag = !self.ui_flags.pause_flag;
+                let pause_flag = self.ui_flags.pause_flag.clone();
+                let mut pause_flag = self.async_ctx.exec_normal_task(pause_flag.write());
+                *pause_flag = !*pause_flag;
                 let audio_player = &self.audio_player;
-                if self.ui_flags.pause_flag {
+                if *pause_flag {
                     audio_player.pause();
                 } else {
                     audio_player.play();
@@ -522,11 +524,16 @@ impl AppUi {
 
                     tiny_decoder.seek_timestamp_to_decode(*timestamp);
                     audio_player.source_queue_skip_to_end();
-                    if !self.ui_flags.pause_flag {
+                    let pause_flag = self.ui_flags.pause_flag.clone();
+                    let pause_flag = self.async_ctx.exec_normal_task(pause_flag.read());
+                    if !*pause_flag {
                         audio_player.play();
                     }
                     self.frame_show_instant = *now;
-                    self.current_video_frame = None;
+                    let cur_v_frame = self.current_video_frame.clone();
+                    let mut current_video_frame =
+                        self.async_ctx.exec_normal_task(cur_v_frame.write());
+                    *current_video_frame = None;
                 }
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     let subtitle_btn = PlayerTextButton::new("AI ST", 20.0, true);
@@ -737,7 +744,7 @@ impl AppUi {
         false
     }
 
-    fn set_current_play_pts(&self, ts: i64) {
+    fn _set_current_play_pts(&self, ts: i64) {
         {
             let mut cur_pts = self
                 .async_ctx
@@ -748,34 +755,6 @@ impl AppUi {
         }
     }
     /// return true when the current video time > audio time,else return false
-    /// if video time-audio time is too high(more than 1 second),default return true
-    fn check_video_wait_for_audio(&mut self, tiny_decoder: &TinyDecoder) -> bool {
-        if let MainStream::Video = tiny_decoder.main_stream() {
-            return true;
-        }
-        if let Some(frame) = &self.current_video_frame {
-            let timestamp = self
-                .async_ctx
-                .exec_normal_task(self.main_stream_current_timestamp.read());
-            {
-                let video_time_base = tiny_decoder.video_time_base();
-                let audio_time_base = tiny_decoder.audio_time_base();
-                if let Some(f_ts) = frame.pts() {
-                    let v_time = f_ts * 1000 * video_time_base.numerator() as i64
-                        / video_time_base.denominator() as i64;
-                    let a_time = *timestamp * 1000 * audio_time_base.numerator() as i64
-                        / audio_time_base.denominator() as i64;
-                    let time_dur = v_time - a_time;
-                    if time_dur > 0 {
-                        //     warn!("wait audio v_time{},a_time{}", v_time, a_time);
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
 
     fn paint_playlist_window(&mut self, ctx: &Context, now: &Instant) {
         if self.ui_flags.playlist_window_flag {
@@ -874,8 +853,9 @@ impl AppUi {
         {
             let decoder = self.tiny_decoder.clone();
             let mut tiny_decoder = self.async_ctx.exec_normal_task(decoder.write());
-
-            self.ui_flags.pause_flag = true;
+            let pause_flag = self.ui_flags.pause_flag.clone();
+            let mut pause_flag = self.async_ctx.exec_normal_task(pause_flag.write());
+            *pause_flag = true;
             self.async_ctx.exec_normal_task(async {
                 if tiny_decoder.set_file_path_and_init_par(path).await.is_ok() {
                     warn!("reset file path success!");
@@ -894,111 +874,34 @@ impl AppUi {
                 *mutex_guard = 0;
             }
         });
-
-        self.current_video_frame = None;
+        let current_video_frame = self.current_video_frame.clone();
+        let mut current_video_frame = self.async_ctx.exec_normal_task(current_video_frame.write());
+        *current_video_frame = None;
         self.frame_show_instant = *now;
 
         Ok(())
     }
 
-    fn data_manage_and_sync(&mut self, tiny_decoder: &mut TinyDecoder, now: Instant) {
-        //     let audio_source_add_fu = self.audio_source_add();
-        self.update_current_timestamp();
-        if now
-            .checked_duration_since(self.frame_show_instant)
-            .is_some()
-        {
-            let video_exist = {
-                let v_stream_idx = tiny_decoder.video_stream_idx();
-                let video_stream_idx = self.async_ctx.exec_normal_task(v_stream_idx.read());
-                !*video_stream_idx == usize::MAX
-            };
-            if video_exist {
-                if self.check_video_wait_for_audio(tiny_decoder) {
-                    if let Some(v_frame) = self
-                        .async_ctx
-                        .exec_normal_task(tiny_decoder.pull_one_video_play_frame())
-                    {
-                        if self.current_video_frame.is_some() {
-                            let cur_mainstream_ts = self
-                                .async_ctx
-                                .exec_normal_task(self.main_stream_current_timestamp.read());
-
-                            if let Some(pts) = v_frame.pts() {
-                                if let Some(current_video_frame) = &self.current_video_frame {
-                                    if let Some(cur_pts) = current_video_frame.pts() {
-                                        if let MainStream::Audio = tiny_decoder.main_stream() {
-                                            let audio_time_base = tiny_decoder.audio_time_base();
-                                            let video_time_base = tiny_decoder.video_time_base();
-                                            let a_time = *cur_mainstream_ts
-                                                * 1000
-                                                * audio_time_base.numerator() as i64
-                                                / audio_time_base.denominator() as i64;
-                                            let v_time =
-                                                cur_pts * 1000 * video_time_base.numerator() as i64
-                                                    / video_time_base.denominator() as i64;
-                                            if (a_time - v_time).abs() > 100 {
-                                                self.frame_show_instant = now;
-                                            }
-                                        }
-                                        if self.frame_show_instant != now {
-                                            let video_time_base = tiny_decoder.video_time_base();
-                                            let ts_res = (pts - cur_pts)
-                                                * 1000
-                                                * video_time_base.numerator() as i64
-                                                / video_time_base.denominator() as i64;
-
-                                            let duration = Duration::from_millis(ts_res as u64);
-
-                                            if let Some(ins) =
-                                                self.frame_show_instant.checked_add(duration)
-                                            {
-                                                if duration.as_millis() < 1000 {
-                                                    self.frame_show_instant = ins;
-                                                    // warn!("add dur{}", duration.as_millis());
-                                                } else {
-                                                    self.frame_show_instant = now;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some(c_img) = &mut self.main_color_image {
-                                if let Some(current_video_frame) = &self.current_video_frame {
-                                    c_img
-                                        .as_raw_mut()
-                                        .copy_from_slice(current_video_frame.data(0));
-                                }
-                                if let Some(v_tex) = &mut self.video_texture_handle {
-                                    v_tex.set(
-                                        ImageData::Color(Arc::new(c_img.clone())),
-                                        TextureOptions::LINEAR,
-                                    );
-                                }
-                            }
-
-                            self.current_video_frame = Some(v_frame);
-                        } else {
-                            self.current_video_frame = Some(v_frame);
-                        }
-
-                        if let MainStream::Video = tiny_decoder.main_stream() {
-                            if let Some(f) = self.current_video_frame.as_ref() {
-                                if let Some(pts) = f.pts() {
-                                    self.set_current_play_pts(pts);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    self.frame_show_instant = now;
-                }
-            }
+    fn copy_video_data_to_img(&mut self, tiny_decoder: &mut TinyDecoder) {
+        let c_img = &mut self.main_color_image;
+        let current_video_frame = self.current_video_frame.clone();
+        let current_video_frame = self.async_ctx.exec_normal_task(current_video_frame.read());
+        if let Some(current_video_frame) = &*current_video_frame {
+            c_img
+                .as_raw_mut()
+                .copy_from_slice(current_video_frame.data(0));
         }
+        if let Some(v_tex) = &mut self.video_texture_handle {
+            v_tex.set(
+                ImageData::Color(Arc::new(c_img.clone())),
+                TextureOptions::LINEAR,
+            );
+        }
+
         if self.check_play_is_at_endtail(tiny_decoder) {
-            self.ui_flags.pause_flag = true;
+            let pause_flag = self.ui_flags.pause_flag.clone();
+            let mut pause_flag = self.async_ctx.exec_normal_task(pause_flag.write());
+            *pause_flag = true;
         }
     }
     fn detect_file_drag(&mut self, ctx: &Context, now: &Instant) {

@@ -26,6 +26,7 @@ mod appui;
 mod async_context;
 mod audio_play;
 mod decode;
+mod present_data_manage;
 
 const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
 static CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf>> = LazyLock::new(|| {

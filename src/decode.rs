@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::Arc,
-    time::Duration,
 };
 
 use ffmpeg_the_third::{
@@ -22,7 +21,12 @@ use ffmpeg_the_third::{
 };
 
 use time::format_description;
-use tokio::{io::AsyncWriteExt, runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
+use tokio::{
+    io::AsyncWriteExt,
+    runtime::Handle,
+    sync::RwLock,
+    task::{JoinHandle, yield_now},
+};
 use tracing::{Instrument, Level, info, span, warn};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult};
@@ -324,7 +328,7 @@ impl TinyDecoder {
     ) {
         info!("enter demux");
         loop {
-            sleep(Duration::from_millis(1)).await;
+            yield_now().await;
             if *exit_flag.read().await {
                 break;
             }
@@ -589,7 +593,7 @@ impl TinyDecoder {
         }
         let hardware_frame_converter = Arc::new(RwLock::new(None));
         loop {
-            sleep(Duration::from_millis(1)).await;
+            yield_now().await;
             if *exit_flag.read().await {
                 break;
             }
@@ -940,7 +944,7 @@ impl TinyDecoder {
         &self.main_stream
     }
     /// read video stream index
-    pub fn video_stream_idx(&self) -> Arc<RwLock<usize>> {
+    pub fn _video_stream_idx(&self) -> Arc<RwLock<usize>> {
         self.video_stream_index.clone()
     }
     /// stop demux and decode
