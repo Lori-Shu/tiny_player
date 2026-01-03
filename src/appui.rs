@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use egui::{

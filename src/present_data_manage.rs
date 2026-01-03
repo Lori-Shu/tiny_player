@@ -6,11 +6,7 @@ use std::{
 
 use ffmpeg_the_third::frame::Video;
 use rodio::Sink;
-use tokio::{
-    runtime::Handle,
-    sync::RwLock,
-    task::{JoinHandle, yield_now},
-};
+use tokio::{runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
 
 use crate::{
     ai_sub_title::{AISubTitle, UsedModel},
@@ -58,7 +54,7 @@ impl PresentDataManager {
     ) {
         let mut change_instant = Instant::now();
         loop {
-            yield_now().await;
+            sleep(Duration::from_millis(1)).await;
             /*
             add audio frame data to the audio player
              */
