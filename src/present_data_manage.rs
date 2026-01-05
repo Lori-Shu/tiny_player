@@ -1,12 +1,16 @@
 use std::{
-    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use ffmpeg_the_third::frame::Video;
 use rodio::Sink;
-use tokio::{runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
+use tokio::{
+    runtime::Handle,
+    sync::{RwLock, watch::Receiver},
+    task::JoinHandle,
+    time::sleep,
+};
 
 use crate::{
     ai_sub_title::{AISubTitle, UsedModel},
@@ -25,15 +29,13 @@ impl PresentDataManager {
         ai_subtitle: Arc<RwLock<AISubTitle>>,
         current_video_frame: Arc<RwLock<Option<Video>>>,
         sink: Arc<Sink>,
-        pts_que: Arc<RwLock<VecDeque<i64>>>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        pause_flag: Arc<RwLock<bool>>,
+        pause_flag: Receiver<bool>,
     ) -> Self {
         Self {
             _data_thread_handle: runtime_handle.spawn(PresentDataManager::play_task(
                 tiny_decoder,
                 sink,
-                pts_que,
                 used_model,
                 ai_subtitle,
                 current_video_frame,
@@ -45,12 +47,11 @@ impl PresentDataManager {
     async fn play_task(
         tiny_decoder: Arc<RwLock<TinyDecoder>>,
         sink: Arc<Sink>,
-        pts_que: Arc<RwLock<VecDeque<i64>>>,
         used_model: Arc<RwLock<UsedModel>>,
         ai_subtitle: Arc<RwLock<AISubTitle>>,
         current_video_frame: Arc<RwLock<Option<Video>>>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        pause_flag: Arc<RwLock<bool>>,
+        pause_flag: Receiver<bool>,
     ) {
         let mut change_instant = Instant::now();
         loop {
@@ -58,51 +59,36 @@ impl PresentDataManager {
             /*
             add audio frame data to the audio player
              */
-            if !*pause_flag.read().await {
+            if !*pause_flag.borrow() {
+                let mut audio_cur_ts = None;
                 let mut tiny_decoder = tiny_decoder.write().await;
                 if let MainStream::Audio = tiny_decoder.main_stream() {
                     if sink.len() < 10 {
                         if let Some(audio_frame) = tiny_decoder.pull_one_audio_play_frame().await {
-                            let mut pts_que = pts_que.write().await;
                             if let Some(pts) = audio_frame.pts() {
-                                if pts_que.len() > 10 {
-                                    pts_que.pop_front();
-                                }
-                                pts_que.push_back(pts);
+                                audio_cur_ts = Some(pts);
                                 AudioPlayer::play_raw_data_from_audio_frame(
-                                    &*sink,
+                                    &sink,
                                     audio_frame.clone(),
                                 )
                                 .await;
                                 let used_model = used_model.read().await;
                                 let used_model_ref = &*used_model;
-                                if let UsedModel::Chinese = used_model_ref {
-                                    AISubTitle::push_frame_data(
-                                        ai_subtitle.clone(),
-                                        audio_frame,
-                                        UsedModel::Chinese,
-                                    )
+                                let mut subtitle = ai_subtitle.write().await;
+                                subtitle
+                                    .push_frame_data(audio_frame, used_model_ref.clone())
                                     .await;
-                                } else if let UsedModel::English = used_model_ref {
-                                    AISubTitle::push_frame_data(
-                                        ai_subtitle.clone(),
-                                        audio_frame,
-                                        UsedModel::English,
-                                    )
-                                    .await;
-                                }
                             }
                         }
                     }
                 }
-                if PresentDataManager::is_video_wait_for_audio(
-                    &*tiny_decoder,
+                if !PresentDataManager::is_video_wait_for_audio(
+                    &tiny_decoder,
                     main_stream_current_timestamp.clone(),
                     current_video_frame.clone(),
                 )
                 .await
                 {
-                } else {
                     let ins_now = Instant::now();
                     if ins_now - change_instant > Duration::from_millis(0) {
                         if let Some(frame) = tiny_decoder.pull_one_video_play_frame().await {
@@ -146,7 +132,7 @@ impl PresentDataManager {
                 }
                 PresentDataManager::update_current_timestamp(
                     main_stream_current_timestamp.clone(),
-                    pts_que.clone(),
+                    audio_cur_ts,
                     &tiny_decoder,
                     current_video_frame.clone(),
                 )
@@ -156,7 +142,7 @@ impl PresentDataManager {
     }
     async fn update_current_timestamp(
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        pts_que: Arc<RwLock<VecDeque<i64>>>,
+        audio_pts: Option<i64>,
         tiny_decoder: &TinyDecoder,
         current_video_frame: Arc<RwLock<Option<Video>>>,
     ) {
@@ -166,9 +152,8 @@ impl PresentDataManager {
         let main_stream = tiny_decoder.main_stream();
         let mut main_ts = main_stream_current_timestamp.write().await;
         if let MainStream::Audio = main_stream {
-            let pts_que = pts_que.read().await;
-            if !pts_que.is_empty() {
-                *main_ts = pts_que[pts_que.len() - 1];
+            if let Some(pts) = audio_pts {
+                *main_ts = pts;
             }
         } else if let MainStream::Video = main_stream {
             let cur_video_frame = current_video_frame.read().await;

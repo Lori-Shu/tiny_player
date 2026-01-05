@@ -6,11 +6,9 @@ fn main() {
     let mut dlls = vec![];
     let folder_path = Path::new("./resources/dlls");
     if let Ok(dir) = folder_path.read_dir() {
-        for dir_entry in dir {
-            if let Ok(p) = dir_entry {
-                if p.file_name().to_str().unwrap().ends_with(".dll") {
-                    dlls.push(p.path());
-                }
+        for p in dir.flatten() {
+            if p.file_name().to_str().unwrap().ends_with(".dll") {
+                dlls.push(p.path());
             }
         }
     }

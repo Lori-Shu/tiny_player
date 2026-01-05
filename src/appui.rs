@@ -12,7 +12,10 @@ use egui::{
 
 use image::DynamicImage;
 
-use tokio::sync::RwLock;
+use tokio::sync::{
+    RwLock,
+    watch::{self, Receiver, Sender},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -66,7 +69,7 @@ impl Widget for PlayerTextButton {
 }
 /// the main struct stores all the vars which are related to ui
 struct UiFlags {
-    pause_flag: Arc<RwLock<bool>>,
+    pause_flag: (Sender<bool>, Receiver<bool>),
     fullscreen_flag: bool,
     control_ui_flag: bool,
     err_window_flag: bool,
@@ -121,8 +124,7 @@ impl eframe::App for AppUi {
                         .async_ctx
                         .exec_normal_task(tiny_decoder.is_input_exist())
                     {
-                        let pause_flag = self.ui_flags.pause_flag.clone();
-                        if !*self.async_ctx.exec_normal_task(pause_flag.read()) {
+                        if !*self.ui_flags.pause_flag.1.borrow() {
                             /*
                             if now is next_frame_time or a little beyond get and show a new frame
                              */
@@ -136,7 +138,7 @@ impl eframe::App for AppUi {
                             {
                                 warn!("keep awake err");
                             }
-                            self.copy_video_data_to_img(&mut *tiny_decoder);
+                            self.copy_video_data_to_img(&mut tiny_decoder);
                         }
                     }
                 }
@@ -241,11 +243,11 @@ impl AppUi {
         let tiny_decoder = crate::decode::TinyDecoder::new(rt.clone())?;
         let tiny_decoder = Arc::new(RwLock::new(tiny_decoder));
         let used_model = Arc::new(RwLock::new(UsedModel::Empty));
-        let subtitle = Arc::new(RwLock::new(AISubTitle::new(rt.clone())?));
-        let audio_player = crate::audio_play::AudioPlayer::new(rt.clone())?;
+        let subtitle = Arc::new(RwLock::new(AISubTitle::new()?));
+        let audio_player = crate::audio_play::AudioPlayer::new()?;
         let current_video_frame = Arc::new(RwLock::new(None));
         let main_stream_current_timestamp = Arc::new(RwLock::new(0));
-        let pause_flag = Arc::new(RwLock::new(true));
+        let pause_flag = watch::channel(true);
         let _present_data_manager = PresentDataManager::new(
             rt,
             tiny_decoder.clone(),
@@ -253,9 +255,8 @@ impl AppUi {
             subtitle.clone(),
             current_video_frame.clone(),
             audio_player.sink(),
-            audio_player.pts_que(),
             main_stream_current_timestamp.clone(),
-            pause_flag.clone(),
+            pause_flag.1.clone(),
         );
         Ok(Self {
             video_texture_handle: None,
@@ -441,9 +442,7 @@ impl AppUi {
             .async_ctx
             .exec_normal_task(tiny_decoder.is_input_exist())
         {
-            let pause_flag = self.ui_flags.pause_flag.clone();
-            let play_or_pause_image_source = if *self.async_ctx.exec_normal_task(pause_flag.read())
-            {
+            let play_or_pause_image_source = if *self.ui_flags.pause_flag.1.borrow() {
                 PLAY_IMG
             } else {
                 PAUSE_IMG
@@ -462,11 +461,13 @@ impl AppUi {
                 self.last_show_control_ui_instant = *now;
             }
             if btn_response.clicked() || ctx.input(|s| s.key_released(egui::Key::Space)) {
-                let pause_flag = self.ui_flags.pause_flag.clone();
-                let mut pause_flag = self.async_ctx.exec_normal_task(pause_flag.write());
-                *pause_flag = !*pause_flag;
+                let pause_flag = &self.ui_flags.pause_flag;
+                let previous_v = *pause_flag.1.borrow();
+                if pause_flag.0.send(!previous_v).is_err() {
+                    warn!("change pause flag err");
+                }
                 let audio_player = &self.audio_player;
-                if *pause_flag {
+                if *pause_flag.1.borrow() {
                     audio_player.pause();
                 } else {
                     audio_player.play();
@@ -524,9 +525,7 @@ impl AppUi {
 
                     tiny_decoder.seek_timestamp_to_decode(*timestamp);
                     audio_player.source_queue_skip_to_end();
-                    let pause_flag = self.ui_flags.pause_flag.clone();
-                    let pause_flag = self.async_ctx.exec_normal_task(pause_flag.read());
-                    if !*pause_flag {
+                    if !*self.ui_flags.pause_flag.1.borrow() {
                         audio_player.play();
                     }
                     self.frame_show_instant = *now;
@@ -755,7 +754,6 @@ impl AppUi {
         }
     }
     /// return true when the current video time > audio time,else return false
-
     fn paint_playlist_window(&mut self, ctx: &Context, now: &Instant) {
         if self.ui_flags.playlist_window_flag {
             let viewport_id = ViewportId::from_hash_of("content_window");
@@ -853,9 +851,9 @@ impl AppUi {
         {
             let decoder = self.tiny_decoder.clone();
             let mut tiny_decoder = self.async_ctx.exec_normal_task(decoder.write());
-            let pause_flag = self.ui_flags.pause_flag.clone();
-            let mut pause_flag = self.async_ctx.exec_normal_task(pause_flag.write());
-            *pause_flag = true;
+            if self.ui_flags.pause_flag.0.send(true).is_err() {
+                warn!("change pause flag err");
+            }
             self.async_ctx.exec_normal_task(async {
                 if tiny_decoder.set_file_path_and_init_par(path).await.is_ok() {
                     warn!("reset file path success!");
@@ -899,9 +897,9 @@ impl AppUi {
         }
 
         if self.check_play_is_at_endtail(tiny_decoder) {
-            let pause_flag = self.ui_flags.pause_flag.clone();
-            let mut pause_flag = self.async_ctx.exec_normal_task(pause_flag.write());
-            *pause_flag = true;
+            if self.ui_flags.pause_flag.0.send(true).is_err() {
+                warn!("change pause flag err");
+            }
         }
     }
     fn detect_file_drag(&mut self, ctx: &Context, now: &Instant) {

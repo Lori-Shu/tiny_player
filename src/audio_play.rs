@@ -1,7 +1,6 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use rodio::Sink;
-use tokio::{runtime::Handle, sync::RwLock};
 
 use crate::{PlayerError, PlayerResult};
 
@@ -9,22 +8,17 @@ pub struct AudioPlayer {
     sink: Arc<rodio::Sink>,
     _stream: rodio::OutputStream,
     current_volumn: f32,
-    pts_que: Arc<RwLock<VecDeque<i64>>>,
-    runtime_handle: Handle,
 }
 impl AudioPlayer {
-    pub fn new(runtime_handle: Handle) -> PlayerResult<Self> {
+    pub fn new() -> PlayerResult<Self> {
         let stream = rodio::OutputStreamBuilder::open_default_stream()
             .map_err(|e| PlayerError::Internal(e.to_string()))?;
         let sink = Arc::new(rodio::Sink::connect_new(stream.mixer()));
-        let pts_que = Arc::new(RwLock::new(VecDeque::new()));
 
         Ok(Self {
             sink,
             _stream: stream,
             current_volumn: 1.0,
-            pts_que,
-            runtime_handle,
         })
     }
 
@@ -48,10 +42,7 @@ impl AudioPlayer {
         self.current_volumn = volumn;
     }
     pub fn source_queue_skip_to_end(&mut self) {
-        let pts_que = self.pts_que.clone();
-        let mut pts_que = self.runtime_handle.block_on(pts_que.write());
         self.sink.clear();
-        pts_que.clear();
     }
     pub fn pause(&self) {
         self.sink.pause();
@@ -59,25 +50,11 @@ impl AudioPlayer {
     pub fn play(&self) {
         self.sink.play();
     }
-    pub fn _last_source_pts(&self) -> PlayerResult<i64> {
-        let pts_que = self.pts_que.clone();
-        let pts_que = self.runtime_handle.block_on(pts_que.read());
-        if !pts_que.is_empty() {
-            Ok(pts_que[pts_que.len() - 1])
-        } else {
-            Err(PlayerError::Internal("audio source len is 0".to_string()))
-        }
-    }
-    pub fn _len(&self) -> usize {
-        self.sink.len()
-    }
+
     pub fn current_volumn(&self) -> &f32 {
         &self.current_volumn
     }
     pub fn sink(&self) -> Arc<Sink> {
         self.sink.clone()
-    }
-    pub fn pts_que(&self) -> Arc<RwLock<VecDeque<i64>>> {
-        self.pts_que.clone()
     }
 }

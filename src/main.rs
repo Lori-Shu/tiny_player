@@ -58,8 +58,13 @@ fn main() {
     let targets_filter = tracing_subscriber::filter::Targets::default()
         .with_default(Level::WARN)
         .with_target("tiny_player", Level::INFO);
+
     let subscriber = tracing_subscriber::registry::Registry::default()
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_thread_ids(true)
+                .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339()),
+        )
         .with(targets_filter);
     subscriber.init();
     let span = tracing::span!(Level::INFO, "main");

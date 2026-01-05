@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, ptr::null_mut, sync::Arc};
+use std::{collections::VecDeque, ptr::null_mut};
 
 use ffmpeg_the_third::{
     ChannelLayout,
@@ -10,7 +10,6 @@ use ffmpeg_the_third::{
     frame::Audio,
 };
 
-use tokio::{runtime::Handle, sync::RwLock};
 use tracing::{info, warn};
 use vosk::{DecodingState, Model, Recognizer};
 
@@ -28,11 +27,10 @@ pub struct AISubTitle {
     en_recognizer: Recognizer,
     source_buffer: VecDeque<i16>,
     generated_str: String,
-    subtitle_source_resampler: Arc<RwLock<ManualProtectedResampler>>,
-    runtime_handle: Handle,
+    subtitle_source_resampler: ManualProtectedResampler,
 }
 impl AISubTitle {
-    pub fn new(runtime_handle: Handle) -> PlayerResult<Self> {
+    pub fn new() -> PlayerResult<Self> {
         let current_exe_path = CURRENT_EXE_PATH.as_ref().map_err(|e| e.clone())?;
         if let Some(folder_path) = current_exe_path.parent() {
             let chinese_model_path = folder_path.join("model/vosk-model-small-cn-0.22");
@@ -81,10 +79,9 @@ impl AISubTitle {
                                             en_recognizer: en_rez,
                                             source_buffer: VecDeque::new(),
                                             generated_str: String::new(),
-                                            subtitle_source_resampler: Arc::new(RwLock::new(
-                                                ManualProtectedResampler(swr_ctx),
-                                            )),
-                                            runtime_handle,
+                                            subtitle_source_resampler: ManualProtectedResampler(
+                                                swr_ctx,
+                                            ),
                                         });
                                     }
                                 }
@@ -100,17 +97,17 @@ impl AISubTitle {
     }
 
     pub async fn push_frame_data(
-        ai_subtitle: Arc<RwLock<AISubTitle>>,
+        &mut self,
         audio_frame: ffmpeg_the_third::frame::Audio,
         used_model: UsedModel,
     ) {
-        let mut sub_title = ai_subtitle.write().await;
+        let sub_title = self;
         let mut to_recognize_frame = Audio::empty();
         to_recognize_frame.set_format(ffmpeg_the_third::format::Sample::I16(Type::Packed));
         to_recognize_frame.set_ch_layout(ChannelLayout::MONO);
         to_recognize_frame.set_rate(16000);
         unsafe {
-            let resampler = sub_title.subtitle_source_resampler.read().await;
+            let resampler = &mut sub_title.subtitle_source_resampler;
 
             if 0 > swr_convert_frame(
                 resampler.0,
@@ -120,12 +117,8 @@ impl AISubTitle {
                 warn!("subtitle frame convert err!");
             }
         }
-        let data = unsafe {
-            std::slice::from_raw_parts::<'static, i16>(
-                to_recognize_frame.data(0).as_ptr() as *const i16,
-                to_recognize_frame.samples(),
-            )
-        };
+        let data = &bytemuck::cast_slice::<_, i16>(to_recognize_frame.data(0))
+            [0..to_recognize_frame.samples()];
         sub_title.source_buffer.extend(data);
         if let UsedModel::Chinese = &used_model {
             if sub_title.source_buffer.len() > 3200 {
@@ -167,10 +160,8 @@ impl AISubTitle {
 }
 impl Drop for AISubTitle {
     fn drop(&mut self) {
-        let resampler = self.subtitle_source_resampler.clone();
-        let mut resampler = self.runtime_handle.block_on(resampler.write());
         unsafe {
-            swr_free(&mut resampler.0);
+            swr_free(&mut self.subtitle_source_resampler.0);
         }
     }
 }

@@ -3,8 +3,9 @@ use std::{
     ffi::CString,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
+    usize,
 };
 
 use ffmpeg_the_third::{
@@ -66,14 +67,14 @@ pub enum MainStream {
 /// video format, decode, detail and hardware accelerate
 /// the main struct of decode module to manage input and decode
 pub struct TinyDecoder {
-    video_stream_index: Arc<RwLock<usize>>,
-    audio_stream_index: Arc<RwLock<usize>>,
-    cover_stream_index: Arc<RwLock<usize>>,
+    video_stream_index: usize,
+    audio_stream_index: usize,
+    cover_stream_index: usize,
     main_stream: MainStream,
     video_time_base: Rational,
     audio_time_base: Rational,
     video_frame_rect: [u32; 2],
-    format_duration: Arc<RwLock<i64>>,
+    format_duration: i64,
     end_timestamp: i64,
     end_time_formatted_string: String,
     format_input: Arc<RwLock<Option<ManualProtectedInput>>>,
@@ -85,14 +86,13 @@ pub struct TinyDecoder {
     audio_frame_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::frame::Audio>>>>,
     audio_packet_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>>,
     video_packet_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>>,
-    demux_exit_flag: Arc<RwLock<bool>>,
-    decode_exit_flag: Arc<RwLock<bool>>,
+    demux_exit_flag: Arc<AtomicBool>,
+    decode_exit_flag: Arc<AtomicBool>,
     demux_task_handle: Option<JoinHandle<()>>,
     decode_task_handle: Option<JoinHandle<()>>,
-    hardware_config: Arc<RwLock<bool>>,
+    hardware_config: Arc<AtomicBool>,
     cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
     runtime_handle: Handle,
-    graph: Arc<RwLock<Option<ffmpeg_the_third::filter::Graph>>>,
 }
 impl TinyDecoder {
     /// init Decoder and new Struct
@@ -100,14 +100,14 @@ impl TinyDecoder {
     pub fn new(runtime_handle: Handle) -> PlayerResult<Self> {
         ffmpeg_the_third::init().map_err(|e| PlayerError::Internal(e.to_string()))?;
         Ok(Self {
-            video_stream_index: Arc::new(RwLock::new(usize::MAX)),
-            audio_stream_index: Arc::new(RwLock::new(usize::MAX)),
-            cover_stream_index: Arc::new(RwLock::new(usize::MAX)),
+            video_stream_index: usize::MAX,
+            audio_stream_index: usize::MAX,
+            cover_stream_index: usize::MAX,
             main_stream: MainStream::Audio,
             video_time_base: Rational::new(1, 1),
             audio_time_base: Rational::new(1, 1),
             video_frame_rect: [0, 0],
-            format_duration: Arc::new(RwLock::new(0)),
+            format_duration: 0,
             end_timestamp: 0,
             end_time_formatted_string: String::new(),
             format_input: Arc::new(RwLock::new(None)),
@@ -119,37 +119,38 @@ impl TinyDecoder {
             audio_frame_cache_queue: std::sync::Arc::new(RwLock::new(None)),
             audio_packet_cache_queue: std::sync::Arc::new(RwLock::new(None)),
             video_packet_cache_queue: std::sync::Arc::new(RwLock::new(None)),
-            demux_exit_flag: Arc::new(RwLock::new(false)),
-            decode_exit_flag: Arc::new(RwLock::new(false)),
+            demux_exit_flag: Arc::new(AtomicBool::new(false)),
+            decode_exit_flag: Arc::new(AtomicBool::new(false)),
             demux_task_handle: None,
             decode_task_handle: None,
-            hardware_config: Arc::new(RwLock::new(false)),
+            hardware_config: Arc::new(AtomicBool::new(false)),
             cover_pic_data: Arc::new(RwLock::new(None)),
             runtime_handle,
-            graph: Arc::new(RwLock::new(None)),
         })
     }
     /// reset all fields to the initial state
     /// this is to make the decoder ready for fresh input
     async fn reset_tiny_decoder_states(&mut self) {
-        *self.audio_stream_index.write().await = usize::MAX;
-        *self.video_stream_index.write().await = usize::MAX;
-        *self.cover_stream_index.write().await = usize::MAX;
+        self.audio_stream_index = usize::MAX;
+        self.video_stream_index = usize::MAX;
+        self.cover_stream_index = usize::MAX;
         self.main_stream = MainStream::Audio;
         *self.audio_decoder.write().await = None;
         self.audio_time_base = Rational::new(1, 1);
         self.converter_ctx = None;
-        *self.cover_pic_data.write().await = None;
+        self.cover_pic_data = Arc::new(RwLock::new(None));
         self.decode_task_handle = None;
-        *self.decode_exit_flag.write().await = false;
+        self.decode_exit_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.demux_task_handle = None;
-        *self.demux_exit_flag.write().await = false;
+        self.demux_exit_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.end_time_formatted_string = String::new();
         self.end_timestamp = 0;
-        *self.format_duration.write().await = 0;
+        self.format_duration = 0;
         *self.format_input.write().await = None;
-        *self.graph.write().await = None;
-        *self.hardware_config.write().await = false;
+        self.hardware_config
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.resampler_ctx = None;
         *self.video_decoder.write().await = None;
         self.video_frame_rect = [0, 0];
@@ -191,19 +192,16 @@ impl TinyDecoder {
                 cover_stream = Some(item);
             }
         }
-
         if audio_stream.is_none() && video_stream.is_none() {
             info!("no valid stream found");
         }
         if let Some(stream) = &cover_stream {
             info!("cover stream found");
-            let mut mutex_guard = self.cover_stream_index.write().await;
-            *mutex_guard = stream.index();
+            self.cover_stream_index = stream.index();
         }
 
         if let Some(stream) = &audio_stream {
-            let mut mutex_guard = self.audio_stream_index.write().await;
-            *mutex_guard = stream.index();
+            self.audio_stream_index = stream.index();
             self.audio_time_base = stream.time_base();
             info!("audio time_base==={}", self.audio_time_base);
             *self.audio_packet_cache_queue.write().await = Some(VecDeque::new());
@@ -211,8 +209,7 @@ impl TinyDecoder {
         }
 
         if let Some(stream) = &video_stream {
-            let mut mutex_guard = self.video_stream_index.write().await;
-            *mutex_guard = stream.index();
+            self.video_stream_index = stream.index();
             self.video_time_base = stream.time_base();
             info!("video time_base==={}", self.video_time_base);
             if audio_stream.is_none() {
@@ -225,12 +222,12 @@ impl TinyDecoder {
         // format_input.duration() can get the precise duration of the media file
         // format_input.duration() number unit is us
         info!("total duration {} us", format_input.duration());
-        *self.format_duration.write().await = format_input.duration();
+        self.format_duration = format_input.duration();
         let adur_ts = {
             if let MainStream::Audio = self.main_stream {
                 format_input.duration() * self.audio_time_base.denominator() as i64
                     / self.audio_time_base.numerator() as i64
-                    / 1000_000
+                    / 1_000_000
             } else {
                 format_input.duration() * self.video_time_base.denominator() as i64
                     / self.video_time_base.numerator() as i64
@@ -297,9 +294,6 @@ impl TinyDecoder {
             *a_decoder = Some(ManualProtectedAudioDecoder(audio_decoder));
         }
         {
-            let graph = ffmpeg_the_third::filter::Graph::new();
-            *self.graph.write().await = Some(graph);
-
             let mut input = self.format_input.write().await;
             *input = Some(ManualProtectedInput(format_input));
         }
@@ -309,9 +303,9 @@ impl TinyDecoder {
     }
     /// the loop of demuxing video file
     async fn packet_demux_process(
-        audio_stream_index: Arc<RwLock<usize>>,
-        video_stream_index: Arc<RwLock<usize>>,
-        exit_flag: Arc<RwLock<bool>>,
+        audio_stream_index: usize,
+        video_stream_index: usize,
+        exit_flag: Arc<AtomicBool>,
         format_input: Arc<RwLock<Option<ManualProtectedInput>>>,
         audio_packet_cache_queue: std::sync::Arc<
             RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>,
@@ -319,13 +313,13 @@ impl TinyDecoder {
         video_packet_cache_queue: std::sync::Arc<
             RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>,
         >,
-        cover_stream_index: Arc<RwLock<usize>>,
+        cover_stream_index: usize,
         cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
     ) {
         info!("enter demux");
         loop {
             sleep(Duration::from_millis(1)).await;
-            if *exit_flag.read().await {
+            if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
             /*
@@ -364,23 +358,23 @@ impl TinyDecoder {
             {
                 let mut audio_packet_vec = audio_packet_cache_queue.write().await;
                 let mut video_packet_vec = video_packet_cache_queue.write().await;
-                let audio_stream_idx = audio_stream_index.read().await;
-                let video_stream_idx = video_stream_index.read().await;
-                let cover_index = cover_stream_index.read().await;
+                let audio_stream_idx = audio_stream_index;
+                let video_stream_idx = video_stream_index;
+                let cover_index = cover_stream_index;
                 let mut cover_pic_data = cover_pic_data.write().await;
                 let mut input = format_input.write().await;
                 if let Some(input) = &mut *input {
                     match input.0.packets().next() {
                         Some(Ok((stream, packet))) => {
-                            if stream.index() == *cover_index {
+                            if stream.index() == cover_index {
                                 if let Some(d) = packet.data() {
                                     *cover_pic_data = Some(d.to_vec());
                                 }
-                            } else if stream.index() == *audio_stream_idx {
+                            } else if stream.index() == audio_stream_idx {
                                 if let Some(audio_packet_vec) = &mut *audio_packet_vec {
                                     audio_packet_vec.push_back(packet);
                                 }
-                            } else if stream.index() == *video_stream_idx {
+                            } else if stream.index() == video_stream_idx {
                                 if let Some(video_packet_vec) = &mut *video_packet_vec {
                                     video_packet_vec.push_back(packet);
                                 }
@@ -398,11 +392,11 @@ impl TinyDecoder {
     }
     ///convert the hardware output frame to middle format YUV420P
     async fn convert_hardware_frame(
-        hardware_config: Arc<RwLock<bool>>,
+        hardware_config: Arc<AtomicBool>,
         hardware_frame_converter: Arc<RwLock<Option<ManualProtectedConverter>>>,
         video_frame_tmp: Video,
     ) -> Video {
-        if *hardware_config.read().await {
+        if hardware_config.load(std::sync::atomic::Ordering::Relaxed) {
             unsafe {
                 let mut transfered_frame = ffmpeg_the_third::frame::Video::empty();
                 if 0 != av_hwframe_transfer_data(
@@ -438,7 +432,7 @@ impl TinyDecoder {
     }
     /// the loop of decoding demuxed packet
     async fn frame_decode_process(
-        exit_flag: Arc<RwLock<bool>>,
+        exit_flag: Arc<AtomicBool>,
         audio_decoder: Arc<RwLock<Option<ManualProtectedAudioDecoder>>>,
         video_decoder: Arc<RwLock<Option<ManualProtectedVideoDecoder>>>,
         audio_frame_cache_queue: std::sync::Arc<
@@ -453,13 +447,13 @@ impl TinyDecoder {
         video_packet_cache_queue: std::sync::Arc<
             RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>,
         >,
-        hardware_config: Arc<RwLock<bool>>,
-        graph: Arc<RwLock<Option<Graph>>>,
+        hardware_config: Arc<AtomicBool>,
         video_time_base: Rational,
         video_frame_rect: [u32; 2],
     ) {
         info!("enter decode");
         let mut p = PathBuf::new();
+        let mut graph = Graph::new();
         if video_packet_cache_queue.read().await.is_some() {
             if let Ok(exe_path) = CURRENT_EXE_PATH.as_ref() {
                 if let Some(exe_folder) = exe_path.parent() {
@@ -472,108 +466,101 @@ impl TinyDecoder {
                 }
             }
 
-            let mut graph = graph.write().await;
-            if let Some(graph) = &mut *graph {
-                if let Some(font_path_str) = p.to_str() {
-                    let mut font_path_str = font_path_str.replace("\\", "/");
-                    if let Some(idx) = font_path_str.find(':') {
-                        font_path_str.insert(idx, '\\');
-                        unsafe {
-                            if let Ok(c_str_buffer) = CString::new("buffer") {
-                                if let Ok(c_str_buffersrc) = CString::new("buffersrc") {
-                                    if let Ok(c_str_buffersrc_args) = CString::new(format!(
-                                        "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
-                                        video_frame_rect[0],
-                                        video_frame_rect[1],
-                                        AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
-                                        video_time_base.numerator(),
-                                        video_time_base.denominator(),
-                                    )) {
-                                        if let Ok(c_str_drawtext) = CString::new("drawtext") {
-                                            if let Ok(c_str_draw) = CString::new("draw") {
-                                                if let Ok(c_str_draw_args) = CString::new(format!(
-                                                    "text='Tiny Player':fontfile={}:fontsize=26:fontcolor=white@0.3:x=w-text_w-10:y=10",
-                                                    font_path_str
-                                                )) {
-                                                    if let Ok(c_str_buffersink) =
-                                                        CString::new("buffersink")
-                                                    {
-                                                        if let Ok(c_str_sink) = CString::new("sink")
-                                                        {
-                                                            let buffersrc_filter =
-                                                                avfilter_get_by_name(
-                                                                    c_str_buffer.as_ptr(),
-                                                                );
-                                                            // graph free will automatically free filterctx
-                                                            let mut buffersrc_ctx = null_mut();
-                                                            let draw_filter = avfilter_get_by_name(
-                                                                c_str_drawtext.as_ptr(),
+            if let Some(font_path_str) = p.to_str() {
+                let mut font_path_str = font_path_str.replace("\\", "/");
+                if let Some(idx) = font_path_str.find(':') {
+                    font_path_str.insert(idx, '\\');
+                    unsafe {
+                        if let Ok(c_str_buffer) = CString::new("buffer") {
+                            if let Ok(c_str_buffersrc) = CString::new("buffersrc") {
+                                if let Ok(c_str_buffersrc_args) = CString::new(format!(
+                                    "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
+                                    video_frame_rect[0],
+                                    video_frame_rect[1],
+                                    AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
+                                    video_time_base.numerator(),
+                                    video_time_base.denominator(),
+                                )) {
+                                    if let Ok(c_str_drawtext) = CString::new("drawtext") {
+                                        if let Ok(c_str_draw) = CString::new("draw") {
+                                            if let Ok(c_str_draw_args) = CString::new(format!(
+                                                "text='Tiny Player':fontfile={}:fontsize=26:fontcolor=white@0.3:x=w-text_w-10:y=10",
+                                                font_path_str
+                                            )) {
+                                                if let Ok(c_str_buffersink) =
+                                                    CString::new("buffersink")
+                                                {
+                                                    if let Ok(c_str_sink) = CString::new("sink") {
+                                                        let buffersrc_filter = avfilter_get_by_name(
+                                                            c_str_buffer.as_ptr(),
+                                                        );
+                                                        // graph free will automatically free filterctx
+                                                        let mut buffersrc_ctx = null_mut();
+                                                        let draw_filter = avfilter_get_by_name(
+                                                            c_str_drawtext.as_ptr(),
+                                                        );
+                                                        let mut drawtext_ctx = null_mut();
+                                                        let buffersink_filter =
+                                                            avfilter_get_by_name(
+                                                                c_str_buffersink.as_ptr(),
                                                             );
-                                                            let mut drawtext_ctx = null_mut();
-                                                            let buffersink_filter =
-                                                                avfilter_get_by_name(
-                                                                    c_str_buffersink.as_ptr(),
-                                                                );
-                                                            let mut buffersink_ctx = null_mut();
-                                                            let r = avfilter_graph_create_filter(
-                                                                &mut buffersrc_ctx,
-                                                                buffersrc_filter,
-                                                                c_str_buffersrc.as_ptr(),
-                                                                c_str_buffersrc_args.as_ptr(),
-                                                                null_mut(),
-                                                                graph.as_mut_ptr(),
+                                                        let mut buffersink_ctx = null_mut();
+                                                        let r = avfilter_graph_create_filter(
+                                                            &mut buffersrc_ctx,
+                                                            buffersrc_filter,
+                                                            c_str_buffersrc.as_ptr(),
+                                                            c_str_buffersrc_args.as_ptr(),
+                                                            null_mut(),
+                                                            graph.as_mut_ptr(),
+                                                        );
+                                                        if r < 0 {
+                                                            info!("create buffer filter err");
+                                                        }
+                                                        let r = avfilter_graph_create_filter(
+                                                            &mut drawtext_ctx,
+                                                            draw_filter,
+                                                            c_str_draw.as_ptr(),
+                                                            c_str_draw_args.as_ptr(),
+                                                            null_mut(),
+                                                            graph.as_mut_ptr(),
+                                                        );
+                                                        if r < 0 {
+                                                            info!("create drawtext filter err");
+                                                        }
+                                                        let r = avfilter_graph_create_filter(
+                                                            &mut buffersink_ctx,
+                                                            buffersink_filter,
+                                                            c_str_sink.as_ptr(),
+                                                            null(),
+                                                            null_mut(),
+                                                            graph.as_mut_ptr(),
+                                                        );
+                                                        if r < 0 {
+                                                            info!("create buffersink filter err");
+                                                        }
+                                                        let r = avfilter_link(
+                                                            buffersrc_ctx,
+                                                            0,
+                                                            drawtext_ctx,
+                                                            0,
+                                                        );
+                                                        if r < 0 {
+                                                            info!("link src and drawtext err");
+                                                        }
+                                                        let r = avfilter_link(
+                                                            drawtext_ctx,
+                                                            0,
+                                                            buffersink_ctx,
+                                                            0,
+                                                        );
+                                                        if r < 0 {
+                                                            info!("link drawtext and sink err");
+                                                        }
+                                                        if graph.validate().is_ok() {
+                                                            info!(
+                                                                "graph validate success!dump:\n{}",
+                                                                graph.dump()
                                                             );
-                                                            if r < 0 {
-                                                                info!("create buffer filter err");
-                                                            }
-                                                            let r = avfilter_graph_create_filter(
-                                                                &mut drawtext_ctx,
-                                                                draw_filter,
-                                                                c_str_draw.as_ptr(),
-                                                                c_str_draw_args.as_ptr(),
-                                                                null_mut(),
-                                                                graph.as_mut_ptr(),
-                                                            );
-                                                            if r < 0 {
-                                                                info!("create drawtext filter err");
-                                                            }
-                                                            let r = avfilter_graph_create_filter(
-                                                                &mut buffersink_ctx,
-                                                                buffersink_filter,
-                                                                c_str_sink.as_ptr(),
-                                                                null(),
-                                                                null_mut(),
-                                                                graph.as_mut_ptr(),
-                                                            );
-                                                            if r < 0 {
-                                                                info!(
-                                                                    "create buffersink filter err"
-                                                                );
-                                                            }
-                                                            let r = avfilter_link(
-                                                                buffersrc_ctx,
-                                                                0,
-                                                                drawtext_ctx,
-                                                                0,
-                                                            );
-                                                            if r < 0 {
-                                                                info!("link src and drawtext err");
-                                                            }
-                                                            let r = avfilter_link(
-                                                                drawtext_ctx,
-                                                                0,
-                                                                buffersink_ctx,
-                                                                0,
-                                                            );
-                                                            if r < 0 {
-                                                                info!("link drawtext and sink err");
-                                                            }
-                                                            if graph.validate().is_ok() {
-                                                                info!(
-                                                                    "graph validate success!dump:\n{}",
-                                                                    graph.dump()
-                                                                );
-                                                            }
                                                         }
                                                     }
                                                 }
@@ -590,7 +577,7 @@ impl TinyDecoder {
         let hardware_frame_converter = Arc::new(RwLock::new(None));
         loop {
             sleep(Duration::from_millis(1)).await;
-            if *exit_flag.read().await {
+            if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
 
@@ -655,20 +642,18 @@ impl TinyDecoder {
                                                 video_frame_tmp,
                                             )
                                             .await;
-                                            let mut graph = graph.write().await;
-                                            if let Some(graph) = &mut *graph {
-                                                if let Some(mut ctx) = graph.get("buffersrc") {
-                                                    if ctx.source().add(&video_frame).is_ok() {
-                                                        let mut filtered_frame =
-                                                            ffmpeg_the_third::frame::Video::empty();
-                                                        if let Some(mut ctx) = graph.get("sink") {
-                                                            if ctx
-                                                                .sink()
-                                                                .frame(&mut filtered_frame)
-                                                                .is_ok()
-                                                            {
-                                                                frames.push_back(filtered_frame);
-                                                            }
+
+                                            if let Some(mut ctx) = graph.get("buffersrc") {
+                                                if ctx.source().add(&video_frame).is_ok() {
+                                                    let mut filtered_frame =
+                                                        ffmpeg_the_third::frame::Video::empty();
+                                                    if let Some(mut ctx) = graph.get("sink") {
+                                                        if ctx
+                                                            .sink()
+                                                            .frame(&mut filtered_frame)
+                                                            .is_ok()
+                                                        {
+                                                            frames.push_back(filtered_frame);
                                                         }
                                                     }
                                                 }
@@ -685,12 +670,12 @@ impl TinyDecoder {
     }
     /// start the demux and decode task
     async fn start_process_input(&mut self) {
-        let audio_stream_index = self.audio_stream_index.clone();
-        let video_stream_index = self.video_stream_index.clone();
+        let audio_stream_index = self.audio_stream_index;
+        let video_stream_index = self.video_stream_index;
         let format_input = self.format_input.clone();
         let audio_packet_cache_que = self.audio_packet_cache_queue.clone();
         let video_packet_cache_que = self.video_packet_cache_queue.clone();
-        let cov_stream_index = self.cover_stream_index.clone();
+        let cov_stream_index = self.cover_stream_index;
         let cover_pic_data = self.cover_pic_data.clone();
         let demux_exit_flag = self.demux_exit_flag.clone();
 
@@ -719,8 +704,6 @@ impl TinyDecoder {
         let video_packet_cache_que = self.video_packet_cache_queue.clone();
         let hardware_config = self.hardware_config.clone();
         let decode_exit_flag = self.decode_exit_flag.clone();
-
-        let graph = self.graph.clone();
         let video_time_base = self.video_time_base;
         let video_frame_rect = self.video_frame_rect;
         self.decode_task_handle = Some(self.runtime_handle.spawn(async move {
@@ -735,7 +718,6 @@ impl TinyDecoder {
                 audio_packet_cache_que,
                 video_packet_cache_que,
                 hardware_config,
-                graph,
                 video_time_base,
                 video_frame_rect,
             )
@@ -866,9 +848,9 @@ impl TinyDecoder {
             let mut input = self.runtime_handle.block_on(self.format_input.write());
             let main_stream_idx = {
                 if let MainStream::Audio = self.main_stream {
-                    *self.runtime_handle.block_on(self.audio_stream_index.read())
+                    self.audio_stream_index
                 } else {
-                    *self.runtime_handle.block_on(self.video_stream_index.read())
+                    self.video_stream_index
                 }
             };
             let main_stream_time_base = {
@@ -884,7 +866,7 @@ impl TinyDecoder {
                     let res = ffmpeg_the_third::ffi::avformat_seek_file(
                         input.0.as_mut_ptr(),
                         main_stream_idx as i32,
-                        ts - 1 * main_stream_time_base.denominator() as i64
+                        ts - main_stream_time_base.denominator() as i64
                             / main_stream_time_base.numerator() as i64,
                         ts,
                         ts + main_stream_time_base.denominator() as i64
@@ -940,18 +922,20 @@ impl TinyDecoder {
         &self.main_stream
     }
     /// read video stream index
-    pub fn _video_stream_idx(&self) -> Arc<RwLock<usize>> {
-        self.video_stream_index.clone()
+    pub fn _video_stream_idx(&self) -> usize {
+        self.video_stream_index
     }
     /// stop demux and decode
     async fn stop_demux_and_decode(&mut self) {
-        *self.demux_exit_flag.write().await = true;
+        self.demux_exit_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = &mut self.demux_task_handle {
             if handle.await.is_ok() {
                 info!("demux thread join success");
             }
         }
-        *self.decode_exit_flag.write().await = true;
+        self.decode_exit_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = &mut self.decode_task_handle {
             if handle.await.is_ok() {
                 info!("decode thread join success");
@@ -1007,7 +991,8 @@ impl TinyDecoder {
                     }
                     (*decoder.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
 
-                    *self.hardware_config.write().await = true;
+                    self.hardware_config
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     warn!("hardware decode acceleration is on!");
                     return Ok(decoder);
                 }
