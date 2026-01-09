@@ -266,7 +266,7 @@ mod test {
         //     is_sub_set_sum_recursion(&arr, &sum, &mut ans_arr, arr.iter().sum::<i32>(), 0, 0),
         //     ans_arr
         // );
-        println!("result:{}", is_sub_set_sum(&mut arr, &sum));
+        // println!("result:{}", is_sub_set_sum(&mut arr, &sum));
         // println!("result:{}", is_sub_set_sum_dp(&arr, &sum));
     }
     fn _is_sub_set_sum_recursion(

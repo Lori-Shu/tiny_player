@@ -5,7 +5,6 @@ use std::{
     ptr::{null, null_mut},
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
-    usize,
 };
 
 use ffmpeg_the_third::{
@@ -976,7 +975,7 @@ impl TinyDecoder {
 
                 if hw_config.is_null() {
                     warn!("currently doesn't support hardware accelerate");
-                    return Ok(decoder);
+                    Ok(decoder)
                 } else {
                     let mut hw_device_ctx = null_mut();
                     if 0 != av_hwdevice_ctx_create(
@@ -994,12 +993,12 @@ impl TinyDecoder {
                     self.hardware_config
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     warn!("hardware decode acceleration is on!");
-                    return Ok(decoder);
+                    Ok(decoder)
                 }
             } else {
-                return Err(PlayerError::Internal(
+                Err(PlayerError::Internal(
                     "err when config hardware acc".to_string(),
-                ));
+                ))
             }
         }
     }

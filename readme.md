@@ -26,7 +26,7 @@ core feature based on project
 8. control the video by the control widges
 # Tips
 1. if you use a laptop and player runs at a very low frame 
-rate, turn off "BatteryBoost" in nvidia driver which is to save 
-energy.
+rate, go to settings->system->power&battery, set power mode of "on battery" to 
+"best performance" or "balanced" so that windows allows cpu to run at a higher speed.
 # Screenshot
 ![app screenshot](./project_show_img.png)

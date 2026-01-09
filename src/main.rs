@@ -51,8 +51,7 @@ impl Display for PlayerError {
 }
 impl Error for PlayerError {}
 pub type PlayerResult<T> = std::result::Result<T, PlayerError>;
-// static CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf> =
-//     LazyLock;
+
 /// main fun init log, init main ui type Appui
 fn main() {
     let targets_filter = tracing_subscriber::filter::Targets::default()
