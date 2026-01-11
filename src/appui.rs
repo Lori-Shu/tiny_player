@@ -5,15 +5,16 @@ use std::{
 };
 
 use egui::{
-    AtomExt, Color32, ColorImage, Context, ImageData, ImageSource, Layout, Pos2, Rect, RichText,
-    TextBuffer, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId, Widget,
-    WidgetText, include_image,
+    AtomExt, Color32, ColorImage, Context, Image, ImageData, ImageSource, Layout, Pos2, Rect,
+    RichText, TextBuffer, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId,
+    Widget, WidgetText, include_image,
 };
 
-use image::DynamicImage;
+use ffmpeg_the_third::{format::stream::Disposition, media::Type};
+use image::{DynamicImage, EncodableLayout, RgbaImage};
 
 use tokio::sync::{
-    RwLock,
+    Notify, RwLock,
     watch::{self, Receiver, Sender},
 };
 use tracing::{info, warn};
@@ -102,6 +103,7 @@ pub struct AppUi {
     video_des: Arc<RwLock<Vec<VideoDes>>>,
     used_model: Arc<RwLock<UsedModel>>,
     audio_volumn: f32,
+    data_thread_notify: Arc<Notify>,
 }
 impl eframe::App for AppUi {
     /// this function will automaticly be called every ui redraw
@@ -119,7 +121,7 @@ impl eframe::App for AppUi {
                 }
                 {
                     let decoder = self.tiny_decoder.clone();
-                    let mut tiny_decoder = self.async_ctx.exec_normal_task(decoder.write());
+                    let tiny_decoder = self.async_ctx.exec_normal_task(decoder.write());
                     if self
                         .async_ctx
                         .exec_normal_task(tiny_decoder.is_input_exist())
@@ -138,10 +140,16 @@ impl eframe::App for AppUi {
                             {
                                 warn!("keep awake err");
                             }
-                            self.copy_video_data_to_img(&mut tiny_decoder);
+                            self.notify_data_thread(&tiny_decoder);
+                            if self.check_play_is_at_endtail(&tiny_decoder) {
+                                if self.ui_flags.pause_flag.0.send(true).is_err() {
+                                    warn!("change pause flag err");
+                                }
+                            }
                         }
                     }
                 }
+                self.copy_video_data_to_img();
                 /*
                 down part is ui painting and control
 
@@ -248,7 +256,9 @@ impl AppUi {
         let current_video_frame = Arc::new(RwLock::new(None));
         let main_stream_current_timestamp = Arc::new(RwLock::new(0));
         let pause_flag = watch::channel(true);
+        let data_thread_notify = Arc::new(Notify::new());
         let _present_data_manager = PresentDataManager::new(
+            data_thread_notify.clone(),
             rt,
             tiny_decoder.clone(),
             used_model.clone(),
@@ -256,7 +266,6 @@ impl AppUi {
             current_video_frame.clone(),
             audio_player.sink(),
             main_stream_current_timestamp.clone(),
-            pause_flag.1.clone(),
         );
         Ok(Self {
             video_texture_handle: None,
@@ -293,6 +302,7 @@ impl AppUi {
             subtitle,
             video_des: Arc::new(RwLock::new(vec![])),
             audio_volumn: 1.0,
+            data_thread_notify,
         })
     }
     fn paint_video_image(&mut self, ctx: &egui::Context, ui: &mut Ui) {
@@ -362,12 +372,14 @@ impl AppUi {
         let decoder = self.tiny_decoder.clone();
         let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
         let frame_rect = tiny_decoder.video_frame_rect();
-        let color_image = ColorImage::filled(
-            [frame_rect[0] as usize, frame_rect[1] as usize],
-            Color32::from_rgba_unmultiplied(0, 0, 0, 255),
-        );
+        if frame_rect[0] != 0 {
+            let color_image = ColorImage::filled(
+                [frame_rect[0] as usize, frame_rect[1] as usize],
+                Color32::from_rgba_unmultiplied(0, 0, 0, 255),
+            );
 
-        self.main_color_image = color_image;
+            self.main_color_image = color_image;
+        }
     }
     fn load_video_texture(&mut self, ctx: &egui::Context) {
         /*
@@ -767,25 +779,29 @@ impl AppUi {
             ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical(|ui| {
-                        let video_urls_scroll = egui::ScrollArea::vertical().max_height(200.0);
-                        ui.set_min_height(300.0);
+                        let video_urls_scroll = egui::ScrollArea::vertical().max_height(500.0);
 
                         video_urls_scroll.show(ui, |ui| {
-                            let video_des_arc = self.video_des.clone();
-                            let videos = self.async_ctx.exec_normal_task(video_des_arc.read());
-                            for i in &*videos {
-                                ui.vertical_centered_justified(|ui| {
-                                    let player_text_button =
-                                        PlayerTextButton::new(i.name.clone(), 20.0, true);
-                                    if ui.add(player_text_button).clicked() {
-                                        if self
-                                            .change_format_input(&PathBuf::from(&i.path), now)
-                                            .is_ok()
-                                        {
-                                            info!("change_format_input success");
+                            let video_des = self.video_des.clone();
+                            if let Ok(mut videos) = video_des.try_write() {
+                                for i in &mut *videos {
+                                    ui.vertical_centered_justified(|ui| {
+                                        let image = Image::new(&i.texture_handle)
+                                            .max_size(Vec2::new(200.0, 180.0));
+
+                                        ui.add(image);
+                                        let player_text_button =
+                                            PlayerTextButton::new(i.name.clone(), 20.0, true);
+                                        if ui.add(player_text_button).clicked() {
+                                            if self
+                                                .change_format_input(&PathBuf::from(&i.path), now)
+                                                .is_ok()
+                                            {
+                                                info!("change_format_input success");
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                                }
                             }
                         });
                         if let Some(dialog) = &mut self.scan_folder_dialog {
@@ -801,10 +817,12 @@ impl AppUi {
                                     videos.clear();
                                 }
                                 if let Some(path) = dialog.path() {
-                                    self.async_ctx.exec_normal_task(AppUi::read_video_folder(
-                                        path,
-                                        self.video_des.clone(),
-                                    ));
+                                    let video_des = self.video_des.clone();
+                                    let path = path.to_path_buf();
+                                    let ctx = ctx.clone();
+                                    self.async_ctx
+                                        .runtime_handle()
+                                        .spawn(AppUi::read_video_folder(ctx, path, video_des));
                                 }
                             }
                         }
@@ -814,36 +832,28 @@ impl AppUi {
         }
     }
     fn reset_main_tex_to_bg(&mut self) {
-        if let Some(v_tex) = &mut self.video_texture_handle {
-            v_tex.set(
-                ImageData::Color(Arc::new(ColorImage::from_rgba_unmultiplied(
-                    [
-                        self.bg_dyn_img.width() as usize,
-                        self.bg_dyn_img.height() as usize,
-                    ],
-                    self.bg_dyn_img.as_bytes(),
-                ))),
-                TextureOptions::LINEAR,
-            );
-        }
+        let bg_color_img = ColorImage::from_rgba_unmultiplied(
+            [
+                self.bg_dyn_img.width() as usize,
+                self.bg_dyn_img.height() as usize,
+            ],
+            self.bg_dyn_img.as_bytes(),
+        );
+        self.main_color_image = bg_color_img.clone();
     }
     fn reset_main_tex_to_cover_pic(&mut self) {
-        if let Some(v_tex) = &mut self.video_texture_handle {
-            let decoder = self.tiny_decoder.clone();
-            let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
-            let pic_data = tiny_decoder.cover_pic_data();
-            let cover_data = self.async_ctx.exec_normal_task(pic_data.read());
-            if let Some(data_vec) = &*cover_data {
-                if let Ok(img) = image::load_from_memory(data_vec) {
-                    let rgba8_img = img.to_rgba8();
-                    v_tex.set(
-                        ImageData::Color(Arc::new(ColorImage::from_rgba_unmultiplied(
-                            [rgba8_img.width() as usize, rgba8_img.height() as usize],
-                            &rgba8_img,
-                        ))),
-                        TextureOptions::LINEAR,
-                    );
-                }
+        let decoder = self.tiny_decoder.clone();
+        let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
+        let pic_data = tiny_decoder.cover_pic_data();
+        let cover_data = self.async_ctx.exec_normal_task(pic_data.read());
+        if let Some(data_vec) = &*cover_data {
+            if let Ok(img) = image::load_from_memory(data_vec) {
+                let rgba8_img = img.to_rgba8();
+                let cover_color_img = ColorImage::from_rgba_unmultiplied(
+                    [rgba8_img.width() as usize, rgba8_img.height() as usize],
+                    &rgba8_img,
+                );
+                self.main_color_image = cover_color_img.clone();
             }
         }
     }
@@ -880,7 +890,7 @@ impl AppUi {
         Ok(())
     }
 
-    fn copy_video_data_to_img(&mut self, tiny_decoder: &mut TinyDecoder) {
+    fn copy_video_data_to_img(&mut self) {
         let c_img = &mut self.main_color_image;
         let current_video_frame = self.current_video_frame.clone();
         let current_video_frame = self.async_ctx.exec_normal_task(current_video_frame.read());
@@ -894,12 +904,6 @@ impl AppUi {
                 ImageData::Color(Arc::new(c_img.clone())),
                 TextureOptions::LINEAR,
             );
-        }
-
-        if self.check_play_is_at_endtail(tiny_decoder) {
-            if self.ui_flags.pause_flag.0.send(true).is_err() {
-                warn!("change pause flag err");
-            }
         }
     }
     fn detect_file_drag(&mut self, ctx: &Context, now: &Instant) {
@@ -941,7 +945,7 @@ impl AppUi {
             self.paint_playlist_window(ctx, now);
         }
     }
-    pub async fn read_video_folder(path: &Path, video_des: Arc<RwLock<Vec<VideoDes>>>) {
+    async fn read_video_folder(ctx: Context, path: PathBuf, video_des: Arc<RwLock<Vec<VideoDes>>>) {
         let mut video_targets = video_des.write().await;
         if let Ok(ite) = path.read_dir() {
             for entry in ite {
@@ -960,9 +964,14 @@ impl AppUi {
                                     || file_name.ends_with(".opus")
                                 {
                                     if let Some(p_str) = path.join(file_name).to_str() {
+                                        let cover =
+                                            Self::load_file_cover_pic(&PathBuf::from(p_str)).await;
+                                        let texture_handle =
+                                            Self::load_cover_texture(&ctx, &cover, file_name).await;
                                         video_targets.push(VideoDes {
                                             name: file_name.to_string(),
                                             path: p_str.to_string(),
+                                            texture_handle,
                                         });
                                     }
                                 }
@@ -972,6 +981,61 @@ impl AppUi {
                 } else {
                     warn!("read dir element err");
                 }
+            }
+        }
+    }
+    async fn load_file_cover_pic(file_path: &Path) -> RgbaImage {
+        if let Ok(input) = &mut ffmpeg_the_third::format::input(file_path) {
+            let mut cover_idx = None;
+
+            for stream in input.streams() {
+                if let Type::Video = stream.parameters().medium() {
+                    if let Disposition::ATTACHED_PIC = stream.disposition() {
+                        cover_idx = Some(stream.index());
+                        break;
+                    }
+                }
+            }
+            if let Some(idx) = cover_idx {
+                for packet in input.packets() {
+                    if let Ok((stream, p)) = &packet {
+                        if stream.index() == idx {
+                            if let Some(cover_data) = p.data() {
+                                if let Ok(dyn_img) = image::load_from_memory(cover_data) {
+                                    return dyn_img.to_rgba8();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
+            if let Ok(dyn_img) = image::load_from_memory(bytes.as_bytes()) {
+                return dyn_img.to_rgba8();
+            }
+        }
+        RgbaImage::new(1920, 1080)
+    }
+    async fn load_cover_texture(ctx: &Context, cover: &RgbaImage, name: &str) -> TextureHandle {
+        let color_image = ColorImage::from_rgba_unmultiplied(
+            [cover.width() as usize, cover.height() as usize],
+            cover.as_bytes(),
+        );
+        let handle = ctx.load_texture(
+            name,
+            ImageData::Color(Arc::new(color_image)),
+            TextureOptions::LINEAR,
+        );
+        handle
+    }
+
+    fn notify_data_thread(&self, tiny_decoder: &TinyDecoder) {
+        if let MainStream::Video = tiny_decoder.main_stream() {
+            self.data_thread_notify.notify_one();
+        } else {
+            if self.audio_player.len() < 10 {
+                self.data_thread_notify.notify_one();
             }
         }
     }

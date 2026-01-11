@@ -1,6 +1,6 @@
 [package]
 name = "tiny_player"
-version = "0.0.11"
+version = "0.0.13"
 edition = "2024"
 description = "a tiny video player"
 authors = ["Lori-Shu"]

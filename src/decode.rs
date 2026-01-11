@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
 };
 
 use ffmpeg_the_third::{
@@ -22,7 +21,12 @@ use ffmpeg_the_third::{
 };
 
 use time::format_description;
-use tokio::{io::AsyncWriteExt, runtime::Handle, sync::RwLock, task::JoinHandle, time::sleep};
+use tokio::{
+    io::AsyncWriteExt,
+    runtime::Handle,
+    sync::{Notify, RwLock},
+    task::JoinHandle,
+};
 use tracing::{Instrument, Level, info, span, warn};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult};
@@ -62,6 +66,7 @@ pub enum MainStream {
     Video,
     Audio,
 }
+
 /// represent all the details and relevent variables about
 /// video format, decode, detail and hardware accelerate
 /// the main struct of decode module to manage input and decode
@@ -92,6 +97,8 @@ pub struct TinyDecoder {
     hardware_config: Arc<AtomicBool>,
     cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
     runtime_handle: Handle,
+    demux_thread_notify: Arc<Notify>,
+    decode_thread_notify: Arc<Notify>,
 }
 impl TinyDecoder {
     /// init Decoder and new Struct
@@ -125,6 +132,8 @@ impl TinyDecoder {
             hardware_config: Arc::new(AtomicBool::new(false)),
             cover_pic_data: Arc::new(RwLock::new(None)),
             runtime_handle,
+            demux_thread_notify: Arc::new(Notify::new()),
+            decode_thread_notify: Arc::new(Notify::new()),
         })
     }
     /// reset all fields to the initial state
@@ -314,45 +323,17 @@ impl TinyDecoder {
         >,
         cover_stream_index: usize,
         cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
+        demux_thread_notify: Arc<Notify>,
     ) {
         info!("enter demux");
         loop {
-            sleep(Duration::from_millis(1)).await;
+            demux_thread_notify.notified().await;
             if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
             /*
             I choose to lock the packet vec first stick this in other functions
              */
-            {
-                let audio_packet_cache_vec = audio_packet_cache_queue.read().await;
-                let video_packet_cache_vec = video_packet_cache_queue.read().await;
-                if audio_packet_cache_vec.is_some() && video_packet_cache_vec.is_some() {
-                    if let Some(a_packets) = &*audio_packet_cache_vec {
-                        if let Some(v_packets) = &*video_packet_cache_vec {
-                            if a_packets.len() >= 200 && v_packets.len() >= 200 {
-                                continue;
-                            }
-                        }
-                    }
-
-                    //     info!(
-                    //         "audio packet vec len{},video packet vec len{}",
-                    //         a_packets.len(),
-                    //         v_packets.len()
-                    //     );
-                } else if let Some(a_packets) = &*audio_packet_cache_vec {
-                    if a_packets.len() >= 200 {
-                        // info!("packet vec len{}",cache_len);
-                        continue;
-                    }
-                } else if let Some(v_packets) = &*video_packet_cache_vec {
-                    if v_packets.len() >= 200 {
-                        // info!("packet vec len{}",cache_len);
-                        continue;
-                    }
-                }
-            }
 
             {
                 let mut audio_packet_vec = audio_packet_cache_queue.write().await;
@@ -449,6 +430,8 @@ impl TinyDecoder {
         hardware_config: Arc<AtomicBool>,
         video_time_base: Rational,
         video_frame_rect: [u32; 2],
+        demux_thread_notify: Arc<Notify>,
+        decode_thread_notify: Arc<Notify>,
     ) {
         info!("enter decode");
         let mut p = PathBuf::new();
@@ -575,7 +558,7 @@ impl TinyDecoder {
         }
         let hardware_frame_converter = Arc::new(RwLock::new(None));
         loop {
-            sleep(Duration::from_millis(1)).await;
+            decode_thread_notify.notified().await;
             if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
@@ -587,7 +570,10 @@ impl TinyDecoder {
                     if let Some(frames) = &mut *a_frame_vec {
                         let mut audio_decoder = audio_decoder.write().await;
                         // info!("audio frame vec len{}", frames.len());
-                        if !packets.is_empty() && frames.len() < 10 {
+                        if packets.len() < 100 {
+                            demux_thread_notify.notify_one();
+                        }
+                        if !packets.is_empty() {
                             if let Some(front_packet) = packets.pop_front() {
                                 if let Some(decoder) = &mut *audio_decoder {
                                     if decoder.0.send_packet(&front_packet).is_ok() {
@@ -619,7 +605,10 @@ impl TinyDecoder {
                     if let Some(frames) = &mut *v_frame_vec {
                         let mut v_decoder = video_decoder.write().await;
                         // info!("video frame vec len{}", frames.len());
-                        if !packets.is_empty() && frames.len() < 5 {
+                        if packets.len() < 100 {
+                            demux_thread_notify.notify_one();
+                        }
+                        if !packets.is_empty() {
                             if let Some(front_packet) = packets.pop_front() {
                                 if let Some(decoder) = &mut *v_decoder {
                                     if decoder.0.send_packet(&front_packet).is_ok() {
@@ -677,7 +666,7 @@ impl TinyDecoder {
         let cov_stream_index = self.cover_stream_index;
         let cover_pic_data = self.cover_pic_data.clone();
         let demux_exit_flag = self.demux_exit_flag.clone();
-
+        let demux_thread_notify = self.demux_thread_notify.clone();
         self.demux_task_handle = Some(self.runtime_handle.spawn(async move {
             let demux_span = span!(Level::INFO, "demux");
             let _demux_entered = demux_span.enter();
@@ -690,6 +679,7 @@ impl TinyDecoder {
                 video_packet_cache_que,
                 cov_stream_index,
                 cover_pic_data,
+                demux_thread_notify,
             )
             .in_current_span()
             .await;
@@ -705,6 +695,8 @@ impl TinyDecoder {
         let decode_exit_flag = self.decode_exit_flag.clone();
         let video_time_base = self.video_time_base;
         let video_frame_rect = self.video_frame_rect;
+        let decode_thread_notify = self.decode_thread_notify.clone();
+        let demux_thread_notify = self.demux_thread_notify.clone();
         self.decode_task_handle = Some(self.runtime_handle.spawn(async move {
             let demux_span = span!(Level::INFO, "decode");
             let _demux_entered = demux_span.enter();
@@ -719,6 +711,8 @@ impl TinyDecoder {
                 hardware_config,
                 video_time_base,
                 video_frame_rect,
+                demux_thread_notify,
+                decode_thread_notify,
             )
             .in_current_span()
             .await;
@@ -736,6 +730,9 @@ impl TinyDecoder {
             {
                 let mut a_frame_vec = self.audio_frame_cache_queue.write().await;
                 if let Some(a_frame_vec) = &mut *a_frame_vec {
+                    if a_frame_vec.len() < 10 {
+                        self.decode_thread_notify.notify_one();
+                    }
                     if !a_frame_vec.is_empty() {
                         if let Some(raw_frame) = a_frame_vec.pop_front() {
                             unsafe {
@@ -774,6 +771,9 @@ impl TinyDecoder {
                 let mut v_frame_vec = self.video_frame_cache_queue.write().await;
 
                 if let Some(v_frame_vec) = &mut *v_frame_vec {
+                    if v_frame_vec.len() < 5 {
+                        self.decode_thread_notify.notify_one();
+                    }
                     if !v_frame_vec.is_empty() {
                         if let Some(raw_frame) = v_frame_vec.pop_front() {
                             // info!("raw frame pts{}", raw_frame.pts().unwrap());
@@ -907,7 +907,7 @@ impl TinyDecoder {
             info!("end_time_err");
         }
     }
-    /// give an Arc of cover_pic_data out  
+    /// give an Arc of cover_pic_data out
     pub fn cover_pic_data(&self) -> Arc<RwLock<Option<Vec<u8>>>> {
         self.cover_pic_data.clone()
     }
@@ -928,6 +928,7 @@ impl TinyDecoder {
     async fn stop_demux_and_decode(&mut self) {
         self.demux_exit_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.demux_thread_notify.notify_one();
         if let Some(handle) = &mut self.demux_task_handle {
             if handle.await.is_ok() {
                 info!("demux thread join success");
@@ -935,6 +936,7 @@ impl TinyDecoder {
         }
         self.decode_exit_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.decode_thread_notify.notify_one();
         if let Some(handle) = &mut self.decode_task_handle {
             if handle.await.is_ok() {
                 info!("decode thread join success");
@@ -1006,6 +1008,26 @@ impl TinyDecoder {
 impl Drop for TinyDecoder {
     /// handle some struct that have to be free manually
     fn drop(&mut self) {
+        self.demux_exit_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.decode_exit_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.decode_thread_notify.notify_waiters();
+        let demux_task_handle = self.demux_task_handle.take();
+        let decode_task_handle = self.decode_task_handle.take();
+        self.runtime_handle.spawn(async move {
+            demux_task_handle
+                .ok_or(PlayerError::Internal("join demux thread err".to_string()))?
+                .await
+                .map_err(|_e| PlayerError::Internal("join demux thread err".to_string()))?;
+            decode_task_handle
+                .ok_or(PlayerError::Internal("join decode thread err".to_string()))?
+                .await
+                .map_err(|_e| PlayerError::Internal("join decode thread err".to_string()))?;
+            info!("demux and decode thread exit gracefully");
+            PlayerResult::Ok(())
+        });
+
         if let Some(ctx) = &mut self.resampler_ctx {
             unsafe {
                 swr_free(&mut ctx.0);

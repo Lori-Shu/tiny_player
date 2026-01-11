@@ -7,9 +7,8 @@ use ffmpeg_the_third::frame::Video;
 use rodio::Sink;
 use tokio::{
     runtime::Handle,
-    sync::{RwLock, watch::Receiver},
+    sync::{Notify, RwLock},
     task::JoinHandle,
-    time::sleep,
 };
 
 use crate::{
@@ -23,6 +22,7 @@ pub struct PresentDataManager {
 }
 impl PresentDataManager {
     pub fn new(
+        data_thread_notify: Arc<Notify>,
         runtime_handle: Handle,
         tiny_decoder: Arc<RwLock<TinyDecoder>>,
         used_model: Arc<RwLock<UsedModel>>,
@@ -30,114 +30,105 @@ impl PresentDataManager {
         current_video_frame: Arc<RwLock<Option<Video>>>,
         sink: Arc<Sink>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        pause_flag: Receiver<bool>,
     ) -> Self {
         Self {
             _data_thread_handle: runtime_handle.spawn(PresentDataManager::play_task(
+                data_thread_notify,
                 tiny_decoder,
                 sink,
                 used_model,
                 ai_subtitle,
                 current_video_frame,
                 main_stream_current_timestamp,
-                pause_flag,
             )),
         }
     }
     async fn play_task(
+        data_thread_notify: Arc<Notify>,
         tiny_decoder: Arc<RwLock<TinyDecoder>>,
         sink: Arc<Sink>,
         used_model: Arc<RwLock<UsedModel>>,
         ai_subtitle: Arc<RwLock<AISubTitle>>,
         current_video_frame: Arc<RwLock<Option<Video>>>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        pause_flag: Receiver<bool>,
     ) {
         let mut change_instant = Instant::now();
         loop {
-            sleep(Duration::from_millis(1)).await;
             /*
             add audio frame data to the audio player
              */
-            if !*pause_flag.borrow() {
-                let mut audio_cur_ts = None;
-                let mut tiny_decoder = tiny_decoder.write().await;
-                if let MainStream::Audio = tiny_decoder.main_stream() {
-                    if sink.len() < 10 {
-                        if let Some(audio_frame) = tiny_decoder.pull_one_audio_play_frame().await {
-                            if let Some(pts) = audio_frame.pts() {
-                                audio_cur_ts = Some(pts);
-                                AudioPlayer::play_raw_data_from_audio_frame(
-                                    &sink,
-                                    audio_frame.clone(),
-                                )
-                                .await;
-                                let used_model = used_model.read().await;
-                                let used_model_ref = &*used_model;
-                                let mut subtitle = ai_subtitle.write().await;
-                                subtitle
-                                    .push_frame_data(audio_frame, used_model_ref.clone())
-                                    .await;
-                            }
-                        }
+            data_thread_notify.notified().await;
+            let mut audio_cur_ts = None;
+            let mut tiny_decoder = tiny_decoder.write().await;
+            if let MainStream::Audio = tiny_decoder.main_stream() {
+                if let Some(audio_frame) = tiny_decoder.pull_one_audio_play_frame().await {
+                    if let Some(pts) = audio_frame.pts() {
+                        audio_cur_ts = Some(pts);
+                        AudioPlayer::play_raw_data_from_audio_frame(&sink, audio_frame.clone())
+                            .await;
+                        let used_model = used_model.read().await;
+                        let used_model_ref = &*used_model;
+                        let mut subtitle = ai_subtitle.write().await;
+                        subtitle
+                            .push_frame_data(audio_frame, used_model_ref.clone())
+                            .await;
                     }
                 }
-                if !PresentDataManager::is_video_wait_for_audio(
-                    &tiny_decoder,
-                    main_stream_current_timestamp.clone(),
-                    current_video_frame.clone(),
-                )
-                .await
-                {
-                    let ins_now = Instant::now();
-                    if ins_now - change_instant > Duration::from_millis(0) {
-                        if let Some(frame) = tiny_decoder.pull_one_video_play_frame().await {
-                            let mut cur_frame = current_video_frame.write().await;
-                            let main_stream = tiny_decoder.main_stream();
-                            if let MainStream::Video = main_stream {
-                                if let Some(f_pts) = frame.pts() {
-                                    if let Some(cur_frame) = &mut *cur_frame {
-                                        if let Some(cur_pts) = cur_frame.pts() {
-                                            let time_base = tiny_decoder.video_time_base();
-                                            if f_pts > 0
-                                                && cur_pts > 0
-                                                && ((f_pts - cur_pts)
-                                                    * (*time_base).numerator() as i64
-                                                    / (*time_base).denominator() as i64)
-                                                    < 1
+            }
+            if !PresentDataManager::is_video_wait_for_audio(
+                &tiny_decoder,
+                main_stream_current_timestamp.clone(),
+                current_video_frame.clone(),
+            )
+            .await
+            {
+                let ins_now = Instant::now();
+                if ins_now - change_instant > Duration::from_millis(0) {
+                    if let Some(frame) = tiny_decoder.pull_one_video_play_frame().await {
+                        let mut cur_frame = current_video_frame.write().await;
+                        let main_stream = tiny_decoder.main_stream();
+                        if let MainStream::Video = main_stream {
+                            if let Some(f_pts) = frame.pts() {
+                                if let Some(cur_frame) = &mut *cur_frame {
+                                    if let Some(cur_pts) = cur_frame.pts() {
+                                        let time_base = tiny_decoder.video_time_base();
+                                        if f_pts > 0
+                                            && cur_pts > 0
+                                            && ((f_pts - cur_pts) * (*time_base).numerator() as i64
+                                                / (*time_base).denominator() as i64)
+                                                < 1
+                                        {
+                                            if let Some(ins) =
+                                                change_instant.checked_add(Duration::from_millis(
+                                                    ((f_pts - cur_pts)
+                                                        * 1000
+                                                        * (*time_base).numerator() as i64
+                                                        / (*time_base).denominator() as i64)
+                                                        as u64,
+                                                ))
                                             {
-                                                if let Some(ins) = change_instant.checked_add(
-                                                    Duration::from_millis(
-                                                        ((f_pts - cur_pts)
-                                                            * 1000
-                                                            * (*time_base).numerator() as i64
-                                                            / (*time_base).denominator() as i64)
-                                                            as u64,
-                                                    ),
-                                                ) {
-                                                    change_instant = ins;
-                                                }
-                                            } else {
-                                                change_instant = ins_now;
+                                                change_instant = ins;
                                             }
+                                        } else {
+                                            change_instant = ins_now;
                                         }
                                     }
                                 }
-                            } else if let MainStream::Audio = main_stream {
-                                change_instant = ins_now;
                             }
-                            *cur_frame = Some(frame);
+                        } else if let MainStream::Audio = main_stream {
+                            change_instant = ins_now;
                         }
+                        *cur_frame = Some(frame);
                     }
                 }
-                PresentDataManager::update_current_timestamp(
-                    main_stream_current_timestamp.clone(),
-                    audio_cur_ts,
-                    &tiny_decoder,
-                    current_video_frame.clone(),
-                )
-                .await;
             }
+            PresentDataManager::update_current_timestamp(
+                main_stream_current_timestamp.clone(),
+                audio_cur_ts,
+                &tiny_decoder,
+                current_video_frame.clone(),
+            )
+            .await;
         }
     }
     async fn update_current_timestamp(

@@ -1,11 +1,13 @@
+use egui::TextureHandle;
 use tokio::runtime::{Handle, Runtime};
 
 use crate::{PlayerError, PlayerResult};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VideoDes {
     pub name: String,
     pub path: String,
+    pub texture_handle: TextureHandle,
 }
 pub struct AsyncContext {
     async_runtime: Runtime,

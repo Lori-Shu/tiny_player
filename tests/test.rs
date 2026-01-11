@@ -256,8 +256,8 @@ mod test {
         // 102, 205, 307, 403, 502, 608, 701, 809, 904, 1006, 1103, 1205, 1307, 1403, 1502 s 5001 false
         // 100, 99, 98, 97, 96, 95, 20, 19, 18, 17, 16, 15, 5, 4, 3, 2, 1 sum 350
         // 200, 200, 200, 200, 200, 1, 1, 1, 1, 1 sum 700 false
-        let mut arr = vec![200, 200, 200, 200, 200, 1, 1, 1, 1, 1];
-        let sum = 700;
+        // let mut arr = vec![200, 200, 200, 200, 200, 1, 1, 1, 1, 1];
+        // let sum = 700;
         // arr.sort();
         // arr.reverse();
         // let mut ans_arr = vec![];
@@ -313,7 +313,7 @@ mod test {
         }
         result_chose
     }
-    fn is_sub_set_sum(arr: &mut [i32], sum: &i32) -> bool {
+    fn _is_sub_set_sum(arr: &mut [i32], sum: &i32) -> bool {
         arr.sort();
         arr.reverse();
         let mut remain_elements_sum = arr.iter().sum::<i32>();

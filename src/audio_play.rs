@@ -57,4 +57,8 @@ impl AudioPlayer {
     pub fn sink(&self) -> Arc<Sink> {
         self.sink.clone()
     }
+
+    pub fn len(&self) -> usize {
+        self.sink.len()
+    }
 }
