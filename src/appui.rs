@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use egui::{
@@ -24,7 +24,7 @@ use crate::{
     ai_sub_title::{AISubTitle, UsedModel},
     async_context::{AsyncContext, VideoDes},
     decode::{MainStream, TinyDecoder},
-    present_data_manage::PresentDataManager,
+    present_data_manage::{CurFrame, PresentDataManager},
 };
 
 const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
@@ -94,12 +94,13 @@ pub struct AppUi {
     err_window_msg: String,
     last_show_control_ui_instant: Instant,
     app_start_instant: Instant,
-    current_video_frame: Arc<RwLock<Option<ffmpeg_the_third::frame::Video>>>,
+    current_video_frame: Arc<RwLock<Option<CurFrame>>>,
     async_ctx: AsyncContext,
     opened_file: Option<std::path::PathBuf>,
     open_file_dialog: Option<egui_file::FileDialog>,
     scan_folder_dialog: Option<egui_file::FileDialog>,
     subtitle: Arc<RwLock<AISubTitle>>,
+    subtitle_text: RichText,
     video_des: Arc<RwLock<Vec<VideoDes>>>,
     used_model: Arc<RwLock<UsedModel>>,
     audio_volumn: f32,
@@ -108,6 +109,7 @@ pub struct AppUi {
 impl eframe::App for AppUi {
     /// this function will automaticly be called every ui redraw
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(Duration::from_millis(15));
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
                 /*
@@ -120,30 +122,30 @@ impl eframe::App for AppUi {
                     self.frame_show_instant = now;
                 }
                 {
-                    let decoder = self.tiny_decoder.clone();
-                    let tiny_decoder = self.async_ctx.exec_normal_task(decoder.write());
-                    if self
-                        .async_ctx
-                        .exec_normal_task(tiny_decoder.is_input_exist())
-                    {
-                        if !*self.ui_flags.pause_flag.1.borrow() {
-                            /*
-                            if now is next_frame_time or a little beyond get and show a new frame
-                             */
-                            if keepawake::Builder::default()
-                                .display(true)
-                                .idle(true)
-                                .app_name("tiny_player")
-                                .reason("video play")
-                                .create()
-                                .is_err()
-                            {
-                                warn!("keep awake err");
-                            }
-                            self.notify_data_thread(&tiny_decoder);
-                            if self.check_play_is_at_endtail(&tiny_decoder) {
-                                if self.ui_flags.pause_flag.0.send(true).is_err() {
-                                    warn!("change pause flag err");
+                    if let Ok(tiny_decoder) = self.tiny_decoder.try_read() {
+                        if self
+                            .async_ctx
+                            .exec_normal_task(tiny_decoder.is_input_exist())
+                        {
+                            if !*self.ui_flags.pause_flag.1.borrow() {
+                                /*
+                                if now is next_frame_time or a little beyond get and show a new frame
+                                 */
+                                if keepawake::Builder::default()
+                                    .display(true)
+                                    .idle(true)
+                                    .app_name("tiny_player")
+                                    .reason("video play")
+                                    .create()
+                                    .is_err()
+                                {
+                                    warn!("keep awake err");
+                                }
+                                self.notify_data_thread(&tiny_decoder);
+                                if self.check_play_is_at_endtail(&tiny_decoder) {
+                                    if self.ui_flags.pause_flag.0.send(true).is_err() {
+                                        warn!("change pause flag err");
+                                    }
                                 }
                             }
                         }
@@ -300,6 +302,7 @@ impl AppUi {
             scan_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
             bg_dyn_img: dyn_img,
             subtitle,
+            subtitle_text: RichText::new(""),
             video_des: Arc::new(RwLock::new(vec![])),
             audio_volumn: 1.0,
             data_thread_notify,
@@ -323,62 +326,60 @@ impl AppUi {
         }
     }
     fn update_time_and_time_text(&mut self) {
-        let decoder = self.tiny_decoder.clone();
-        let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
-        if self
-            .async_ctx
-            .exec_normal_task(tiny_decoder.is_input_exist())
-        {
-            let play_ts = self.async_ctx.exec_normal_task(async {
-                let ts = self.main_stream_current_timestamp.read().await;
-                *ts
-            });
+        if let Ok(tiny_decoder) = self.tiny_decoder.try_read() {
+            if self
+                .async_ctx
+                .exec_normal_task(tiny_decoder.is_input_exist())
+            {
+                if let Ok(play_ts) = self.main_stream_current_timestamp.try_read() {
+                    let sec_num = {
+                        if let MainStream::Audio = tiny_decoder.main_stream() {
+                            let audio_time_base = tiny_decoder.audio_time_base();
+                            *play_ts * audio_time_base.numerator() as i64
+                                / audio_time_base.denominator() as i64
+                        } else {
+                            let v_time_base = tiny_decoder.video_time_base();
 
-            let sec_num = {
-                if let MainStream::Audio = tiny_decoder.main_stream() {
-                    let audio_time_base = tiny_decoder.audio_time_base();
-                    play_ts * audio_time_base.numerator() as i64
-                        / audio_time_base.denominator() as i64
-                } else {
-                    let v_time_base = tiny_decoder.video_time_base();
-
-                    play_ts * v_time_base.numerator() as i64 / v_time_base.denominator() as i64
-                }
-            };
-            let sec = (sec_num % 60) as u8;
-            let min_num = sec_num / 60;
-            let min = (min_num % 60) as u8;
-            let hour_num = min_num / 60;
-            let hour = hour_num as u8;
-            if let Ok(cur_time) = time::Time::from_hms(hour, min, sec) {
-                if !cur_time.eq(&self.play_time) {
-                    if let Ok(formatter) =
-                        time::format_description::parse("[hour]:[minute]:[second]")
-                    {
-                        if let Ok(mut now_str) = cur_time.format(&formatter) {
-                            now_str.push('|');
-                            now_str.push_str(tiny_decoder.end_time_formatted_string());
-                            self.time_text = now_str;
-                            self.play_time = cur_time;
+                            *play_ts * v_time_base.numerator() as i64
+                                / v_time_base.denominator() as i64
                         }
+                    };
+                    let sec = (sec_num % 60) as u8;
+                    let min_num = sec_num / 60;
+                    let min = (min_num % 60) as u8;
+                    let hour_num = min_num / 60;
+                    let hour = hour_num as u8;
+                    if let Ok(cur_time) = time::Time::from_hms(hour, min, sec) {
+                        if !cur_time.eq(&self.play_time) {
+                            if let Ok(formatter) =
+                                time::format_description::parse("[hour]:[minute]:[second]")
+                            {
+                                if let Ok(mut now_str) = cur_time.format(&formatter) {
+                                    now_str.push('|');
+                                    now_str.push_str(tiny_decoder.end_time_formatted_string());
+                                    self.time_text = now_str;
+                                    self.play_time = cur_time;
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("update time str err!");
                     }
                 }
-            } else {
-                warn!("update time str err!");
             }
         }
     }
     fn update_color_image(&mut self) {
-        let decoder = self.tiny_decoder.clone();
-        let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
-        let frame_rect = tiny_decoder.video_frame_rect();
-        if frame_rect[0] != 0 {
-            let color_image = ColorImage::filled(
-                [frame_rect[0] as usize, frame_rect[1] as usize],
-                Color32::from_rgba_unmultiplied(0, 0, 0, 255),
-            );
+        if let Ok(tiny_decoder) = self.tiny_decoder.try_read() {
+            let frame_rect = tiny_decoder.video_frame_rect();
+            if frame_rect[0] != 0 {
+                let color_image = ColorImage::filled(
+                    [frame_rect[0] as usize, frame_rect[1] as usize],
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 255),
+                );
 
-            self.main_color_image = color_image;
+                self.main_color_image = color_image;
+            }
         }
     }
     fn load_video_texture(&mut self, ctx: &egui::Context) {
@@ -449,7 +450,6 @@ impl AppUi {
     fn paint_playpause_btn(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let decoder = self.tiny_decoder.clone();
         let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
-
         if self
             .async_ctx
             .exec_normal_task(tiny_decoder.is_input_exist())
@@ -491,14 +491,14 @@ impl AppUi {
     fn paint_control_area(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         ui.horizontal(|ui| {
             let decoder = self.tiny_decoder.clone();
-            let mut tiny_decoder = self.async_ctx.exec_normal_task(decoder.write());
+            let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
             if self
                 .async_ctx
                 .exec_normal_task(tiny_decoder.is_input_exist())
             {
                 let mut timestamp = self
                     .async_ctx
-                    .exec_normal_task(async { self.main_stream_current_timestamp.write().await });
+                    .exec_normal_task(self.main_stream_current_timestamp.write());
                 let mut slider_color = THEME_COLOR.to_srgba_unmultiplied();
                 slider_color[3] = 100;
                 let progress_slider = egui::Slider::new(&mut *timestamp, 0..=tiny_decoder.end_ts())
@@ -638,49 +638,54 @@ impl AppUi {
     }
     fn paint_subtitle(&mut self, ui: &mut Ui, ctx: &Context) {
         ui.horizontal(|ui| {
-            let decoder = self.tiny_decoder.clone();
-            let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
-            if self
-                .async_ctx
-                .exec_normal_task(tiny_decoder.is_input_exist())
-            {
-                ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-                    let subtitle = self.async_ctx.exec_normal_task(self.subtitle.read());
+            if let Ok(tiny_decoder) = self.tiny_decoder.try_read() {
+                if self
+                    .async_ctx
+                    .exec_normal_task(tiny_decoder.is_input_exist())
+                {
+                    ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+                        if let Ok(subtitle) = self.subtitle.try_read() {
+                            let generated_str = subtitle.generated_str();
+                            let len_in_chars = generated_str.chars().count();
+                            if let Ok(used_model) = self.used_model.try_read() {
+                                let used_model_ref = &*used_model;
+                                let ui_str = {
+                                    if let UsedModel::Chinese = used_model_ref {
+                                        if len_in_chars > 20 {
+                                            generated_str
+                                                .char_range(len_in_chars - 20..len_in_chars)
+                                        } else {
+                                            generated_str
+                                        }
+                                    } else if let UsedModel::English = used_model_ref {
+                                        if len_in_chars > 50 {
+                                            generated_str
+                                                .char_range(len_in_chars - 50..len_in_chars)
+                                        } else {
+                                            generated_str
+                                        }
+                                    } else {
+                                        ""
+                                    }
+                                };
 
-                    let sub_text = {
-                        let generated_str = subtitle.generated_str();
-                        let len_in_chars = generated_str.chars().count();
-                        let used_model = self.used_model.clone();
-                        let used_model = self.async_ctx.exec_normal_task(used_model.read());
-                        let used_model_ref = &*used_model;
-                        let ui_str = {
-                            if let UsedModel::Chinese = used_model_ref {
-                                if len_in_chars > 20 {
-                                    generated_str.char_range(len_in_chars - 20..len_in_chars)
-                                } else {
-                                    generated_str.char_range(0..len_in_chars)
-                                }
-                            } else if let UsedModel::English = used_model_ref {
-                                if len_in_chars > 30 {
-                                    generated_str.char_range(len_in_chars - 30..len_in_chars)
-                                } else {
-                                    generated_str.char_range(0..len_in_chars)
-                                }
-                            } else {
-                                generated_str
+                                self.subtitle_text =
+                                    RichText::new(ui_str).size(50.0).color(*THEME_COLOR);
                             }
-                        };
-                        RichText::new(ui_str)
-                            .size(50.0)
-                            .color(*THEME_COLOR)
-                            .atom_size(Vec2::new(ctx.content_rect().width() - 100.0, 20.0))
-                    };
-                    let subtitle_text_button = egui::Button::new(sub_text).frame(false);
-                    let be_opacity = ui.opacity();
-                    ui.set_opacity(1.0);
-                    ui.add(subtitle_text_button);
-                    ui.set_opacity(be_opacity);
-                });
+
+                            let subtitle_text_button = egui::Button::new(
+                                self.subtitle_text
+                                    .clone()
+                                    .atom_size(Vec2::new(ctx.content_rect().width(), 10.0)),
+                            )
+                            .frame(false);
+                            let be_opacity = ui.opacity();
+                            ui.set_opacity(1.0);
+                            ui.add(subtitle_text_button);
+                            ui.set_opacity(be_opacity);
+                        }
+                    });
+                }
             }
         });
     }
@@ -728,30 +733,28 @@ impl AppUi {
             ui.add(date_time_button);
         });
     }
-    fn check_play_is_at_endtail(&mut self, tiny_decoder: &TinyDecoder) -> bool {
-        let pts = *self
-            .async_ctx
-            .exec_normal_task(self.main_stream_current_timestamp.read());
-        let main_stream_time_base = {
-            if let MainStream::Audio = tiny_decoder.main_stream() {
-                tiny_decoder.audio_time_base()
-            } else {
-                tiny_decoder.video_time_base()
+    fn check_play_is_at_endtail(&self, tiny_decoder: &TinyDecoder) -> bool {
+        if let Ok(pts) = self.main_stream_current_timestamp.try_read() {
+            let main_stream_time_base = {
+                if let MainStream::Audio = tiny_decoder.main_stream() {
+                    tiny_decoder.audio_time_base()
+                } else {
+                    tiny_decoder.video_time_base()
+                }
+            };
+            if *pts
+                + main_stream_time_base.denominator() as i64
+                    / main_stream_time_base.numerator() as i64
+                    / 2
+                >= tiny_decoder.end_ts()
+            // tiny_decoder.end_audio_ts() * audio_time_base.numerator() as i64
+            //     / audio_time_base.denominator() as i64
+            {
+                let end = tiny_decoder.end_ts();
+                warn!("play end! end_ts:{end},current_ts:{pts} ");
+                return true;
             }
-        };
-        if pts
-            + main_stream_time_base.denominator() as i64
-                / main_stream_time_base.numerator() as i64
-                / 2
-            >= tiny_decoder.end_ts()
-        // tiny_decoder.end_audio_ts() * audio_time_base.numerator() as i64
-        //     / audio_time_base.denominator() as i64
-        {
-            let end = tiny_decoder.end_ts();
-            warn!("play end! end_ts:{end},current_ts:{pts} ");
-            return true;
         }
-
         false
     }
 
@@ -853,6 +856,7 @@ impl AppUi {
                     [rgba8_img.width() as usize, rgba8_img.height() as usize],
                     &rgba8_img,
                 );
+                info!("set cover img!");
                 self.main_color_image = cover_color_img.clone();
             }
         }
@@ -892,18 +896,17 @@ impl AppUi {
 
     fn copy_video_data_to_img(&mut self) {
         let c_img = &mut self.main_color_image;
-        let current_video_frame = self.current_video_frame.clone();
-        let current_video_frame = self.async_ctx.exec_normal_task(current_video_frame.read());
-        if let Some(current_video_frame) = &*current_video_frame {
-            c_img
-                .as_raw_mut()
-                .copy_from_slice(current_video_frame.data(0));
-        }
-        if let Some(v_tex) = &mut self.video_texture_handle {
-            v_tex.set(
-                ImageData::Color(Arc::new(c_img.clone())),
-                TextureOptions::LINEAR,
-            );
+        if let Ok(current_video_frame) = self.current_video_frame.try_read() {
+            if let Some(current_video_frame) = &*current_video_frame {
+                let img_raw_bytes = c_img.as_raw_mut();
+                img_raw_bytes.copy_from_slice(current_video_frame.data());
+            }
+            if let Some(v_tex) = &mut self.video_texture_handle {
+                v_tex.set(
+                    ImageData::Color(Arc::new(c_img.clone())),
+                    TextureOptions::LINEAR,
+                );
+            }
         }
     }
     fn detect_file_drag(&mut self, ctx: &Context, now: &Instant) {

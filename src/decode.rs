@@ -10,9 +10,10 @@ use ffmpeg_the_third::{
     ChannelLayout, Rational, Stream,
     ffi::{
         AV_CHANNEL_LAYOUT_STEREO, AVPixelFormat, AVSEEK_FLAG_BACKWARD, SwrContext,
-        av_hwdevice_ctx_create, av_hwframe_transfer_data, avcodec_get_hw_config,
-        avfilter_get_by_name, avfilter_graph_create_filter, avfilter_link, swr_alloc_set_opts2,
-        swr_convert_frame, swr_free, swr_init,
+        av_hwdevice_ctx_create, av_hwframe_transfer_data, av_image_copy_to_buffer,
+        av_image_get_buffer_size, avcodec_get_hw_config, avfilter_get_by_name,
+        avfilter_graph_create_filter, avfilter_link, swr_alloc_set_opts2, swr_convert_frame,
+        swr_free, swr_init,
     },
     filter::Graph,
     format::{Pixel, sample::Type, stream::Disposition},
@@ -327,7 +328,6 @@ impl TinyDecoder {
     ) {
         info!("enter demux");
         loop {
-            demux_thread_notify.notified().await;
             if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
@@ -368,6 +368,7 @@ impl TinyDecoder {
                     }
                 }
             }
+            demux_thread_notify.notified().await;
         }
     }
     ///convert the hardware output frame to middle format YUV420P
@@ -384,27 +385,34 @@ impl TinyDecoder {
                     video_frame_tmp.as_ptr(),
                     0,
                 ) {
-                    info!("hardware frame transfer to software frame err");
+                    warn!("hardware frame transfer to software frame err");
                 }
 
                 transfered_frame.set_pts(video_frame_tmp.pts());
                 let mut default_frame = Video::empty();
-                let mut hardware_frame_converter = hardware_frame_converter.write().await;
-                if let Some(hardware_frame_converter) = &mut *hardware_frame_converter {
-                    if hardware_frame_converter
-                        .0
-                        .run(&transfered_frame, &mut default_frame)
-                        .is_ok()
-                    {
-                        default_frame.set_pts(transfered_frame.pts());
-                        return default_frame;
+                {
+                    let mut hardware_frame_converter_guard = hardware_frame_converter.write().await;
+                    if let Some(hardware_frame_converter) = &mut *hardware_frame_converter_guard {
+                        if hardware_frame_converter
+                            .0
+                            .run(&transfered_frame, &mut default_frame)
+                            .is_ok()
+                        {
+                            default_frame.set_pts(transfered_frame.pts());
+                            return default_frame;
+                        }
+                    } else if let Ok(mut ctx) = ffmpeg_the_third::software::converter(
+                        (video_frame_tmp.width(), video_frame_tmp.height()),
+                        transfered_frame.format(),
+                        Pixel::YUV420P,
+                    ) {
+                        info!("transfered_frame format: {:?}", transfered_frame.format());
+                        if ctx.run(&transfered_frame, &mut default_frame).is_ok() {
+                            default_frame.set_pts(transfered_frame.pts());
+                            *hardware_frame_converter_guard = Some(ManualProtectedConverter(ctx));
+                            return default_frame;
+                        }
                     }
-                } else if let Ok(ctx) = ffmpeg_the_third::software::converter(
-                    (video_frame_tmp.width(), video_frame_tmp.height()),
-                    transfered_frame.format(),
-                    Pixel::YUV420P,
-                ) {
-                    *hardware_frame_converter = Some(ManualProtectedConverter(ctx));
                 }
             }
         }
@@ -558,7 +566,6 @@ impl TinyDecoder {
         }
         let hardware_frame_converter = Arc::new(RwLock::new(None));
         loop {
-            decode_thread_notify.notified().await;
             if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
@@ -570,7 +577,7 @@ impl TinyDecoder {
                     if let Some(frames) = &mut *a_frame_vec {
                         let mut audio_decoder = audio_decoder.write().await;
                         // info!("audio frame vec len{}", frames.len());
-                        if packets.len() < 100 {
+                        if packets.len() < 10 {
                             demux_thread_notify.notify_one();
                         }
                         if !packets.is_empty() {
@@ -605,7 +612,7 @@ impl TinyDecoder {
                     if let Some(frames) = &mut *v_frame_vec {
                         let mut v_decoder = video_decoder.write().await;
                         // info!("video frame vec len{}", frames.len());
-                        if packets.len() < 100 {
+                        if packets.len() < 10 {
                             demux_thread_notify.notify_one();
                         }
                         if !packets.is_empty() {
@@ -654,6 +661,7 @@ impl TinyDecoder {
                     }
                 }
             }
+            decode_thread_notify.notified().await;
         }
     }
     /// start the demux and decode task
@@ -759,6 +767,33 @@ impl TinyDecoder {
 
         None
     }
+    pub async fn convert_frame_data_to_no_padding_layout(res: &mut Video) -> Box<[u8]> {
+        unsafe {
+            let buf_size = av_image_get_buffer_size(
+                AVPixelFormat::AV_PIX_FMT_RGBA,
+                res.width() as i32,
+                res.height() as i32,
+                1,
+            );
+            let mut buf = vec![0_u8; buf_size as usize];
+            let frame = res.as_mut_ptr();
+
+            if 0 > av_image_copy_to_buffer(
+                buf.as_mut_ptr(),
+                buf_size,
+                (*frame).data.as_ptr() as *const *const u8,
+                (*frame).linesize.as_ptr(),
+                AVPixelFormat::from(res.format()),
+                (*frame).width,
+                (*frame).height,
+                1,
+            ) {
+                warn!("av_image_copy_to_buffer err");
+            }
+            buf.into_boxed_slice()
+        }
+    }
+
     /// pull one frame from the video cache queue
     /// in additon, do the convert and if the input changed(caused by source or hard acce)
     /// set the new converter, only change the out put format, dont change the width and height which
@@ -782,6 +817,7 @@ impl TinyDecoder {
                                 if let Some(pts) = raw_frame.pts() {
                                     res.set_pts(Some(pts));
                                 }
+
                                 return_val = Some(res);
                             }
                         }
@@ -817,7 +853,7 @@ impl TinyDecoder {
     /// use the ffi function to enable seek all the frames
     /// the ffmpeg_the_third::ffi::AVSEEK_FLAG_ANY flag makes sure
     /// the seek would go as I want, to an exact frame
-    pub fn seek_timestamp_to_decode(&mut self, ts: i64) {
+    pub fn seek_timestamp_to_decode(&self, ts: i64) {
         {
             let mut audio_packet_cache_vec = self
                 .runtime_handle
