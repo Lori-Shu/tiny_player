@@ -4,17 +4,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+use eframe::{
+    Frame,
+    wgpu::{Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect},
+};
 use egui::{
     AtomExt, Color32, ColorImage, Context, Image, ImageData, ImageSource, Layout, Pos2, Rect,
-    RichText, TextBuffer, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId,
-    Widget, WidgetText, include_image,
+    RichText, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId, Widget,
+    WidgetText, include_image,
 };
 
-use ffmpeg_the_third::{format::stream::Disposition, media::Type};
+use ffmpeg_the_third::{format::stream::Disposition, frame::Video, media::Type};
 use image::{DynamicImage, EncodableLayout, RgbaImage};
 
 use tokio::sync::{
-    Notify, RwLock,
+    Notify, RwLock, mpsc,
     watch::{self, Receiver, Sender},
 };
 use tracing::{info, warn};
@@ -24,7 +28,7 @@ use crate::{
     ai_sub_title::{AISubTitle, UsedModel},
     async_context::{AsyncContext, VideoDes},
     decode::{MainStream, TinyDecoder},
-    present_data_manage::{CurFrame, PresentDataManager},
+    present_data_manage::PresentDataManager,
 };
 
 const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
@@ -94,13 +98,14 @@ pub struct AppUi {
     err_window_msg: String,
     last_show_control_ui_instant: Instant,
     app_start_instant: Instant,
-    current_video_frame: Arc<RwLock<Option<CurFrame>>>,
+    current_video_frame: Arc<RwLock<Video>>,
     async_ctx: AsyncContext,
     opened_file: Option<std::path::PathBuf>,
     open_file_dialog: Option<egui_file::FileDialog>,
     scan_folder_dialog: Option<egui_file::FileDialog>,
-    subtitle: Arc<RwLock<AISubTitle>>,
-    subtitle_text: RichText,
+    _subtitle: Arc<RwLock<AISubTitle>>,
+    subtitle_text: String,
+    subtitle_text_receiver: mpsc::Receiver<String>,
     video_des: Arc<RwLock<Vec<VideoDes>>>,
     used_model: Arc<RwLock<UsedModel>>,
     audio_volumn: f32,
@@ -108,7 +113,7 @@ pub struct AppUi {
 }
 impl eframe::App for AppUi {
     /// this function will automaticly be called every ui redraw
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(15));
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
@@ -151,7 +156,7 @@ impl eframe::App for AppUi {
                         }
                     }
                 }
-                self.copy_video_data_to_img();
+                self.copy_video_data_to_texture(frame);
                 /*
                 down part is ui painting and control
 
@@ -253,12 +258,16 @@ impl AppUi {
         let tiny_decoder = crate::decode::TinyDecoder::new(rt.clone())?;
         let tiny_decoder = Arc::new(RwLock::new(tiny_decoder));
         let used_model = Arc::new(RwLock::new(UsedModel::Empty));
-        let subtitle = Arc::new(RwLock::new(AISubTitle::new()?));
+        let subtitle_channel = mpsc::channel(5);
+        let subtitle = Arc::new(RwLock::new(AISubTitle::new(subtitle_channel.0)?));
         let audio_player = crate::audio_play::AudioPlayer::new()?;
-        let current_video_frame = Arc::new(RwLock::new(None));
+        let empty_frame = Video::empty();
+        let current_video_frame = Arc::new(RwLock::new(empty_frame));
         let main_stream_current_timestamp = Arc::new(RwLock::new(0));
         let pause_flag = watch::channel(true);
+
         let data_thread_notify = Arc::new(Notify::new());
+
         let _present_data_manager = PresentDataManager::new(
             data_thread_notify.clone(),
             rt,
@@ -270,6 +279,7 @@ impl AppUi {
             main_stream_current_timestamp.clone(),
         );
         Ok(Self {
+            subtitle_text_receiver: subtitle_channel.1,
             video_texture_handle: None,
             tiny_decoder,
             audio_player,
@@ -301,8 +311,8 @@ impl AppUi {
             open_file_dialog: Some(f_dialog),
             scan_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
             bg_dyn_img: dyn_img,
-            subtitle,
-            subtitle_text: RichText::new(""),
+            _subtitle: subtitle,
+            subtitle_text: String::new(),
             video_des: Arc::new(RwLock::new(vec![])),
             audio_volumn: 1.0,
             data_thread_notify,
@@ -544,7 +554,8 @@ impl AppUi {
                     let cur_v_frame = self.current_video_frame.clone();
                     let mut current_video_frame =
                         self.async_ctx.exec_normal_task(cur_v_frame.write());
-                    *current_video_frame = None;
+                    let empty_frame = Video::empty();
+                    *current_video_frame = empty_frame;
                 }
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     let subtitle_btn = PlayerTextButton::new("AI ST", 20.0, true);
@@ -644,46 +655,23 @@ impl AppUi {
                     .exec_normal_task(tiny_decoder.is_input_exist())
                 {
                     ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-                        if let Ok(subtitle) = self.subtitle.try_read() {
-                            let generated_str = subtitle.generated_str();
-                            let len_in_chars = generated_str.chars().count();
-                            if let Ok(used_model) = self.used_model.try_read() {
-                                let used_model_ref = &*used_model;
-                                let ui_str = {
-                                    if let UsedModel::Chinese = used_model_ref {
-                                        if len_in_chars > 20 {
-                                            generated_str
-                                                .char_range(len_in_chars - 20..len_in_chars)
-                                        } else {
-                                            generated_str
-                                        }
-                                    } else if let UsedModel::English = used_model_ref {
-                                        if len_in_chars > 50 {
-                                            generated_str
-                                                .char_range(len_in_chars - 50..len_in_chars)
-                                        } else {
-                                            generated_str
-                                        }
-                                    } else {
-                                        ""
-                                    }
-                                };
-
-                                self.subtitle_text =
-                                    RichText::new(ui_str).size(50.0).color(*THEME_COLOR);
-                            }
-
-                            let subtitle_text_button = egui::Button::new(
-                                self.subtitle_text
-                                    .clone()
-                                    .atom_size(Vec2::new(ctx.content_rect().width(), 10.0)),
-                            )
-                            .frame(false);
-                            let be_opacity = ui.opacity();
-                            ui.set_opacity(1.0);
-                            ui.add(subtitle_text_button);
-                            ui.set_opacity(be_opacity);
+                        if let Ok(generated_str) = self.subtitle_text_receiver.try_recv() {
+                            self.subtitle_text.push_str(&generated_str);
                         }
+                        if self.subtitle_text.len() > 50 {
+                            self.subtitle_text.remove(0);
+                        }
+                        let subtitle_text_button = egui::Button::new(
+                            RichText::new(self.subtitle_text.clone())
+                                .size(50.0)
+                                .color(*THEME_COLOR)
+                                .atom_size(Vec2::new(ctx.content_rect().width(), 10.0)),
+                        )
+                        .frame(false);
+                        let be_opacity = ui.opacity();
+                        ui.set_opacity(1.0);
+                        ui.add(subtitle_text_button);
+                        ui.set_opacity(be_opacity);
                     });
                 }
             }
@@ -888,24 +876,55 @@ impl AppUi {
         });
         let current_video_frame = self.current_video_frame.clone();
         let mut current_video_frame = self.async_ctx.exec_normal_task(current_video_frame.write());
-        *current_video_frame = None;
+        let empty_frame = Video::empty();
+        *current_video_frame = empty_frame;
         self.frame_show_instant = *now;
 
         Ok(())
     }
 
-    fn copy_video_data_to_img(&mut self) {
+    fn copy_video_data_to_texture(&mut self, frame: &mut Frame) {
         let c_img = &mut self.main_color_image;
         if let Ok(current_video_frame) = self.current_video_frame.try_read() {
-            if let Some(current_video_frame) = &*current_video_frame {
-                let img_raw_bytes = c_img.as_raw_mut();
-                img_raw_bytes.copy_from_slice(current_video_frame.data());
-            }
             if let Some(v_tex) = &mut self.video_texture_handle {
-                v_tex.set(
-                    ImageData::Color(Arc::new(c_img.clone())),
-                    TextureOptions::LINEAR,
-                );
+                if current_video_frame.pts().is_some() {
+                    if let Some(wgpu_render_state) = frame.wgpu_render_state() {
+                        let renderer = wgpu_render_state.renderer.read();
+                        if let Some(wgpu_texture) = renderer.texture(&v_tex.id()) {
+                            if let Some(texture) = &wgpu_texture.texture {
+                                let texel_copy_info = TexelCopyTextureInfo {
+                                    texture: texture,
+                                    mip_level: 0,
+                                    origin: Origin3d::ZERO,
+                                    aspect: TextureAspect::All,
+                                };
+                                unsafe {
+                                    wgpu_render_state.queue.write_texture(
+                                        texel_copy_info,
+                                        current_video_frame.data(0),
+                                        TexelCopyBufferLayout {
+                                            offset: 0,
+                                            bytes_per_row: Some(
+                                                (*current_video_frame.as_ptr()).linesize[0] as u32,
+                                            ),
+                                            rows_per_image: None,
+                                        },
+                                        Extent3d {
+                                            width: current_video_frame.width(),
+                                            height: current_video_frame.height(),
+                                            depth_or_array_layers: 1,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    v_tex.set(
+                        ImageData::Color(Arc::new(c_img.clone())),
+                        TextureOptions::LINEAR,
+                    );
+                }
             }
         }
     }

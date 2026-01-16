@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ffmpeg_the_third::{ffi::av_frame_unref, frame::Video};
+use ffmpeg_the_third::frame::Video;
 use rodio::Sink;
 use tokio::{
     runtime::Handle,
@@ -27,7 +27,7 @@ impl PresentDataManager {
         tiny_decoder: Arc<RwLock<TinyDecoder>>,
         used_model: Arc<RwLock<UsedModel>>,
         ai_subtitle: Arc<RwLock<AISubTitle>>,
-        current_video_frame: Arc<RwLock<Option<CurFrame>>>,
+        current_video_frame: Arc<RwLock<Video>>,
         sink: Arc<Sink>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
     ) -> Self {
@@ -40,6 +40,7 @@ impl PresentDataManager {
                 ai_subtitle,
                 current_video_frame,
                 main_stream_current_timestamp,
+                runtime_handle.clone(),
             )),
         }
     }
@@ -49,8 +50,9 @@ impl PresentDataManager {
         sink: Arc<Sink>,
         used_model: Arc<RwLock<UsedModel>>,
         ai_subtitle: Arc<RwLock<AISubTitle>>,
-        current_video_frame: Arc<RwLock<Option<CurFrame>>>,
+        current_video_frame: Arc<RwLock<Video>>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
+        runtime_handle: Handle,
     ) {
         let mut change_instant = Instant::now();
         loop {
@@ -68,16 +70,21 @@ impl PresentDataManager {
                                 .await;
                             let used_model = used_model.read().await;
                             let used_model_ref = &*used_model;
-                            let mut subtitle = ai_subtitle.write().await;
                             if UsedModel::Empty != *used_model_ref {
-                                subtitle
-                                    .push_frame_data(audio_frame, used_model_ref.clone())
-                                    .await;
+                                let ai_subtitle = ai_subtitle.clone();
+                                let used_model = used_model_ref.clone();
+                                runtime_handle.spawn_blocking(move || {
+                                    AISubTitle::push_frame_data(
+                                        ai_subtitle,
+                                        audio_frame,
+                                        used_model,
+                                    );
+                                });
                             }
                         }
                     }
                 }
-                if !PresentDataManager::is_video_wait_for_audio(
+                if PresentDataManager::should_video_catch_audio(
                     &tiny_decoder,
                     main_stream_current_timestamp.clone(),
                     current_video_frame.clone(),
@@ -85,53 +92,43 @@ impl PresentDataManager {
                 .await
                 {
                     let ins_now = Instant::now();
-                    if ins_now - change_instant > Duration::from_millis(0) {
-                        if let Some(mut frame) = tiny_decoder.pull_one_video_play_frame().await {
-                            let mut cur_frame = current_video_frame.write().await;
-                            let main_stream = tiny_decoder.main_stream();
-                            if let MainStream::Video = main_stream {
+                    if let Some(frame) = tiny_decoder.pull_one_video_play_frame().await {
+                        let mut cur_frame = current_video_frame.write().await;
+                        let main_stream = tiny_decoder.main_stream();
+                        if let MainStream::Video = main_stream {
+                            if ins_now - change_instant > Duration::from_millis(0) {
                                 if let Some(f_pts) = frame.pts() {
-                                    if let Some(cur_frame) = &mut *cur_frame {
-                                        if let Some(cur_pts) = cur_frame.av_frame().pts() {
-                                            let time_base = tiny_decoder.video_time_base();
-                                            if f_pts > 0
-                                                && cur_pts > 0
-                                                && ((f_pts - cur_pts)
-                                                    * (*time_base).numerator() as i64
-                                                    / (*time_base).denominator() as i64)
-                                                    < 1
+                                    if let Some(cur_pts) = cur_frame.pts() {
+                                        let time_base = tiny_decoder.video_time_base();
+                                        if f_pts > 0
+                                            && cur_pts > 0
+                                            && ((f_pts - cur_pts)
+                                                * 1000
+                                                * (*time_base).numerator() as i64
+                                                / (*time_base).denominator() as i64)
+                                                < 1000
+                                        {
+                                            if let Some(ins) =
+                                                change_instant.checked_add(Duration::from_millis(
+                                                    ((f_pts - cur_pts)
+                                                        * 1000
+                                                        * (*time_base).numerator() as i64
+                                                        / (*time_base).denominator() as i64)
+                                                        as u64,
+                                                ))
                                             {
-                                                if let Some(ins) = change_instant.checked_add(
-                                                    Duration::from_millis(
-                                                        ((f_pts - cur_pts)
-                                                            * 1000
-                                                            * (*time_base).numerator() as i64
-                                                            / (*time_base).denominator() as i64)
-                                                            as u64,
-                                                    ),
-                                                ) {
-                                                    change_instant = ins;
-                                                }
-                                            } else {
-                                                change_instant = ins_now;
+                                                change_instant = ins;
                                             }
+                                        } else {
+                                            change_instant = ins_now;
                                         }
                                     }
                                 }
-                            } else if let MainStream::Audio = main_stream {
-                                change_instant = ins_now;
                             }
-                            let data =
-                                TinyDecoder::convert_frame_data_to_no_padding_layout(&mut frame)
-                                    .await;
-                            let pts = frame.pts();
-                            // free the useless data
-                            unsafe {
-                                av_frame_unref(frame.as_mut_ptr());
-                            }
-                            frame.set_pts(pts);
-                            *cur_frame = Some(CurFrame::new(frame, data));
+                        } else if let MainStream::Audio = main_stream {
+                            change_instant = ins_now;
                         }
+                        *cur_frame = frame;
                     }
                 }
                 PresentDataManager::update_current_timestamp(
@@ -149,7 +146,7 @@ impl PresentDataManager {
         main_stream_current_timestamp: Arc<RwLock<i64>>,
         audio_pts: Option<i64>,
         tiny_decoder: &TinyDecoder,
-        current_video_frame: Arc<RwLock<Option<CurFrame>>>,
+        current_video_frame: Arc<RwLock<Video>>,
     ) {
         /*
         add audio frame data to the audio player
@@ -162,59 +159,43 @@ impl PresentDataManager {
             }
         } else if let MainStream::Video = main_stream {
             let cur_video_frame = current_video_frame.read().await;
-            if let Some(frame) = &*cur_video_frame {
-                if let Some(pts) = frame.av_frame().pts() {
-                    if pts > 0 {
-                        *main_ts = pts;
-                    }
+
+            if let Some(pts) = cur_video_frame.pts() {
+                if pts > 0 {
+                    *main_ts = pts;
                 }
             }
         }
     }
     /// if video time-audio time is too high(more than 1 second),default return true
-    async fn is_video_wait_for_audio(
+    async fn should_video_catch_audio(
         tiny_decoder: &TinyDecoder,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        current_video_frame: Arc<RwLock<Option<CurFrame>>>,
+        current_video_frame: Arc<RwLock<Video>>,
     ) -> bool {
         if let MainStream::Video = tiny_decoder.main_stream() {
-            return false;
+            return true;
         }
         let current_video_frame = current_video_frame.read().await;
-        if let Some(frame) = &*current_video_frame {
-            let timestamp = main_stream_current_timestamp.read().await;
-            {
-                let video_time_base = tiny_decoder.video_time_base();
-                let audio_time_base = tiny_decoder.audio_time_base();
-                if let Some(f_ts) = frame.av_frame().pts() {
-                    let v_time = f_ts * 1000 * video_time_base.numerator() as i64
-                        / video_time_base.denominator() as i64;
-                    let a_time = *timestamp * 1000 * audio_time_base.numerator() as i64
-                        / audio_time_base.denominator() as i64;
-                    let time_dur = v_time - a_time;
-                    if time_dur > 0 {
-                        // info!("wait audio v_time{},a_time{}", v_time, a_time);
-                        return true;
-                    }
+
+        let timestamp = main_stream_current_timestamp.read().await;
+        {
+            let video_time_base = tiny_decoder.video_time_base();
+            let audio_time_base = tiny_decoder.audio_time_base();
+            if let Some(f_ts) = current_video_frame.pts() {
+                let v_time = f_ts * 1000 * video_time_base.numerator() as i64
+                    / video_time_base.denominator() as i64;
+                let a_time = *timestamp * 1000 * audio_time_base.numerator() as i64
+                    / audio_time_base.denominator() as i64;
+                let time_dur = a_time - v_time;
+                if time_dur > 100 {
+                    return true;
                 }
+            } else {
+                return true;
             }
         }
 
         false
-    }
-}
-pub struct CurFrame {
-    frame: Video,
-    image_data: Box<[u8]>,
-}
-impl CurFrame {
-    pub fn new(frame: Video, image_data: Box<[u8]>) -> Self {
-        Self { frame, image_data }
-    }
-    pub fn av_frame(&self) -> &Video {
-        &self.frame
-    }
-    pub fn data(&self) -> &[u8] {
-        &self.image_data
     }
 }

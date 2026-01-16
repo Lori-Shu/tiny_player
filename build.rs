@@ -1,7 +1,5 @@
 use std::{fs, path::Path};
 
-use fs_extra::dir::CopyOptions;
-
 fn main() {
     let mut dlls = vec![];
     let folder_path = Path::new("./resources/dlls");
@@ -17,10 +15,22 @@ fn main() {
             Path::new("target/debug").join(dll.file_name().unwrap().to_str().unwrap());
         fs::copy(&dll, target_debug_dest).unwrap();
     }
-    fs_extra::copy_items(
-        &[Path::new("./resources/model")],
-        Path::new("./target/debug"),
-        &CopyOptions::new().overwrite(true),
+    if fs::read_dir("target/debug/model").is_err() {
+        fs::create_dir("target/debug/model").unwrap();
+    }
+    fs::copy(
+        "resources/model/base_q8_0.gguf",
+        "target/debug/model/base_q8_0.gguf",
+    )
+    .unwrap();
+    fs::copy(
+        "resources/model/config.json",
+        "target/debug/model/config.json",
+    )
+    .unwrap();
+    fs::copy(
+        "resources/model/tokenizer.json",
+        "target/debug/model/tokenizer.json",
     )
     .unwrap();
     if std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap() == "windows" {
@@ -28,6 +38,4 @@ fn main() {
         res.set_icon("resources/desktop_icon.ico");
         res.compile().unwrap();
     }
-    let vosk_lib_path = "./resources";
-    println!("cargo:rustc-link-search=native={}", vosk_lib_path);
 }

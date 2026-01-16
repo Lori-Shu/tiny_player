@@ -96,7 +96,7 @@ fn main() {
         options.centered = true;
         options.viewport.inner_size = Some(Vec2::new(900.0, 700.0));
 
-        if eframe::run_native(
+        if let Err(e) = eframe::run_native(
             "tiny player",
             options,
             Box::new(|cc| {
@@ -104,10 +104,10 @@ fn main() {
                 tiny_app_ui.replace_fonts(&cc.egui_ctx);
                 Ok(Box::new(tiny_app_ui))
             }),
-        )
-        .is_ok()
-        {
-            warn!("eframe start success");
+        ) {
+            warn!("eframe start error {}", e.to_string());
         }
+    } else if let Err(e) = appui::AppUi::new() {
+        warn!("appui construct err {}", e.to_string());
     }
 }

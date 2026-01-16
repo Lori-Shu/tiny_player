@@ -10,10 +10,10 @@ use ffmpeg_the_third::{
     ChannelLayout, Rational, Stream,
     ffi::{
         AV_CHANNEL_LAYOUT_STEREO, AVPixelFormat, AVSEEK_FLAG_BACKWARD, SwrContext,
-        av_hwdevice_ctx_create, av_hwframe_transfer_data, av_image_copy_to_buffer,
-        av_image_get_buffer_size, avcodec_get_hw_config, avfilter_get_by_name,
-        avfilter_graph_create_filter, avfilter_link, swr_alloc_set_opts2, swr_convert_frame,
-        swr_free, swr_init,
+        av_frame_get_buffer, av_hwdevice_ctx_create, av_hwframe_transfer_data,
+        av_image_copy_to_buffer, av_image_get_buffer_size, avcodec_get_hw_config,
+        avfilter_get_by_name, avfilter_graph_create_filter, avfilter_link, swr_alloc_set_opts2,
+        swr_convert_frame, swr_free, swr_init,
     },
     filter::Graph,
     format::{Pixel, sample::Type, stream::Disposition},
@@ -767,7 +767,7 @@ impl TinyDecoder {
 
         None
     }
-    pub async fn convert_frame_data_to_no_padding_layout(res: &mut Video) -> Box<[u8]> {
+    pub async fn _convert_frame_data_to_no_padding_layout(res: &mut Video) -> Box<[u8]> {
         unsafe {
             let buf_size = av_image_get_buffer_size(
                 AVPixelFormat::AV_PIX_FMT_RGBA,
@@ -801,6 +801,7 @@ impl TinyDecoder {
     pub async fn pull_one_video_play_frame(&mut self) -> Option<ffmpeg_the_third::frame::Video> {
         if let Some(converter_ctx) = &mut self.converter_ctx {
             let mut res = ffmpeg_the_third::frame::Video::empty();
+
             let mut return_val = None;
             {
                 let mut v_frame_vec = self.video_frame_cache_queue.write().await;
@@ -812,7 +813,18 @@ impl TinyDecoder {
                     if !v_frame_vec.is_empty() {
                         if let Some(raw_frame) = v_frame_vec.pop_front() {
                             // info!("raw frame pts{}", raw_frame.pts().unwrap());
+                            unsafe {
+                                let frame = res.as_mut_ptr();
+                                (*frame).width = raw_frame.width() as i32;
+                                (*frame).height = raw_frame.height() as i32;
+                                (*frame).format = AVPixelFormat::AV_PIX_FMT_RGBA as i32;
 
+                                // align to 256 to meet the wgpu requirement
+                                let align = 256;
+                                if 0 > av_frame_get_buffer(frame, align) {
+                                    warn!("av_frame_get_buffer error!");
+                                }
+                            }
                             if converter_ctx.0.run(&raw_frame, &mut res).is_ok() {
                                 if let Some(pts) = raw_frame.pts() {
                                     res.set_pts(Some(pts));
