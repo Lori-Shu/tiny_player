@@ -19,8 +19,9 @@ use ffmpeg_the_third::{
     frame::Audio,
 };
 
+use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use tokenizers::{Tokenizer, tokenizer};
-use tokio::sync::{RwLock, mpsc::Sender};
+use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, decode::ManualProtectedResampler};
@@ -31,13 +32,7 @@ pub enum UsedModel {
     Chinese,
     English,
 }
-
-pub struct AISubTitle {
-    mel_filters: Vec<f32>,
-    config: Config,
-    device: Device,
-    recognizer: Whisper,
-    tokenizer: Tokenizer,
+struct TokenIds {
     sot_id: u32,
     zh_language_id: u32,
     en_language_id: u32,
@@ -45,9 +40,16 @@ pub struct AISubTitle {
     no_timestamp_id: u32,
     eot_id: u32,
     no_speech_id: u32,
-    source_buffer: Vec<f32>,
+}
+pub struct AISubTitle {
+    _config: Config,
+    device: Device,
+    model: Whisper,
+    tokenizer: Tokenizer,
     subtitle_source_resampler: ManualProtectedResampler,
     subtitle_sender: Sender<String>,
+    candle_streaming_mel_processor: CandleStreamingMelProcessor,
+    token_ids: TokenIds,
 }
 impl AISubTitle {
     pub fn new(subtitle_sender: Sender<String>) -> PlayerResult<Self> {
@@ -60,8 +62,8 @@ impl AISubTitle {
                 // if let Err(e)=Device::new_cuda(0){
                 //     warn!("cuda init error! {}",e.to_string());
                 // }
-                let device =
-                    Device::new_cuda(0).map_err(|e| PlayerError::Internal(e.to_string()))?;
+                let device = Device::cuda_if_available(0)
+                    .map_err(|e| PlayerError::Internal(e.to_string()))?;
                 let var_builder = VarBuilder::from_gguf(model_path_str, &device)
                     .map_err(|e| PlayerError::Internal(e.to_string()))?;
 
@@ -98,11 +100,7 @@ impl AISubTitle {
                     if r < 0 {
                         info!("swr init err");
                     }
-                    let mut mel_filters = vec![0f32; MEL_FILTERS.len() / 4];
-                    <byteorder::LittleEndian as byteorder::ByteOrder>::read_f32_into(
-                        MEL_FILTERS,
-                        &mut mel_filters,
-                    );
+                    let mel_filters = bytemuck::cast_slice::<_, f32>(MEL_FILTERS).to_vec();
                     let sot_id = tokenizer
                         .token_to_id(candle_transformers::models::whisper::SOT_TOKEN)
                         .ok_or(PlayerError::Internal("sot token to id err".to_string()))?;
@@ -132,22 +130,29 @@ impl AISubTitle {
                         }
                         Some(n) => n,
                     };
+                    let candle_streaming_mel_processor = CandleStreamingMelProcessor::new(
+                        Tensor::new(mel_filters, &device)
+                            .map_err(|e| PlayerError::Internal(e.to_string()))?,
+                        &device,
+                    );
                     return Ok(Self {
+                        candle_streaming_mel_processor,
                         subtitle_sender,
-                        sot_id,
-                        zh_language_id: 50260,
-                        en_language_id: 50259,
-                        transcribe_id,
-                        no_timestamp_id,
-                        eot_id,
-                        no_speech_id,
-                        mel_filters,
-                        config,
+
+                        _config: config,
                         device,
                         tokenizer,
-                        recognizer: whisper_recognizer,
-                        source_buffer: Vec::new(),
+                        model: whisper_recognizer,
                         subtitle_source_resampler: ManualProtectedResampler(swr_ctx),
+                        token_ids: TokenIds {
+                            sot_id,
+                            zh_language_id: 50260,
+                            en_language_id: 50259,
+                            transcribe_id,
+                            no_timestamp_id,
+                            eot_id,
+                            no_speech_id,
+                        },
                     });
                 }
             }
@@ -158,18 +163,17 @@ impl AISubTitle {
         ))
     }
 
-    pub fn push_frame_data(
-        subtitle: Arc<RwLock<AISubTitle>>,
+    pub async fn push_frame_data(
+        &mut self,
         audio_frame: ffmpeg_the_third::frame::Audio,
         used_model: UsedModel,
     ) {
-        let mut subtitle = subtitle.blocking_write();
         let mut to_recognize_frame = Audio::empty();
         to_recognize_frame.set_format(ffmpeg_the_third::format::Sample::F32(Type::Packed));
         to_recognize_frame.set_ch_layout(ChannelLayout::MONO);
         to_recognize_frame.set_rate(16000);
         unsafe {
-            let resampler = &mut subtitle.subtitle_source_resampler;
+            let resampler = &mut self.subtitle_source_resampler;
 
             if 0 > swr_convert_frame(
                 resampler.0,
@@ -181,70 +185,44 @@ impl AISubTitle {
         }
         let data = &bytemuck::cast_slice::<_, f32>(to_recognize_frame.data(0))
             [0..to_recognize_frame.samples()];
-        subtitle.source_buffer.extend(data);
-        if subtitle.source_buffer.len() > 16000 * 2 {
-            let mel_source = candle_transformers::models::whisper::audio::pcm_to_mel(
-                &subtitle.config,
-                &subtitle.source_buffer,
-                &subtitle.mel_filters,
-            );
+        if let Ok(Some(t)) = self
+            .candle_streaming_mel_processor
+            .process_chunk(data.to_vec())
+        {
+            if let Ok(audio_features) = self.model.encoder.forward(&t, true) {
+                if let UsedModel::Chinese = &used_model {
+                    let mut tokens = vec![
+                        self.token_ids.sot_id,
+                        self.token_ids.zh_language_id,
+                        self.token_ids.transcribe_id,
+                        self.token_ids.no_timestamp_id,
+                    ];
+                    let max_tokens = 56;
 
-            let mel_len = mel_source.len();
-            // 转换为 Tensor 并增加 Batch 维度 [1, 80, 3000]
-            if let Ok(tensor) = Tensor::from_vec(
-                mel_source,
-                (
-                    1,
-                    subtitle.config.num_mel_bins,
-                    mel_len / subtitle.config.num_mel_bins,
-                ),
-                &subtitle.device,
-            ) {
-                warn!("before forward");
-                if let Err(e) = subtitle.recognizer.encoder.forward(&tensor, true) {
-                    warn!("forward error {}", e.to_string());
-                }
-                if let Ok(audio_features) = subtitle.recognizer.encoder.forward(&tensor, true) {
-                    if let UsedModel::Chinese = &used_model {
-                        let mut tokens = vec![
-                            subtitle.sot_id,
-                            subtitle.zh_language_id,
-                            subtitle.transcribe_id,
-                            subtitle.no_timestamp_id,
-                        ];
-                        let max_tokens = subtitle.config.max_target_positions / 8;
-                        warn!("before loop");
-                        // 2. 开始循环
-                        for i in 0..max_tokens {
-                            if let Ok(input_ids) = Tensor::new(tokens.as_slice(), &subtitle.device)
-                            {
-                                warn!("before unsqueeze");
-                                if let Ok(input_ids) = input_ids.unsqueeze(0) {
-                                    warn!("before decode");
-                                    if let Ok(ys) = subtitle.recognizer.decoder.forward(
-                                        &input_ids,
-                                        &audio_features,
-                                        true,
-                                    ) {
-                                        if i == 0 {
-                                            if let Ok(t) = ys.i(..1) {
-                                                if let Ok(t) =
-                                                    subtitle.recognizer.decoder.final_linear(&t)
-                                                {
-                                                    if let Ok(t) = t.i(0) {
-                                                        if let Ok(logits) = t.i(0) {
-                                                            if let Ok(n) = softmax(&logits, 0) {
-                                                                if let Ok(n) = n
-                                                                    .i(subtitle.no_speech_id
-                                                                        as usize)
+                    for i in 0..max_tokens {
+                        if let Ok(input_ids) = Tensor::new(tokens.as_slice(), &self.device) {
+                            if let Ok(input_ids) = input_ids.unsqueeze(0) {
+                                if let Ok(ys) =
+                                    self.model
+                                        .decoder
+                                        .forward(&input_ids, &audio_features, true)
+                                {
+                                    if i == 0 {
+                                        if let Ok(t) = ys.i(..1) {
+                                            if let Ok(t) = self.model.decoder.final_linear(&t) {
+                                                if let Ok(t) = t.i(0) {
+                                                    if let Ok(logits) = t.i(0) {
+                                                        if let Ok(n) = softmax(&logits, 0) {
+                                                            if let Ok(n) = n
+                                                                .i(self.token_ids.no_speech_id
+                                                                    as usize)
+                                                            {
+                                                                if let Ok(no_speech_prob) =
+                                                                    n.to_scalar::<f32>()
                                                                 {
-                                                                    if let Ok(no_speech_prob) =
-                                                                        n.to_scalar::<f32>()
-                                                                    {
-                                                                        if (no_speech_prob as f64)>candle_transformers::models::whisper::NO_SPEECH_THRESHOLD {
+                                                                    if (no_speech_prob as f64)>candle_transformers::models::whisper::NO_SPEECH_THRESHOLD {
                                                                                     break;
                                                                                 }
-                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -252,35 +230,31 @@ impl AISubTitle {
                                                 }
                                             }
                                         }
-
-                                        // 获取序列长度并取最后一个 Token 的 Logits
-                                        warn!("before dims3");
-                                        if let Ok((_, seq_len, _)) = ys.dims3() {
-                                            if let Ok(t) = ys.i((..1, seq_len - 1..)) {
-                                                if let Ok(t) =
-                                                    subtitle.recognizer.decoder.final_linear(&t)
-                                                {
-                                                    if let Ok(t) = t.i(0) {
-                                                        if let Ok(logits) = t.i(0) {
-                                                            let logits_v: candle_core::Result<
-                                                                Vec<f32>,
-                                                            > = logits.to_vec1();
-                                                            if let Ok(logits_v) = logits_v {
-                                                                if let Some(v) = logits_v
-                                                                    .iter()
-                                                                    .enumerate()
-                                                                    .max_by(|(_, u), (_, v)| {
-                                                                        u.total_cmp(v)
-                                                                    })
-                                                                    .map(|(i, _)| i as u32)
+                                    }
+                                    if let Ok((_, seq_len, _)) = ys.dims3() {
+                                        if let Ok(t) = ys.i((..1, seq_len - 1..)) {
+                                            if let Ok(t) = self.model.decoder.final_linear(&t) {
+                                                if let Ok(t) = t.i(0) {
+                                                    if let Ok(logits) = t.i(0) {
+                                                        let logits_v: candle_core::Result<
+                                                            Vec<f32>,
+                                                        > = logits.to_vec1();
+                                                        if let Ok(logits_v) = logits_v {
+                                                            if let Some(v) = logits_v
+                                                                .iter()
+                                                                .enumerate()
+                                                                .max_by(|(_, u), (_, v)| {
+                                                                    u.total_cmp(v)
+                                                                })
+                                                                .map(|(i, _)| i as u32)
+                                                            {
+                                                                let next_token = v;
+                                                                tokens.push(next_token);
+                                                                if next_token
+                                                                    == self.token_ids.eot_id
+                                                                    || tokens.len() > max_tokens
                                                                 {
-                                                                    let next_token = v;
-                                                                    tokens.push(next_token);
-                                                                    if next_token == subtitle.eot_id
-                                                                        || tokens.len() > subtitle.config.max_target_positions/8
-                                                                    {
-                                                                        break;
-                                                                    }
+                                                                    break;
                                                                 }
                                                             }
                                                         }
@@ -292,90 +266,44 @@ impl AISubTitle {
                                 }
                             }
                         }
-                        if let Ok(text) = subtitle.tokenizer.decode(&tokens, true) {
-                            subtitle.source_buffer.drain(0..(16000 * 2));
-                            if let Err(e) = subtitle
-                                .subtitle_sender
-                                .blocking_send(text.trim().to_string())
-                            {
-                                warn!("send subtitle err {}", e.to_string());
-                            }
+                    }
+                    if let Ok(text) = self.tokenizer.decode(&tokens, true) {
+                        if let Err(e) = self.subtitle_sender.blocking_send(text.trim().to_string())
+                        {
+                            warn!("send subtitle err {}", e.to_string());
                         }
-                    } else if let UsedModel::English = &used_model {
-                        let mut tokens = vec![
-                            subtitle.sot_id,
-                            subtitle.en_language_id,
-                            subtitle.transcribe_id,
-                            subtitle.no_timestamp_id,
-                        ];
-                        let max_tokens = subtitle.config.max_target_positions / 8;
-                        warn!("before loop");
-                        // 2. 开始循环
-                        for i in 0..max_tokens {
-                            if let Ok(input_ids) = Tensor::new(tokens.as_slice(), &subtitle.device)
-                            {
-                                warn!("before unsqueeze");
-                                if let Ok(input_ids) = input_ids.unsqueeze(0) {
-                                    warn!("before decode");
-                                    if let Ok(ys) = subtitle.recognizer.decoder.forward(
-                                        &input_ids,
-                                        &audio_features,
-                                        true,
-                                    ) {
-                                        if i == 0 {
-                                            if let Ok(t) = ys.i(..1) {
-                                                if let Ok(t) =
-                                                    subtitle.recognizer.decoder.final_linear(&t)
-                                                {
-                                                    if let Ok(t) = t.i(0) {
-                                                        if let Ok(logits) = t.i(0) {
-                                                            if let Ok(n) = softmax(&logits, 0) {
-                                                                if let Ok(n) = n
-                                                                    .i(subtitle.no_speech_id
-                                                                        as usize)
-                                                                {
-                                                                    if let Ok(no_speech_prob) =
-                                                                        n.to_scalar::<f32>()
-                                                                    {
-                                                                        if (no_speech_prob as f64)>candle_transformers::models::whisper::NO_SPEECH_THRESHOLD {
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                    }
+                } else if let UsedModel::English = &used_model {
+                    let mut tokens = vec![
+                        self.token_ids.sot_id,
+                        self.token_ids.en_language_id,
+                        self.token_ids.transcribe_id,
+                        self.token_ids.no_timestamp_id,
+                    ];
+                    let max_tokens = 56;
 
-                                        // 获取序列长度并取最后一个 Token 的 Logits
-                                        warn!("before dims3");
-                                        if let Ok((_, seq_len, _)) = ys.dims3() {
-                                            // 3. ✨ 关键：切出最后一个位置的隐藏状态 [1, 1, hidden_dim]
-                                            // 这样做是为了效率，因为我们只需要预测下一个 token
-                                            if let Ok(t) = ys.i((..1, seq_len - 1..)) {
-                                                if let Ok(t) =
-                                                    subtitle.recognizer.decoder.final_linear(&t)
-                                                {
-                                                    if let Ok(t) = t.i(0) {
-                                                        if let Ok(logits) = t.i(0) {
-                                                            let logits_v: candle_core::Result<
-                                                                Vec<f32>,
-                                                            > = logits.to_vec1();
-                                                            if let Ok(logits_v) = logits_v {
-                                                                if let Some(v) = logits_v
-                                                                    .iter()
-                                                                    .enumerate()
-                                                                    .max_by(|(_, u), (_, v)| {
-                                                                        u.total_cmp(v)
-                                                                    })
-                                                                    .map(|(i, _)| i as u32)
+                    for i in 0..max_tokens {
+                        if let Ok(input_ids) = Tensor::new(tokens.as_slice(), &self.device) {
+                            if let Ok(input_ids) = input_ids.unsqueeze(0) {
+                                if let Ok(ys) =
+                                    self.model
+                                        .decoder
+                                        .forward(&input_ids, &audio_features, true)
+                                {
+                                    if i == 0 {
+                                        if let Ok(t) = ys.i(..1) {
+                                            if let Ok(t) = self.model.decoder.final_linear(&t) {
+                                                if let Ok(t) = t.i(0) {
+                                                    if let Ok(logits) = t.i(0) {
+                                                        if let Ok(n) = softmax(&logits, 0) {
+                                                            if let Ok(n) = n
+                                                                .i(self.token_ids.no_speech_id
+                                                                    as usize)
+                                                            {
+                                                                if let Ok(no_speech_prob) =
+                                                                    n.to_scalar::<f32>()
                                                                 {
-                                                                    let next_token = v;
-                                                                    tokens.push(next_token);
-                                                                    if next_token == subtitle.eot_id
-                                                                        || tokens.len() > subtitle.config.max_target_positions/8
+                                                                    if (no_speech_prob as f64) > 0.8
                                                                     {
                                                                         break;
                                                                     }
@@ -387,17 +315,49 @@ impl AISubTitle {
                                             }
                                         }
                                     }
+
+                                    if let Ok((_, seq_len, _)) = ys.dims3() {
+                                        // 3. ✨ 关键：切出最后一个位置的隐藏状态 [1, 1, hidden_dim]
+                                        // 这样做是为了效率，因为我们只需要预测下一个 token
+                                        if let Ok(t) = ys.i((..1, seq_len - 1..)) {
+                                            if let Ok(t) = self.model.decoder.final_linear(&t) {
+                                                if let Ok(t) = t.i(0) {
+                                                    if let Ok(logits) = t.i(0) {
+                                                        let logits_v: candle_core::Result<
+                                                            Vec<f32>,
+                                                        > = logits.to_vec1();
+                                                        if let Ok(logits_v) = logits_v {
+                                                            if let Some(v) = logits_v
+                                                                .iter()
+                                                                .enumerate()
+                                                                .max_by(|(_, u), (_, v)| {
+                                                                    u.total_cmp(v)
+                                                                })
+                                                                .map(|(i, _)| i as u32)
+                                                            {
+                                                                let next_token = v;
+                                                                tokens.push(next_token);
+                                                                if next_token
+                                                                    == self.token_ids.eot_id
+                                                                    || tokens.len() > max_tokens
+                                                                {
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                        if let Ok(text) = subtitle.tokenizer.decode(&tokens, true) {
-                            subtitle.source_buffer.drain(0..(16000 * 2));
-                            if let Err(e) = subtitle
-                                .subtitle_sender
-                                .blocking_send(text.trim().to_string())
-                            {
-                                warn!("send subtitle err {}", e.to_string());
-                            }
+                    }
+                    if let Ok(text) = self.tokenizer.decode(&tokens, true) {
+                        warn!("after decode text==={}", text);
+                        if let Err(e) = self.subtitle_sender.send(text).await {
+                            warn!("send subtitle err {}", e.to_string());
                         }
                     }
                 }
@@ -405,11 +365,199 @@ impl AISubTitle {
         }
     }
 }
-
 impl Drop for AISubTitle {
     fn drop(&mut self) {
         unsafe {
             swr_free(&mut self.subtitle_source_resampler.0);
         }
+    }
+}
+
+pub struct CandleStreamingMelProcessor {
+    device: Device,
+    mel_filters: Tensor, // (80, 201)
+    hann_window: Vec<f32>,
+    audio_buffer: Vec<f32>,
+    fft_handler: Arc<dyn Fft<f32>>,
+    n_fft: usize,
+    hop_length: usize,
+    mel_buffer: Vec<Tensor>, // 存储单帧 Tensor
+    max_mel_frames: usize,
+}
+
+impl CandleStreamingMelProcessor {
+    pub fn new(mel_filters: Tensor, device: &Device) -> Self {
+        let n_fft = 400;
+        let hann: Vec<f32> = (0..n_fft)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos())
+            .collect();
+
+        let mut planner = FftPlanner::new();
+        let fft_handler = planner.plan_fft_forward(n_fft);
+
+        // 确保 mel_filters 形状正确并搬运到目标设备
+        let mel_filters = mel_filters
+            .reshape((80, 201))
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+
+        Self {
+            device: device.clone(),
+            mel_filters,
+            hann_window: hann,
+            audio_buffer: Vec::new(),
+            fft_handler,
+            n_fft,
+            hop_length: 160,
+            mel_buffer: vec![],
+            max_mel_frames: 3000,
+        }
+    }
+
+    /// 将音频切片转换为功率谱 Tensor (Batch 处理以提升效率)
+    fn frames_to_power_spec(&self, frames: &[&[f32]]) -> candle_core::Result<Tensor> {
+        let n_out = self.n_fft / 2 + 1;
+        let mut all_energies = Vec::with_capacity(frames.len() * n_out);
+
+        for frame in frames {
+            let mut buffer: Vec<Complex<f32>> = frame
+                .iter()
+                .zip(self.hann_window.iter())
+                .map(|(&x, &w)| Complex::new(x * w, 0.0))
+                .collect();
+
+            self.fft_handler.process(&mut buffer);
+
+            // Power Spectrum: |FFT|^2
+            for c in &buffer[..n_out] {
+                all_energies.push(c.norm_sqr());
+            }
+        }
+
+        Tensor::from_vec(all_energies, (frames.len(), n_out), &self.device)
+    }
+
+    // 修正后的核心处理逻辑
+    pub fn process_chunk(&mut self, pcm: Vec<f32>) -> PlayerResult<Option<Tensor>> {
+        self.audio_buffer.extend(pcm);
+
+        // 至少需要一个 FFT 窗口的数据
+        if self.audio_buffer.len() < self.n_fft {
+            return Ok(None);
+        }
+
+        // 1. 提取所有可用的帧
+        let num_frames = (self.audio_buffer.len() - self.n_fft) / self.hop_length + 1;
+        let mut frames = Vec::with_capacity(num_frames);
+        for i in 0..num_frames {
+            let start = i * self.hop_length;
+            frames.push(&self.audio_buffer[start..start + self.n_fft]);
+        }
+
+        // 2. 批量计算功率谱
+        let power_spec = self
+            .frames_to_power_spec(&frames)
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+        // 3. 矩阵乘法转 Mel: [frames, 201] * [201, 80] -> [frames, 80]
+        let mel = power_spec
+            .matmul(
+                &self
+                    .mel_filters
+                    .t()
+                    .map_err(|e| PlayerError::Internal(e.to_string()))?,
+            )
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+        // 4. Log-Mel 变换与归一化 (核心修正点)
+        // Whisper 标准: log10(mel) -> 映射到 [-1, 1]
+        let shape = mel.shape().clone();
+
+        // 1. 将 Tensor 转回 Rust 的 Vec<f32> 进行高精度 log10 处理
+        let mel_vec = mel
+            .flatten_all()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?
+            .to_vec1::<f32>()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+        // 2. 使用 Rust 标准库 f32::log10 处理
+        // 我们同时在这里处理 clamp，防止 log10(-inf)
+        let log_mel_vec: Vec<f32> = mel_vec.into_iter().map(|v| v.max(1e-10).log10()).collect();
+
+        // 3. 转回 Tensor
+        let log10_mel = Tensor::from_vec(log_mel_vec, shape, &self.device)
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+        // 1. 获取当前批次的最大值
+        let max_val = log10_mel
+            .max_all()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?
+            .to_scalar::<f32>()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+        // 2. 创建一个标量 Tensor 作为阈值 (注意必须在同一个 device 上)
+        let threshold = Tensor::from_vec(vec![max_val - 8.0], (1, 1), &self.device)
+            .map_err(|e| PlayerError::Internal(e.to_string()))?
+            .broadcast_as(log10_mel.shape())
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+        // 3. 使用 broadcast_maximum (或简写 maximum)
+        let log_mel = log10_mel
+            .maximum(&threshold)
+            .map_err(|e| PlayerError::Internal(e.to_string()))?
+            .affine(1.0 / 4.0, 1.0)
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+        // 5. 逐帧推入缓冲区
+        // 修正：从 log_mel 中提取每一帧时，保持 Tensor 引用
+        for i in 0..num_frames {
+            let frame = log_mel
+                .narrow(0, i, 1)
+                .map_err(|e| PlayerError::Internal(e.to_string()))?
+                .squeeze(0)
+                .map_err(|e| PlayerError::Internal(e.to_string()))?;
+            self.mel_buffer.push(frame);
+        }
+
+        // 清理 PCM 缓冲区
+        self.audio_buffer.drain(0..num_frames * self.hop_length);
+
+        // 6. 限制缓冲区并返回
+        if self.mel_buffer.len() > self.max_mel_frames {
+            self.mel_buffer
+                .drain(0..self.mel_buffer.len() - self.max_mel_frames);
+        }
+
+        // 如果帧数太少（比如少于 0.5s），Encoder 可能无法捕捉特征
+        if self.mel_buffer.len() < 100 {
+            return Ok(None);
+        }
+
+        // 重点：Whisper Encoder 期望的形状是 [Batch, 80, Time]
+        let final_mel = Tensor::stack(&self.mel_buffer, 0)
+            .map_err(|e| PlayerError::Internal(e.to_string()))?
+            .t() // [80, Time]
+            .map_err(|e| PlayerError::Internal(e.to_string()))?
+            .unsqueeze(0) // [1, 80, Time]
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+        self.mel_buffer.clear();
+        let (_, _, current_frames) = final_mel
+            .dims3()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+        let final_mel = if current_frames < 3000 {
+            let pad_size = 3000 - current_frames;
+            let pad = Tensor::zeros((1, 80, pad_size), final_mel.dtype(), final_mel.device())
+                .map_err(|e| PlayerError::Internal(e.to_string()))?
+                .affine(1.0, -1.0) // 0.0 * 1.0 + (-1.0) = -1.0
+                .map_err(|e| PlayerError::Internal(e.to_string()))?;
+
+            Tensor::cat(&[final_mel, pad], 2).map_err(|e| PlayerError::Internal(e.to_string()))?
+        } else {
+            final_mel
+                .narrow(2, 0, 3000)
+                .map_err(|e| PlayerError::Internal(e.to_string()))?
+        };
+        Ok(Some(final_mel))
     }
 }

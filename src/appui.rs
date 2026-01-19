@@ -258,7 +258,7 @@ impl AppUi {
         let tiny_decoder = crate::decode::TinyDecoder::new(rt.clone())?;
         let tiny_decoder = Arc::new(RwLock::new(tiny_decoder));
         let used_model = Arc::new(RwLock::new(UsedModel::Empty));
-        let subtitle_channel = mpsc::channel(5);
+        let subtitle_channel = mpsc::channel(10);
         let subtitle = Arc::new(RwLock::new(AISubTitle::new(subtitle_channel.0)?));
         let audio_player = crate::audio_play::AudioPlayer::new()?;
         let empty_frame = Video::empty();

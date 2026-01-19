@@ -52,7 +52,7 @@ impl PresentDataManager {
         ai_subtitle: Arc<RwLock<AISubTitle>>,
         current_video_frame: Arc<RwLock<Video>>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        runtime_handle: Handle,
+        _runtime_handle: Handle,
     ) {
         let mut change_instant = Instant::now();
         loop {
@@ -71,15 +71,9 @@ impl PresentDataManager {
                             let used_model = used_model.read().await;
                             let used_model_ref = &*used_model;
                             if UsedModel::Empty != *used_model_ref {
-                                let ai_subtitle = ai_subtitle.clone();
+                                let mut ai_subtitle = ai_subtitle.write().await;
                                 let used_model = used_model_ref.clone();
-                                runtime_handle.spawn_blocking(move || {
-                                    AISubTitle::push_frame_data(
-                                        ai_subtitle,
-                                        audio_frame,
-                                        used_model,
-                                    );
-                                });
+                                ai_subtitle.push_frame_data(audio_frame, used_model).await;
                             }
                         }
                     }
