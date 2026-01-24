@@ -9,34 +9,38 @@ use eframe::{
     wgpu::{Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect},
 };
 use egui::{
-    AtomExt, Color32, ColorImage, Context, Image, ImageData, ImageSource, Layout, Pos2, Rect,
-    RichText, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId, Widget,
+    AtomExt, Button, Color32, ColorImage, Context, Image, ImageData, ImageSource, Layout, Pos2,
+    Rect, RichText, TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportId, Widget,
     WidgetText, include_image,
 };
 
 use ffmpeg_the_third::{format::stream::Disposition, frame::Video, media::Type};
 use image::{DynamicImage, EncodableLayout, RgbaImage};
 
-use tokio::sync::{
-    Notify, RwLock, mpsc,
-    watch::{self, Receiver, Sender},
+use tokio::{
+    runtime::Runtime,
+    sync::{
+        Notify, RwLock, mpsc,
+        watch::{self, Receiver, Sender},
+    },
 };
 use tracing::{info, warn};
 
 use crate::{
     PlayerError, PlayerResult,
     ai_sub_title::{AISubTitle, UsedModel},
-    async_context::{AsyncContext, VideoDes},
     decode::{MainStream, TinyDecoder},
     present_data_manage::PresentDataManager,
 };
 
-const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/video_file_img.png");
-const VOLUMN_IMG: ImageSource = include_image!("../resources/volumn_img.png");
-const PLAY_IMG: ImageSource = include_image!("../resources/play_img.png");
-const PAUSE_IMG: ImageSource = include_image!("../resources/pause-97625_1920.png");
-const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen_img.png");
+const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/file-play.png");
+const VOLUME_IMG: ImageSource = include_image!("../resources/volume-2.png");
+const PLAY_IMG: ImageSource = include_image!("../resources/play.png");
+const PAUSE_IMG: ImageSource = include_image!("../resources/pause.png");
+const FULLSCREEN_IMG: ImageSource = include_image!("../resources/fullscreen.png");
 const DEFAULT_BG_IMG: ImageSource = include_image!("../resources/background.png");
+const PLAY_LIST_IMG: ImageSource = include_image!("../resources/list-video.png");
+const SUBTITLE_IMG: ImageSource = include_image!("../resources/captions.png");
 pub const MAPLE_FONT: &[u8] = include_bytes!("../resources/fonts/MapleMono-CN-Regular.ttf");
 const EMOJI_FONT: &[u8] = include_bytes!("../resources/fonts/seguiemj.ttf");
 static THEME_COLOR: LazyLock<Color32> = LazyLock::new(|| {
@@ -77,7 +81,7 @@ struct UiFlags {
     pause_flag: (Sender<bool>, Receiver<bool>),
     fullscreen_flag: bool,
     control_ui_flag: bool,
-    err_window_flag: bool,
+    tip_window_flag: bool,
     playlist_window_flag: bool,
     show_subtitle_options_flag: bool,
     show_volumn_slider_flag: bool,
@@ -95,11 +99,11 @@ pub struct AppUi {
     ui_flags: UiFlags,
     play_time: time::Time,
     time_text: String,
-    err_window_msg: String,
+    tip_window_msg: String,
     last_show_control_ui_instant: Instant,
     app_start_instant: Instant,
     current_video_frame: Arc<RwLock<Video>>,
-    async_ctx: AsyncContext,
+    async_rt: Runtime,
     opened_file: Option<std::path::PathBuf>,
     open_file_dialog: Option<egui_file::FileDialog>,
     scan_folder_dialog: Option<egui_file::FileDialog>,
@@ -128,10 +132,7 @@ impl eframe::App for AppUi {
                 }
                 {
                     if let Ok(tiny_decoder) = self.tiny_decoder.try_read() {
-                        if self
-                            .async_ctx
-                            .exec_normal_task(tiny_decoder.is_input_exist())
-                        {
+                        if self.async_rt.block_on(tiny_decoder.is_input_exist()) {
                             if !*self.ui_flags.pause_flag.1.borrow() {
                                 /*
                                 if now is next_frame_time or a little beyond get and show a new frame
@@ -169,6 +170,7 @@ impl eframe::App for AppUi {
                     ui.set_opacity(0.0);
                 }
                 ui.horizontal(|ui| {
+                    self.paint_tip_window(ctx);
                     self.paint_file_btn(ui, ctx, &now);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         self.paint_playlist_button(ui, ctx, &now);
@@ -236,8 +238,11 @@ impl AppUi {
         let play_time =
             time::Time::from_hms(0, 0, 0).map_err(|e| PlayerError::Internal(e.to_string()))?;
 
-        let async_ctx = AsyncContext::new()?;
-        let rt = async_ctx.runtime_handle();
+        let async_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+        let rt = async_rt.handle().clone();
         let f_dialog = egui_file::FileDialog::open_file(None);
         let (color_image, dyn_img) = {
             if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
@@ -278,6 +283,7 @@ impl AppUi {
             audio_player.sink(),
             main_stream_current_timestamp.clone(),
         );
+
         Ok(Self {
             subtitle_text_receiver: subtitle_channel.1,
             video_texture_handle: None,
@@ -292,7 +298,7 @@ impl AppUi {
                 pause_flag,
                 fullscreen_flag: false,
                 control_ui_flag: true,
-                err_window_flag: false,
+                tip_window_flag: false,
                 playlist_window_flag: false,
                 show_subtitle_options_flag: false,
                 show_volumn_slider_flag: false,
@@ -301,12 +307,12 @@ impl AppUi {
 
             time_text: String::new(),
 
-            err_window_msg: String::new(),
+            tip_window_msg: String::new(),
 
             last_show_control_ui_instant: Instant::now(),
             app_start_instant: Instant::now(),
             current_video_frame,
-            async_ctx,
+            async_rt,
             opened_file: None,
             open_file_dialog: Some(f_dialog),
             scan_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
@@ -337,10 +343,7 @@ impl AppUi {
     }
     fn update_time_and_time_text(&mut self) {
         if let Ok(tiny_decoder) = self.tiny_decoder.try_read() {
-            if self
-                .async_ctx
-                .exec_normal_task(tiny_decoder.is_input_exist())
-            {
+            if self.async_rt.block_on(tiny_decoder.is_input_exist()) {
                 if let Ok(play_ts) = self.main_stream_current_timestamp.try_read() {
                     let sec_num = {
                         if let MainStream::Audio = tiny_decoder.main_stream() {
@@ -411,7 +414,9 @@ impl AppUi {
             ctx.content_rect().width() / 10.0,
         );
         let file_image_button = egui::Button::new(VIDEO_FILE_IMG.atom_size(btn_rect)).frame(false);
+
         let file_img_btn_response = ui.add(file_image_button);
+
         if file_img_btn_response.hovered() {
             self.ui_flags.control_ui_flag = true;
             self.last_show_control_ui_instant = *now;
@@ -420,19 +425,6 @@ impl AppUi {
             if let Some(dialog) = &mut self.open_file_dialog {
                 dialog.open();
             }
-        }
-        if self.ui_flags.err_window_flag {
-            egui::Window::new("err window")
-                .default_pos(Pos2::new(
-                    ctx.content_rect().width() / 2.0,
-                    ctx.content_rect().height() / 2.0,
-                ))
-                .show(ctx, |ui| {
-                    ui.label(&self.err_window_msg);
-                    if ui.button("close").clicked() {
-                        self.ui_flags.err_window_flag = false;
-                    }
-                });
         }
 
         if let Some(d) = &mut self.open_file_dialog {
@@ -451,19 +443,16 @@ impl AppUi {
                     warn!("accept file path{}", p_str);
                 }
             } else {
-                self.err_window_msg = "please choose a valid video or audio file !!!".to_string();
-                self.ui_flags.err_window_flag = true;
+                self.tip_window_msg = "please choose a valid video or audio file !!!".to_string();
+                self.ui_flags.tip_window_flag = true;
             }
         }
     }
 
     fn paint_playpause_btn(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         let decoder = self.tiny_decoder.clone();
-        let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
-        if self
-            .async_ctx
-            .exec_normal_task(tiny_decoder.is_input_exist())
-        {
+        let tiny_decoder = self.async_rt.block_on(decoder.read());
+        if self.async_rt.block_on(tiny_decoder.is_input_exist()) {
             let play_or_pause_image_source = if *self.ui_flags.pause_flag.1.borrow() {
                 PLAY_IMG
             } else {
@@ -501,14 +490,11 @@ impl AppUi {
     fn paint_control_area(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
         ui.horizontal(|ui| {
             let decoder = self.tiny_decoder.clone();
-            let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
-            if self
-                .async_ctx
-                .exec_normal_task(tiny_decoder.is_input_exist())
-            {
+            let tiny_decoder = self.async_rt.block_on(decoder.read());
+            if self.async_rt.block_on(tiny_decoder.is_input_exist()) {
                 let mut timestamp = self
-                    .async_ctx
-                    .exec_normal_task(self.main_stream_current_timestamp.write());
+                    .async_rt
+                    .block_on(self.main_stream_current_timestamp.write());
                 let mut slider_color = THEME_COLOR.to_srgba_unmultiplied();
                 slider_color[3] = 100;
                 let progress_slider = egui::Slider::new(&mut *timestamp, 0..=tiny_decoder.end_ts())
@@ -552,19 +538,14 @@ impl AppUi {
                     }
                     self.frame_show_instant = *now;
                     let cur_v_frame = self.current_video_frame.clone();
-                    let mut current_video_frame =
-                        self.async_ctx.exec_normal_task(cur_v_frame.write());
+                    let mut current_video_frame = self.async_rt.block_on(cur_v_frame.write());
                     let empty_frame = Video::empty();
                     *current_video_frame = empty_frame;
                 }
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-                    let subtitle_btn = PlayerTextButton::new("AI ST", 20.0, true);
-                    let be_op = ui.opacity();
-                    if be_op != 0.0 {
-                        ui.set_opacity(0.3);
-                    }
+                    let subtitle_btn =
+                        Button::new(SUBTITLE_IMG.atom_size(Vec2::new(50.0, 50.0))).frame(false);
                     let btn_response = ui.add(subtitle_btn);
-                    ui.set_opacity(be_op);
                     if btn_response.hovered() {
                         self.ui_flags.control_ui_flag = true;
                         self.last_show_control_ui_instant = *now;
@@ -574,7 +555,7 @@ impl AppUi {
                             !self.ui_flags.show_subtitle_options_flag;
                     }
                     let used_model = self.used_model.clone();
-                    let mut used_model = self.async_ctx.exec_normal_task(used_model.write());
+                    let mut used_model = self.async_rt.block_on(used_model.write());
                     if self.ui_flags.show_subtitle_options_flag {
                         ui.radio_value(&mut *used_model, UsedModel::Empty, "closed");
                         ui.radio_value(&mut *used_model, UsedModel::Chinese, "中文");
@@ -583,7 +564,7 @@ impl AppUi {
                 });
                 ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                     let volumn_img_btn =
-                        egui::Button::new(VOLUMN_IMG.atom_size(Vec2::new(50.0, 50.0))).frame(false);
+                        egui::Button::new(VOLUME_IMG.atom_size(Vec2::new(50.0, 50.0))).frame(false);
                     let btn_response = ui.add(volumn_img_btn);
                     if btn_response.hovered() {
                         self.ui_flags.control_ui_flag = true;
@@ -650,10 +631,7 @@ impl AppUi {
     fn paint_subtitle(&mut self, ui: &mut Ui, ctx: &Context) {
         ui.horizontal(|ui| {
             if let Ok(tiny_decoder) = self.tiny_decoder.try_read() {
-                if self
-                    .async_ctx
-                    .exec_normal_task(tiny_decoder.is_input_exist())
-                {
+                if self.async_rt.block_on(tiny_decoder.is_input_exist()) {
                     ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
                         if let Ok(generated_str) = self.subtitle_text_receiver.try_recv() {
                             self.subtitle_text.push_str(&generated_str);
@@ -749,8 +727,8 @@ impl AppUi {
     fn _set_current_play_pts(&self, ts: i64) {
         {
             let mut cur_pts = self
-                .async_ctx
-                .exec_normal_task(self.main_stream_current_timestamp.write());
+                .async_rt
+                .block_on(self.main_stream_current_timestamp.write());
             {
                 *cur_pts = ts;
             }
@@ -803,16 +781,14 @@ impl AppUi {
                             if dialog.selected() {
                                 {
                                     let video_des_arc = self.video_des.clone();
-                                    let mut videos =
-                                        self.async_ctx.exec_normal_task(video_des_arc.write());
+                                    let mut videos = self.async_rt.block_on(video_des_arc.write());
                                     videos.clear();
                                 }
                                 if let Some(path) = dialog.path() {
                                     let video_des = self.video_des.clone();
                                     let path = path.to_path_buf();
                                     let ctx = ctx.clone();
-                                    self.async_ctx
-                                        .runtime_handle()
+                                    self.async_rt
                                         .spawn(AppUi::read_video_folder(ctx, path, video_des));
                                 }
                             }
@@ -834,9 +810,9 @@ impl AppUi {
     }
     fn reset_main_tex_to_cover_pic(&mut self) {
         let decoder = self.tiny_decoder.clone();
-        let tiny_decoder = self.async_ctx.exec_normal_task(decoder.read());
+        let tiny_decoder = self.async_rt.block_on(decoder.read());
         let pic_data = tiny_decoder.cover_pic_data();
-        let cover_data = self.async_ctx.exec_normal_task(pic_data.read());
+        let cover_data = self.async_rt.block_on(pic_data.read());
         if let Some(data_vec) = &*cover_data {
             if let Ok(img) = image::load_from_memory(data_vec) {
                 let rgba8_img = img.to_rgba8();
@@ -849,18 +825,22 @@ impl AppUi {
             }
         }
     }
-    fn change_format_input(&mut self, path: &Path, now: &Instant) -> Result<(), String> {
+    fn change_format_input(&mut self, path: &Path, now: &Instant) -> PlayerResult<()> {
         {
             let decoder = self.tiny_decoder.clone();
-            let mut tiny_decoder = self.async_ctx.exec_normal_task(decoder.write());
+            let mut tiny_decoder = self.async_rt.block_on(decoder.write());
             if self.ui_flags.pause_flag.0.send(true).is_err() {
                 warn!("change pause flag err");
+                return Err(PlayerError::Internal("change pause flag err".to_string()));
             }
-            self.async_ctx.exec_normal_task(async {
-                if tiny_decoder.set_file_path_and_init_par(path).await.is_ok() {
-                    warn!("reset file path success!");
-                }
-            });
+            if self
+                .async_rt
+                .block_on(tiny_decoder.set_file_path_and_init_par(path))
+                .is_err()
+            {
+                warn!("reset file path error!");
+                return Err(PlayerError::Internal("change pause flag err".to_string()));
+            }
         }
         let au_pl = &mut self.audio_player;
         au_pl.source_queue_skip_to_end();
@@ -868,14 +848,14 @@ impl AppUi {
         self.reset_main_tex_to_bg();
         self.reset_main_tex_to_cover_pic();
         self.update_color_image();
-        self.async_ctx.exec_normal_task(async {
+        self.async_rt.block_on(async {
             let mut mutex_guard = self.main_stream_current_timestamp.write().await;
             {
                 *mutex_guard = 0;
             }
         });
         let current_video_frame = self.current_video_frame.clone();
-        let mut current_video_frame = self.async_ctx.exec_normal_task(current_video_frame.write());
+        let mut current_video_frame = self.async_rt.block_on(current_video_frame.write());
         let empty_frame = Video::empty();
         *current_video_frame = empty_frame;
         self.frame_show_instant = *now;
@@ -938,23 +918,18 @@ impl AppUi {
                             warn!("filepath{}", p_str);
                         }
                     } else {
-                        self.err_window_msg =
+                        self.tip_window_msg =
                             "please choose a valid video or audio file !!!".to_string();
-                        self.ui_flags.err_window_flag = true;
+                        self.ui_flags.tip_window_flag = true;
                     }
                 }
             }
         });
     }
     fn paint_playlist_button(&mut self, ui: &mut Ui, ctx: &Context, now: &Instant) {
-        let btn_text = RichText::new("playlist").color(*THEME_COLOR).size(30.0);
-        let open_btn = egui::Button::new(btn_text);
-        let be_op = ui.opacity();
-        if be_op != 0.0 {
-            ui.set_opacity(0.3);
-        }
+        let open_btn = Button::new(PLAY_LIST_IMG.atom_size(Vec2::new(50.0, 50.0))).frame(false);
+
         let btn_response = ui.add(open_btn);
-        ui.set_opacity(be_op);
 
         if btn_response.hovered() {
             self.ui_flags.control_ui_flag = true;
@@ -985,17 +960,15 @@ impl AppUi {
                                     || file_name.ends_with(".ogg")
                                     || file_name.ends_with(".opus")
                                 {
-                                    if let Some(p_str) = path.join(file_name).to_str() {
-                                        let cover =
-                                            Self::load_file_cover_pic(&PathBuf::from(p_str)).await;
-                                        let texture_handle =
-                                            Self::load_cover_texture(&ctx, &cover, file_name).await;
-                                        video_targets.push(VideoDes {
-                                            name: file_name.to_string(),
-                                            path: p_str.to_string(),
-                                            texture_handle,
-                                        });
-                                    }
+                                    let media_path = en.path().clone();
+                                    let cover = Self::load_file_cover_pic(&media_path).await;
+                                    let texture_handle =
+                                        Self::load_cover_texture(&ctx, &cover, file_name).await;
+                                    video_targets.push(VideoDes {
+                                        name: file_name.to_string(),
+                                        path: media_path,
+                                        texture_handle,
+                                    });
                                 }
                             }
                         }
@@ -1061,4 +1034,23 @@ impl AppUi {
             }
         }
     }
+    fn paint_tip_window(&mut self, ctx: &Context) {
+        if self.ui_flags.tip_window_flag {
+            let tip_window = egui::Window::new("tip window");
+            tip_window.show(ctx, |ui| {
+                let tip_text = RichText::new(&self.tip_window_msg).size(20.0);
+
+                ui.add(Button::new(tip_text));
+                if ui.button("close").clicked() {
+                    self.ui_flags.tip_window_flag = false;
+                }
+            });
+        }
+    }
+}
+
+struct VideoDes {
+    pub name: String,
+    pub path: PathBuf,
+    pub texture_handle: TextureHandle,
 }

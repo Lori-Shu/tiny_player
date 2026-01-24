@@ -35,7 +35,7 @@ fn main() {
     .unwrap();
     if std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap() == "windows" {
         let mut res = winresource::WindowsResource::new();
-        res.set_icon("resources/desktop_icon.ico");
+        res.set_icon("resources/play.ico");
         res.compile().unwrap();
     }
 }

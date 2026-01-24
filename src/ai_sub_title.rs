@@ -25,7 +25,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
 use crate::{CURRENT_EXE_PATH, PlayerError, PlayerResult, decode::ManualProtectedResampler};
-const MEL_FILTERS: &[u8] = include_bytes!("../resources/model/melfilters.bytes");
+const MEL_FILTERS: &[u8] = include_bytes!("../resources/melfilters.bytes");
 #[derive(PartialEq, Clone)]
 pub enum UsedModel {
     Empty,
@@ -59,9 +59,6 @@ impl AISubTitle {
             let config_path = folder_path.join("model/config.json");
             let tokenizer_path = folder_path.join("model/tokenizer.json");
             if let Some(model_path_str) = model_path.to_str() {
-                // if let Err(e)=Device::new_cuda(0){
-                //     warn!("cuda init error! {}",e.to_string());
-                // }
                 let device = Device::cuda_if_available(0)
                     .map_err(|e| PlayerError::Internal(e.to_string()))?;
                 let var_builder = VarBuilder::from_gguf(model_path_str, &device)
@@ -530,7 +527,7 @@ impl CandleStreamingMelProcessor {
         }
 
         // 如果帧数太少（比如少于 0.5s），Encoder 可能无法捕捉特征
-        if self.mel_buffer.len() < 100 {
+        if self.mel_buffer.len() < 200 {
             return Ok(None);
         }
 

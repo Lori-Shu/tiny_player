@@ -23,12 +23,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod ai_sub_title;
 mod appui;
-mod async_context;
 mod audio_play;
 mod decode;
 mod present_data_manage;
 
-const WINDOW_ICON: ImageSource = include_image!("../resources/play_img.png");
+const WINDOW_ICON: ImageSource = include_image!("../resources/play.png");
 static CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf>> = LazyLock::new(|| {
     if let Ok(path) = std::env::current_exe() {
         Ok(path)
