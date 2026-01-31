@@ -131,7 +131,7 @@ impl AISubTitle {
                         Tensor::new(mel_filters, &device)
                             .map_err(|e| PlayerError::Internal(e.to_string()))?,
                         &device,
-                    );
+                    )?;
                     return Ok(Self {
                         candle_streaming_mel_processor,
                         subtitle_sender,
@@ -383,7 +383,7 @@ pub struct CandleStreamingMelProcessor {
 }
 
 impl CandleStreamingMelProcessor {
-    pub fn new(mel_filters: Tensor, device: &Device) -> Self {
+    pub fn new(mel_filters: Tensor, device: &Device) -> PlayerResult<Self> {
         let n_fft = 400;
         let hann: Vec<f32> = (0..n_fft)
             .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos())
@@ -395,11 +395,11 @@ impl CandleStreamingMelProcessor {
         // 确保 mel_filters 形状正确并搬运到目标设备
         let mel_filters = mel_filters
             .reshape((80, 201))
-            .unwrap()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?
             .to_device(device)
-            .unwrap();
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
 
-        Self {
+        Ok(Self {
             device: device.clone(),
             mel_filters,
             hann_window: hann,
@@ -409,7 +409,7 @@ impl CandleStreamingMelProcessor {
             hop_length: 160,
             mel_buffer: vec![],
             max_mel_frames: 3000,
-        }
+        })
     }
 
     /// 将音频切片转换为功率谱 Tensor (Batch 处理以提升效率)

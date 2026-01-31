@@ -273,15 +273,15 @@ impl AppUi {
 
         let data_thread_notify = Arc::new(Notify::new());
 
-        let _present_data_manager = PresentDataManager::new(
+        let present_data_manager = PresentDataManager::new(
             data_thread_notify.clone(),
-            rt,
             tiny_decoder.clone(),
             used_model.clone(),
             subtitle.clone(),
             current_video_frame.clone(),
             audio_player.sink(),
             main_stream_current_timestamp.clone(),
+            rt,
         );
 
         Ok(Self {
@@ -289,7 +289,7 @@ impl AppUi {
             video_texture_handle: None,
             tiny_decoder,
             audio_player,
-            _present_data_manager,
+            _present_data_manager: present_data_manager,
             main_stream_current_timestamp,
             play_time,
             main_color_image: color_image,
@@ -873,7 +873,7 @@ impl AppUi {
                         if let Some(wgpu_texture) = renderer.texture(&v_tex.id()) {
                             if let Some(texture) = &wgpu_texture.texture {
                                 let texel_copy_info = TexelCopyTextureInfo {
-                                    texture: texture,
+                                    texture,
                                     mip_level: 0,
                                     origin: Origin3d::ZERO,
                                     aspect: TextureAspect::All,
@@ -1005,7 +1005,7 @@ impl AppUi {
                 }
             }
         }
-        if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
+        if let ImageSource::Bytes { bytes, .. } = PLAY_IMG {
             if let Ok(dyn_img) = image::load_from_memory(bytes.as_bytes()) {
                 return dyn_img.to_rgba8();
             }
@@ -1017,12 +1017,11 @@ impl AppUi {
             [cover.width() as usize, cover.height() as usize],
             cover.as_bytes(),
         );
-        let handle = ctx.load_texture(
+        ctx.load_texture(
             name,
             ImageData::Color(Arc::new(color_image)),
             TextureOptions::LINEAR,
-        );
-        handle
+        )
     }
 
     fn notify_data_thread(&self, tiny_decoder: &TinyDecoder) {

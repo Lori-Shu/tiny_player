@@ -23,13 +23,13 @@ pub struct PresentDataManager {
 impl PresentDataManager {
     pub fn new(
         data_thread_notify: Arc<Notify>,
-        runtime_handle: Handle,
         tiny_decoder: Arc<RwLock<TinyDecoder>>,
         used_model: Arc<RwLock<UsedModel>>,
         ai_subtitle: Arc<RwLock<AISubTitle>>,
         current_video_frame: Arc<RwLock<Video>>,
         sink: Arc<Sink>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
+        runtime_handle: Handle,
     ) -> Self {
         Self {
             _data_thread_handle: runtime_handle.spawn(PresentDataManager::play_task(
@@ -40,7 +40,6 @@ impl PresentDataManager {
                 ai_subtitle,
                 current_video_frame,
                 main_stream_current_timestamp,
-                runtime_handle.clone(),
             )),
         }
     }
@@ -52,7 +51,6 @@ impl PresentDataManager {
         ai_subtitle: Arc<RwLock<AISubTitle>>,
         current_video_frame: Arc<RwLock<Video>>,
         main_stream_current_timestamp: Arc<RwLock<i64>>,
-        _runtime_handle: Handle,
     ) {
         let mut change_instant = Instant::now();
         loop {

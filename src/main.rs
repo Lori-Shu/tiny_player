@@ -27,7 +27,7 @@ mod audio_play;
 mod decode;
 mod present_data_manage;
 
-const WINDOW_ICON: ImageSource = include_image!("../resources/play.png");
+const WINDOW_ICON: ImageSource = include_image!("../resources/play.ico");
 static CURRENT_EXE_PATH: LazyLock<PlayerResult<PathBuf>> = LazyLock::new(|| {
     if let Ok(path) = std::env::current_exe() {
         Ok(path)

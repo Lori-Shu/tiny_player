@@ -6,8 +6,9 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
+use derive_builder::Builder;
 use ffmpeg_the_third::{
-    ChannelLayout, Rational, Stream,
+    ChannelLayout, Packet, Rational, Stream,
     ffi::{
         AV_CHANNEL_LAYOUT_STEREO, AVPixelFormat, AVSEEK_FLAG_BACKWARD, SwrContext,
         av_frame_get_buffer, av_hwdevice_ctx_create, av_hwframe_transfer_data,
@@ -17,7 +18,7 @@ use ffmpeg_the_third::{
     },
     filter::Graph,
     format::{Pixel, sample::Type, stream::Disposition},
-    frame::Video,
+    frame::{Audio, Video},
     software::scaling,
 };
 
@@ -87,15 +88,15 @@ pub struct TinyDecoder {
     audio_decoder: Arc<RwLock<Option<ManualProtectedAudioDecoder>>>,
     converter_ctx: Option<ManualProtectedConverter>,
     resampler_ctx: Option<ManualProtectedResampler>,
-    video_frame_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::frame::Video>>>>,
-    audio_frame_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::frame::Audio>>>>,
-    audio_packet_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>>,
-    video_packet_cache_queue: Arc<RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>>,
+    video_frame_cache_queue: Arc<RwLock<VecDeque<ffmpeg_the_third::frame::Video>>>,
+    audio_frame_cache_queue: Arc<RwLock<VecDeque<ffmpeg_the_third::frame::Audio>>>,
+    audio_packet_cache_queue: Arc<RwLock<VecDeque<ffmpeg_the_third::packet::Packet>>>,
+    video_packet_cache_queue: Arc<RwLock<VecDeque<ffmpeg_the_third::packet::Packet>>>,
     demux_exit_flag: Arc<AtomicBool>,
     decode_exit_flag: Arc<AtomicBool>,
     demux_task_handle: Option<JoinHandle<()>>,
     decode_task_handle: Option<JoinHandle<()>>,
-    hardware_config: Arc<AtomicBool>,
+    hardware_config_flag: Arc<AtomicBool>,
     cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
     runtime_handle: Handle,
     demux_thread_notify: Arc<Notify>,
@@ -122,15 +123,15 @@ impl TinyDecoder {
             audio_decoder: Arc::new(RwLock::new(None)),
             converter_ctx: None,
             resampler_ctx: None,
-            video_frame_cache_queue: std::sync::Arc::new(RwLock::new(None)),
-            audio_frame_cache_queue: std::sync::Arc::new(RwLock::new(None)),
-            audio_packet_cache_queue: std::sync::Arc::new(RwLock::new(None)),
-            video_packet_cache_queue: std::sync::Arc::new(RwLock::new(None)),
+            video_frame_cache_queue: std::sync::Arc::new(RwLock::new(VecDeque::new())),
+            audio_frame_cache_queue: std::sync::Arc::new(RwLock::new(VecDeque::new())),
+            audio_packet_cache_queue: std::sync::Arc::new(RwLock::new(VecDeque::new())),
+            video_packet_cache_queue: std::sync::Arc::new(RwLock::new(VecDeque::new())),
             demux_exit_flag: Arc::new(AtomicBool::new(false)),
             decode_exit_flag: Arc::new(AtomicBool::new(false)),
             demux_task_handle: None,
             decode_task_handle: None,
-            hardware_config: Arc::new(AtomicBool::new(false)),
+            hardware_config_flag: Arc::new(AtomicBool::new(false)),
             cover_pic_data: Arc::new(RwLock::new(None)),
             runtime_handle,
             demux_thread_notify: Arc::new(Notify::new()),
@@ -158,16 +159,16 @@ impl TinyDecoder {
         self.end_timestamp = 0;
         self.format_duration = 0;
         *self.format_input.write().await = None;
-        self.hardware_config
+        self.hardware_config_flag
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.resampler_ctx = None;
         *self.video_decoder.write().await = None;
         self.video_frame_rect = [0, 0];
         self.video_time_base = Rational::new(1, 1);
-        *self.audio_packet_cache_queue.write().await = None;
-        *self.video_packet_cache_queue.write().await = None;
-        *self.audio_frame_cache_queue.write().await = None;
-        *self.video_frame_cache_queue.write().await = None;
+        self.audio_packet_cache_queue.write().await.clear();
+        self.video_packet_cache_queue.write().await.clear();
+        self.audio_frame_cache_queue.write().await.clear();
+        self.video_frame_cache_queue.write().await.clear();
     }
     /// called when user selected a file path to play
     /// init all the details from the file selected
@@ -213,8 +214,6 @@ impl TinyDecoder {
             self.audio_stream_index = stream.index();
             self.audio_time_base = stream.time_base();
             info!("audio time_base==={}", self.audio_time_base);
-            *self.audio_packet_cache_queue.write().await = Some(VecDeque::new());
-            *self.audio_frame_cache_queue.write().await = Some(VecDeque::new());
         }
 
         if let Some(stream) = &video_stream {
@@ -224,8 +223,6 @@ impl TinyDecoder {
             if audio_stream.is_none() {
                 self.main_stream = MainStream::Video;
             }
-            *self.video_packet_cache_queue.write().await = Some(VecDeque::new());
-            *self.video_frame_cache_queue.write().await = Some(VecDeque::new());
         }
 
         // format_input.duration() can get the precise duration of the media file
@@ -311,38 +308,27 @@ impl TinyDecoder {
         Ok(())
     }
     /// the loop of demuxing video file
-    async fn packet_demux_process(
-        audio_stream_index: usize,
-        video_stream_index: usize,
-        exit_flag: Arc<AtomicBool>,
-        format_input: Arc<RwLock<Option<ManualProtectedInput>>>,
-        audio_packet_cache_queue: std::sync::Arc<
-            RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>,
-        >,
-        video_packet_cache_queue: std::sync::Arc<
-            RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>,
-        >,
-        cover_stream_index: usize,
-        cover_pic_data: Arc<RwLock<Option<Vec<u8>>>>,
-        demux_thread_notify: Arc<Notify>,
-    ) {
+    async fn packet_demux_process(demux_context: DemuxContext) {
         info!("enter demux");
         loop {
-            if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if demux_context
+                .demux_exit_flag
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 break;
             }
             /*
-            I choose to lock the packet vec first stick this in other functions
+            choose to lock the packet vec first stick this in other functions
              */
 
             {
-                let mut audio_packet_vec = audio_packet_cache_queue.write().await;
-                let mut video_packet_vec = video_packet_cache_queue.write().await;
-                let audio_stream_idx = audio_stream_index;
-                let video_stream_idx = video_stream_index;
-                let cover_index = cover_stream_index;
-                let mut cover_pic_data = cover_pic_data.write().await;
-                let mut input = format_input.write().await;
+                let mut audio_packet_vec = demux_context.audio_packet_cache_queue.write().await;
+                let mut video_packet_vec = demux_context.video_packet_cache_queue.write().await;
+                let audio_stream_idx = demux_context.audio_stream_index;
+                let video_stream_idx = demux_context.video_stream_index;
+                let cover_index = demux_context.cover_stream_index;
+                let mut cover_pic_data = demux_context.cover_image_data.write().await;
+                let mut input = demux_context.format_input.write().await;
                 if let Some(input) = &mut *input {
                     match input.0.packets().next() {
                         Some(Ok((stream, packet))) => {
@@ -351,13 +337,9 @@ impl TinyDecoder {
                                     *cover_pic_data = Some(d.to_vec());
                                 }
                             } else if stream.index() == audio_stream_idx {
-                                if let Some(audio_packet_vec) = &mut *audio_packet_vec {
-                                    audio_packet_vec.push_back(packet);
-                                }
+                                audio_packet_vec.push_back(packet);
                             } else if stream.index() == video_stream_idx {
-                                if let Some(video_packet_vec) = &mut *video_packet_vec {
-                                    video_packet_vec.push_back(packet);
-                                }
+                                video_packet_vec.push_back(packet);
                             }
                         }
                         Some(Err(ffmpeg_the_third::util::error::Error::Eof)) => {
@@ -368,7 +350,7 @@ impl TinyDecoder {
                     }
                 }
             }
-            demux_thread_notify.notified().await;
+            demux_context.demux_thread_notify.notified().await;
         }
     }
     ///convert the hardware output frame to middle format YUV420P
@@ -419,32 +401,11 @@ impl TinyDecoder {
         video_frame_tmp
     }
     /// the loop of decoding demuxed packet
-    async fn frame_decode_process(
-        exit_flag: Arc<AtomicBool>,
-        audio_decoder: Arc<RwLock<Option<ManualProtectedAudioDecoder>>>,
-        video_decoder: Arc<RwLock<Option<ManualProtectedVideoDecoder>>>,
-        audio_frame_cache_queue: std::sync::Arc<
-            RwLock<Option<VecDeque<ffmpeg_the_third::frame::Audio>>>,
-        >,
-        video_frame_cache_queue: std::sync::Arc<
-            RwLock<Option<VecDeque<ffmpeg_the_third::frame::Video>>>,
-        >,
-        audio_packet_cache_queue: std::sync::Arc<
-            RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>,
-        >,
-        video_packet_cache_queue: std::sync::Arc<
-            RwLock<Option<VecDeque<ffmpeg_the_third::packet::Packet>>>,
-        >,
-        hardware_config: Arc<AtomicBool>,
-        video_time_base: Rational,
-        video_frame_rect: [u32; 2],
-        demux_thread_notify: Arc<Notify>,
-        decode_thread_notify: Arc<Notify>,
-    ) {
+    async fn frame_decode_process(decode_context: DecodeContext) {
         info!("enter decode");
         let mut p = PathBuf::new();
         let mut graph = Graph::new();
-        if video_packet_cache_queue.read().await.is_some() {
+        if decode_context.video_decoder.read().await.is_some() {
             if let Ok(exe_path) = CURRENT_EXE_PATH.as_ref() {
                 if let Some(exe_folder) = exe_path.parent() {
                     p = exe_folder.join("app_font.ttf");
@@ -465,11 +426,11 @@ impl TinyDecoder {
                             if let Ok(c_str_buffersrc) = CString::new("buffersrc") {
                                 if let Ok(c_str_buffersrc_args) = CString::new(format!(
                                     "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
-                                    video_frame_rect[0],
-                                    video_frame_rect[1],
+                                    decode_context.video_frame_rect[0],
+                                    decode_context.video_frame_rect[1],
                                     AVPixelFormat::AV_PIX_FMT_YUV420P as i32,
-                                    video_time_base.numerator(),
-                                    video_time_base.denominator(),
+                                    decode_context.video_time_base.numerator(),
+                                    decode_context.video_time_base.denominator(),
                                 )) {
                                     if let Ok(c_str_drawtext) = CString::new("drawtext") {
                                         if let Ok(c_str_draw) = CString::new("draw") {
@@ -566,92 +527,81 @@ impl TinyDecoder {
         }
         let hardware_frame_converter = Arc::new(RwLock::new(None));
         loop {
-            if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if decode_context
+                .decode_exit_flag
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 break;
             }
+            if !decode_context
+                .audio_packet_cache_queue
+                .read()
+                .await
+                .is_empty()
+            {
+                let mut audio_packet_cache_vec =
+                    decode_context.audio_packet_cache_queue.write().await;
+                let mut a_frame_vec = decode_context.audio_frame_cache_queue.write().await;
+                let mut audio_decoder = decode_context.audio_decoder.write().await;
+                if audio_packet_cache_vec.len() < 10 {
+                    decode_context.demux_thread_notify.notify_one();
+                }
+                if let Some(front_packet) = audio_packet_cache_vec.pop_front() {
+                    if let Some(decoder) = &mut *audio_decoder {
+                        if decoder.0.send_packet(&front_packet).is_ok() {
+                            loop {
+                                let mut audio_frame_tmp = ffmpeg_the_third::frame::Audio::empty();
 
-            if audio_packet_cache_queue.read().await.is_some() {
-                let mut audio_packet_cache_vec = audio_packet_cache_queue.write().await;
-                let mut a_frame_vec = audio_frame_cache_queue.write().await;
-                if let Some(packets) = &mut *audio_packet_cache_vec {
-                    if let Some(frames) = &mut *a_frame_vec {
-                        let mut audio_decoder = audio_decoder.write().await;
-                        // info!("audio frame vec len{}", frames.len());
-                        if packets.len() < 10 {
-                            demux_thread_notify.notify_one();
-                        }
-                        if !packets.is_empty() {
-                            if let Some(front_packet) = packets.pop_front() {
-                                if let Some(decoder) = &mut *audio_decoder {
-                                    if decoder.0.send_packet(&front_packet).is_ok() {
-                                        loop {
-                                            let mut audio_frame_tmp =
-                                                ffmpeg_the_third::frame::Audio::empty();
-
-                                            if decoder
-                                                .0
-                                                .receive_frame(&mut audio_frame_tmp)
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-
-                                            frames.push_back(audio_frame_tmp);
-                                        }
-                                    }
+                                if decoder.0.receive_frame(&mut audio_frame_tmp).is_err() {
+                                    break;
                                 }
+
+                                a_frame_vec.push_back(audio_frame_tmp);
                             }
                         }
                     }
                 }
+            } else {
+                decode_context.demux_thread_notify.notify_one();
             }
-            if video_packet_cache_queue.read().await.is_some() {
-                let mut video_packet_cache_vec = video_packet_cache_queue.write().await;
-                let mut v_frame_vec = video_frame_cache_queue.write().await;
-                if let Some(packets) = &mut *video_packet_cache_vec {
-                    if let Some(frames) = &mut *v_frame_vec {
-                        let mut v_decoder = video_decoder.write().await;
-                        // info!("video frame vec len{}", frames.len());
-                        if packets.len() < 10 {
-                            demux_thread_notify.notify_one();
-                        }
-                        if !packets.is_empty() {
-                            if let Some(front_packet) = packets.pop_front() {
-                                if let Some(decoder) = &mut *v_decoder {
-                                    if decoder.0.send_packet(&front_packet).is_ok() {
-                                        loop {
-                                            let mut video_frame_tmp =
-                                                ffmpeg_the_third::frame::Video::empty();
+            if !decode_context
+                .video_packet_cache_queue
+                .read()
+                .await
+                .is_empty()
+            {
+                let mut video_packet_cache_vec =
+                    decode_context.video_packet_cache_queue.write().await;
+                let mut v_frame_vec = decode_context.video_frame_cache_queue.write().await;
+                let mut v_decoder = decode_context.video_decoder.write().await;
+                // info!("video frame vec len{}", frames.len());
+                if video_packet_cache_vec.len() < 10 {
+                    decode_context.demux_thread_notify.notify_one();
+                }
+                if let Some(front_packet) = video_packet_cache_vec.pop_front() {
+                    if let Some(decoder) = &mut *v_decoder {
+                        if decoder.0.send_packet(&front_packet).is_ok() {
+                            loop {
+                                let mut video_frame_tmp = ffmpeg_the_third::frame::Video::empty();
 
-                                            if decoder
-                                                .0
-                                                .receive_frame(&mut video_frame_tmp)
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
+                                if decoder.0.receive_frame(&mut video_frame_tmp).is_err() {
+                                    break;
+                                }
 
-                                            let video_frame = TinyDecoder::convert_hardware_frame(
-                                                hardware_config.clone(),
-                                                hardware_frame_converter.clone(),
-                                                video_frame_tmp,
-                                            )
-                                            .await;
+                                let video_frame = TinyDecoder::convert_hardware_frame(
+                                    decode_context.hardware_config_flag.clone(),
+                                    hardware_frame_converter.clone(),
+                                    video_frame_tmp,
+                                )
+                                .await;
 
-                                            if let Some(mut ctx) = graph.get("buffersrc") {
-                                                if ctx.source().add(&video_frame).is_ok() {
-                                                    let mut filtered_frame =
-                                                        ffmpeg_the_third::frame::Video::empty();
-                                                    if let Some(mut ctx) = graph.get("sink") {
-                                                        if ctx
-                                                            .sink()
-                                                            .frame(&mut filtered_frame)
-                                                            .is_ok()
-                                                        {
-                                                            frames.push_back(filtered_frame);
-                                                        }
-                                                    }
-                                                }
+                                if let Some(mut ctx) = graph.get("buffersrc") {
+                                    if ctx.source().add(&video_frame).is_ok() {
+                                        let mut filtered_frame =
+                                            ffmpeg_the_third::frame::Video::empty();
+                                        if let Some(mut ctx) = graph.get("sink") {
+                                            if ctx.sink().frame(&mut filtered_frame).is_ok() {
+                                                v_frame_vec.push_back(filtered_frame);
                                             }
                                         }
                                     }
@@ -660,71 +610,62 @@ impl TinyDecoder {
                         }
                     }
                 }
+            } else {
+                decode_context.demux_thread_notify.notify_one();
             }
-            decode_thread_notify.notified().await;
+            decode_context.decode_thread_notify.notified().await;
         }
     }
     /// start the demux and decode task
     async fn start_process_input(&mut self) {
-        let audio_stream_index = self.audio_stream_index;
-        let video_stream_index = self.video_stream_index;
-        let format_input = self.format_input.clone();
-        let audio_packet_cache_que = self.audio_packet_cache_queue.clone();
-        let video_packet_cache_que = self.video_packet_cache_queue.clone();
-        let cov_stream_index = self.cover_stream_index;
-        let cover_pic_data = self.cover_pic_data.clone();
-        let demux_exit_flag = self.demux_exit_flag.clone();
-        let demux_thread_notify = self.demux_thread_notify.clone();
-        self.demux_task_handle = Some(self.runtime_handle.spawn(async move {
-            let demux_span = span!(Level::INFO, "demux");
-            let _demux_entered = demux_span.enter();
-            Self::packet_demux_process(
-                audio_stream_index,
-                video_stream_index,
-                demux_exit_flag,
-                format_input,
-                audio_packet_cache_que,
-                video_packet_cache_que,
-                cov_stream_index,
-                cover_pic_data,
-                demux_thread_notify,
-            )
-            .in_current_span()
-            .await;
-        }));
+        if let Ok(demux_context) = DemuxContextBuilder::create_empty()
+            .audio_stream_index(self.audio_stream_index)
+            .video_stream_index(self.video_stream_index)
+            .format_input(self.format_input.clone())
+            .audio_packet_cache_queue(self.audio_packet_cache_queue.clone())
+            .video_packet_cache_queue(self.video_packet_cache_queue.clone())
+            .cover_stream_index(self.cover_stream_index)
+            .cover_image_data(self.cover_pic_data.clone())
+            .demux_exit_flag(self.demux_exit_flag.clone())
+            .demux_thread_notify(self.demux_thread_notify.clone())
+            .build()
+        {
+            self.demux_task_handle = Some(self.runtime_handle.spawn(async move {
+                let demux_span = span!(Level::INFO, "demux");
+                let _demux_entered = demux_span.enter();
+                Self::packet_demux_process(demux_context)
+                    .in_current_span()
+                    .await;
+            }));
+        } else {
+            warn!("build demux context error!");
+        }
 
-        let video_decoder = self.video_decoder.clone();
-        let audio_decoder = self.audio_decoder.clone();
-        let video_frame_cache_que = self.video_frame_cache_queue.clone();
-        let audio_frame_cache_que = self.audio_frame_cache_queue.clone();
-        let audio_packet_cache_que = self.audio_packet_cache_queue.clone();
-        let video_packet_cache_que = self.video_packet_cache_queue.clone();
-        let hardware_config = self.hardware_config.clone();
-        let decode_exit_flag = self.decode_exit_flag.clone();
-        let video_time_base = self.video_time_base;
-        let video_frame_rect = self.video_frame_rect;
-        let decode_thread_notify = self.decode_thread_notify.clone();
-        let demux_thread_notify = self.demux_thread_notify.clone();
-        self.decode_task_handle = Some(self.runtime_handle.spawn(async move {
-            let demux_span = span!(Level::INFO, "decode");
-            let _demux_entered = demux_span.enter();
-            Self::frame_decode_process(
-                decode_exit_flag,
-                audio_decoder,
-                video_decoder,
-                audio_frame_cache_que,
-                video_frame_cache_que,
-                audio_packet_cache_que,
-                video_packet_cache_que,
-                hardware_config,
-                video_time_base,
-                video_frame_rect,
-                demux_thread_notify,
-                decode_thread_notify,
-            )
-            .in_current_span()
-            .await;
-        }));
+        if let Ok(decode_context) = DecodeContextBuilder::create_empty()
+            .video_decoder(self.video_decoder.clone())
+            .audio_decoder(self.audio_decoder.clone())
+            .video_frame_cache_queue(self.video_frame_cache_queue.clone())
+            .audio_frame_cache_queue(self.audio_frame_cache_queue.clone())
+            .audio_packet_cache_queue(self.audio_packet_cache_queue.clone())
+            .video_packet_cache_queue(self.video_packet_cache_queue.clone())
+            .hardware_config_flag(self.hardware_config_flag.clone())
+            .decode_exit_flag(self.decode_exit_flag.clone())
+            .video_time_base(self.video_time_base)
+            .video_frame_rect(self.video_frame_rect)
+            .decode_thread_notify(self.decode_thread_notify.clone())
+            .demux_thread_notify(self.demux_thread_notify.clone())
+            .build()
+        {
+            self.decode_task_handle = Some(self.runtime_handle.spawn(async move {
+                let demux_span = span!(Level::INFO, "decode");
+                let _demux_entered = demux_span.enter();
+                Self::frame_decode_process(decode_context)
+                    .in_current_span()
+                    .await;
+            }));
+        } else {
+            warn!("build decode context error!");
+        }
     }
     /// called by the main thread pull one audio frame from the queue
     /// in addition, do the resample
@@ -737,27 +678,25 @@ impl TinyDecoder {
 
             {
                 let mut a_frame_vec = self.audio_frame_cache_queue.write().await;
-                if let Some(a_frame_vec) = &mut *a_frame_vec {
-                    if a_frame_vec.len() < 10 {
-                        self.decode_thread_notify.notify_one();
-                    }
-                    if !a_frame_vec.is_empty() {
-                        if let Some(raw_frame) = a_frame_vec.pop_front() {
-                            unsafe {
-                                let r = swr_convert_frame(
-                                    resampler_ctx.0,
-                                    res.as_mut_ptr(),
-                                    raw_frame.as_ptr(),
-                                );
-                                if r == 0 {
-                                    if let Some(pts) = raw_frame.pts() {
-                                        res.set_pts(Some(pts));
-                                        res.set_rate(48000);
-                                        return Some(res);
-                                    }
-                                } else {
-                                    info!("resample err{}", r);
+                if a_frame_vec.len() < 10 {
+                    self.decode_thread_notify.notify_one();
+                }
+                if !a_frame_vec.is_empty() {
+                    if let Some(raw_frame) = a_frame_vec.pop_front() {
+                        unsafe {
+                            let r = swr_convert_frame(
+                                resampler_ctx.0,
+                                res.as_mut_ptr(),
+                                raw_frame.as_ptr(),
+                            );
+                            if r == 0 {
+                                if let Some(pts) = raw_frame.pts() {
+                                    res.set_pts(Some(pts));
+                                    res.set_rate(48000);
+                                    return Some(res);
                                 }
+                            } else {
+                                info!("resample err{}", r);
                             }
                         }
                     }
@@ -805,33 +744,30 @@ impl TinyDecoder {
             let mut return_val = None;
             {
                 let mut v_frame_vec = self.video_frame_cache_queue.write().await;
+                if v_frame_vec.len() < 5 {
+                    self.decode_thread_notify.notify_one();
+                }
+                if !v_frame_vec.is_empty() {
+                    if let Some(raw_frame) = v_frame_vec.pop_front() {
+                        // info!("raw frame pts{}", raw_frame.pts().unwrap());
+                        unsafe {
+                            let frame = res.as_mut_ptr();
+                            (*frame).width = raw_frame.width() as i32;
+                            (*frame).height = raw_frame.height() as i32;
+                            (*frame).format = AVPixelFormat::AV_PIX_FMT_RGBA as i32;
 
-                if let Some(v_frame_vec) = &mut *v_frame_vec {
-                    if v_frame_vec.len() < 5 {
-                        self.decode_thread_notify.notify_one();
-                    }
-                    if !v_frame_vec.is_empty() {
-                        if let Some(raw_frame) = v_frame_vec.pop_front() {
-                            // info!("raw frame pts{}", raw_frame.pts().unwrap());
-                            unsafe {
-                                let frame = res.as_mut_ptr();
-                                (*frame).width = raw_frame.width() as i32;
-                                (*frame).height = raw_frame.height() as i32;
-                                (*frame).format = AVPixelFormat::AV_PIX_FMT_RGBA as i32;
-
-                                // align to 256 to meet the wgpu requirement
-                                let align = 256;
-                                if 0 > av_frame_get_buffer(frame, align) {
-                                    warn!("av_frame_get_buffer error!");
-                                }
+                            // align to 256 to meet the wgpu requirement
+                            let align = 256;
+                            if 0 > av_frame_get_buffer(frame, align) {
+                                warn!("av_frame_get_buffer error!");
                             }
-                            if converter_ctx.0.run(&raw_frame, &mut res).is_ok() {
-                                if let Some(pts) = raw_frame.pts() {
-                                    res.set_pts(Some(pts));
-                                }
-
-                                return_val = Some(res);
+                        }
+                        if converter_ctx.0.run(&raw_frame, &mut res).is_ok() {
+                            if let Some(pts) = raw_frame.pts() {
+                                res.set_pts(Some(pts));
                             }
+
+                            return_val = Some(res);
                         }
                     }
                 }
@@ -879,18 +815,10 @@ impl TinyDecoder {
             let mut video_cache_vec = self
                 .runtime_handle
                 .block_on(self.video_frame_cache_queue.write());
-            if let Some(audio_packet_cache_vec) = &mut *audio_packet_cache_vec {
-                audio_packet_cache_vec.clear();
-            }
-            if let Some(video_packet_cache_vec) = &mut *video_packet_cache_vec {
-                video_packet_cache_vec.clear();
-            }
-            if let Some(audio_cache_vec) = &mut *audio_cache_vec {
-                audio_cache_vec.clear();
-            }
-            if let Some(video_cache_vec) = &mut *video_cache_vec {
-                video_cache_vec.clear();
-            }
+            audio_packet_cache_vec.clear();
+            video_packet_cache_vec.clear();
+            audio_cache_vec.clear();
+            video_cache_vec.clear();
 
             let mut input = self.runtime_handle.block_on(self.format_input.write());
             let main_stream_idx = {
@@ -1040,7 +968,7 @@ impl TinyDecoder {
                     }
                     (*decoder.as_mut_ptr()).hw_device_ctx = hw_device_ctx;
 
-                    self.hardware_config
+                    self.hardware_config_flag
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     warn!("hardware decode acceleration is on!");
                     Ok(decoder)
@@ -1082,4 +1010,32 @@ impl Drop for TinyDecoder {
             }
         }
     }
+}
+#[derive(Builder)]
+struct DemuxContext {
+    pub audio_stream_index: usize,
+    pub video_stream_index: usize,
+    pub cover_stream_index: usize,
+    pub format_input: Arc<RwLock<Option<ManualProtectedInput>>>,
+    pub audio_packet_cache_queue: Arc<RwLock<VecDeque<Packet>>>,
+    pub video_packet_cache_queue: Arc<RwLock<VecDeque<Packet>>>,
+    pub cover_image_data: Arc<RwLock<Option<Vec<u8>>>>,
+    pub demux_exit_flag: Arc<AtomicBool>,
+    pub demux_thread_notify: Arc<Notify>,
+}
+
+#[derive(Builder)]
+struct DecodeContext {
+    pub audio_decoder: Arc<RwLock<Option<ManualProtectedAudioDecoder>>>,
+    pub video_decoder: Arc<RwLock<Option<ManualProtectedVideoDecoder>>>,
+    pub audio_packet_cache_queue: Arc<RwLock<VecDeque<Packet>>>,
+    pub video_packet_cache_queue: Arc<RwLock<VecDeque<Packet>>>,
+    pub audio_frame_cache_queue: Arc<RwLock<VecDeque<Audio>>>,
+    pub video_frame_cache_queue: Arc<RwLock<VecDeque<Video>>>,
+    pub hardware_config_flag: Arc<AtomicBool>,
+    pub decode_exit_flag: Arc<AtomicBool>,
+    pub video_time_base: Rational,
+    pub video_frame_rect: [u32; 2],
+    pub demux_thread_notify: Arc<Notify>,
+    pub decode_thread_notify: Arc<Notify>,
 }
