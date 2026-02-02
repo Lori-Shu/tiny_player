@@ -618,7 +618,7 @@ impl TinyDecoder {
     }
     /// start the demux and decode task
     async fn start_process_input(&mut self) {
-        if let Ok(demux_context) = DemuxContextBuilder::create_empty()
+        if let Ok(demux_context) = DemuxContextBuilder::default()
             .audio_stream_index(self.audio_stream_index)
             .video_stream_index(self.video_stream_index)
             .format_input(self.format_input.clone())
@@ -641,7 +641,7 @@ impl TinyDecoder {
             warn!("build demux context error!");
         }
 
-        if let Ok(decode_context) = DecodeContextBuilder::create_empty()
+        if let Ok(decode_context) = DecodeContextBuilder::default()
             .video_decoder(self.video_decoder.clone())
             .audio_decoder(self.audio_decoder.clone())
             .video_frame_cache_queue(self.video_frame_cache_queue.clone())

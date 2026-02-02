@@ -30,7 +30,7 @@ use crate::{
     PlayerError, PlayerResult,
     ai_sub_title::{AISubTitle, UsedModel},
     decode::{MainStream, TinyDecoder},
-    present_data_manage::PresentDataManager,
+    present_data_manage::{DataManageContextBuilder, PresentDataManager},
 };
 
 const VIDEO_FILE_IMG: ImageSource = include_image!("../resources/file-play.png");
@@ -272,17 +272,18 @@ impl AppUi {
         let pause_flag = watch::channel(true);
 
         let data_thread_notify = Arc::new(Notify::new());
-
-        let present_data_manager = PresentDataManager::new(
-            data_thread_notify.clone(),
-            tiny_decoder.clone(),
-            used_model.clone(),
-            subtitle.clone(),
-            current_video_frame.clone(),
-            audio_player.sink(),
-            main_stream_current_timestamp.clone(),
-            rt,
-        );
+        let data_manage_context = DataManageContextBuilder::default()
+            .data_thread_notify(data_thread_notify.clone())
+            .tiny_decoder(tiny_decoder.clone())
+            .used_model(used_model.clone())
+            .ai_subtitle(subtitle.clone())
+            .current_video_frame(current_video_frame.clone())
+            .audio_sink(audio_player.sink())
+            .main_stream_current_timestamp(main_stream_current_timestamp.clone())
+            .runtime_handle(rt)
+            .build()
+            .map_err(|e| PlayerError::Internal(e.to_string()))?;
+        let present_data_manager = PresentDataManager::new(data_manage_context);
 
         Ok(Self {
             subtitle_text_receiver: subtitle_channel.1,

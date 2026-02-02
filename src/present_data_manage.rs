@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use derive_builder::Builder;
 use ffmpeg_the_third::frame::Video;
 use rodio::Sink;
 use tokio::{
@@ -21,37 +22,15 @@ pub struct PresentDataManager {
     _data_thread_handle: JoinHandle<()>,
 }
 impl PresentDataManager {
-    pub fn new(
-        data_thread_notify: Arc<Notify>,
-        tiny_decoder: Arc<RwLock<TinyDecoder>>,
-        used_model: Arc<RwLock<UsedModel>>,
-        ai_subtitle: Arc<RwLock<AISubTitle>>,
-        current_video_frame: Arc<RwLock<Video>>,
-        sink: Arc<Sink>,
-        main_stream_current_timestamp: Arc<RwLock<i64>>,
-        runtime_handle: Handle,
-    ) -> Self {
+    pub fn new(data_manage_context: DataManageContext) -> Self {
         Self {
-            _data_thread_handle: runtime_handle.spawn(PresentDataManager::play_task(
-                data_thread_notify,
-                tiny_decoder,
-                sink,
-                used_model,
-                ai_subtitle,
-                current_video_frame,
-                main_stream_current_timestamp,
-            )),
+            _data_thread_handle: data_manage_context
+                .runtime_handle
+                .clone()
+                .spawn(PresentDataManager::play_task(data_manage_context)),
         }
     }
-    async fn play_task(
-        data_thread_notify: Arc<Notify>,
-        tiny_decoder: Arc<RwLock<TinyDecoder>>,
-        sink: Arc<Sink>,
-        used_model: Arc<RwLock<UsedModel>>,
-        ai_subtitle: Arc<RwLock<AISubTitle>>,
-        current_video_frame: Arc<RwLock<Video>>,
-        main_stream_current_timestamp: Arc<RwLock<i64>>,
-    ) {
+    async fn play_task(data_manage_context: DataManageContext) {
         let mut change_instant = Instant::now();
         loop {
             /*
@@ -59,17 +38,20 @@ impl PresentDataManager {
              */
             {
                 let mut audio_cur_ts = None;
-                let mut tiny_decoder = tiny_decoder.write().await;
+                let mut tiny_decoder = data_manage_context.tiny_decoder.write().await;
                 if let MainStream::Audio = tiny_decoder.main_stream() {
                     if let Some(audio_frame) = tiny_decoder.pull_one_audio_play_frame().await {
                         if let Some(pts) = audio_frame.pts() {
                             audio_cur_ts = Some(pts);
-                            AudioPlayer::play_raw_data_from_audio_frame(&sink, audio_frame.clone())
-                                .await;
-                            let used_model = used_model.read().await;
+                            AudioPlayer::play_raw_data_from_audio_frame(
+                                &data_manage_context.audio_sink,
+                                audio_frame.clone(),
+                            )
+                            .await;
+                            let used_model = data_manage_context.used_model.read().await;
                             let used_model_ref = &*used_model;
                             if UsedModel::Empty != *used_model_ref {
-                                let mut ai_subtitle = ai_subtitle.write().await;
+                                let mut ai_subtitle = data_manage_context.ai_subtitle.write().await;
                                 let used_model = used_model_ref.clone();
                                 ai_subtitle.push_frame_data(audio_frame, used_model).await;
                             }
@@ -78,14 +60,14 @@ impl PresentDataManager {
                 }
                 if PresentDataManager::should_video_catch_audio(
                     &tiny_decoder,
-                    main_stream_current_timestamp.clone(),
-                    current_video_frame.clone(),
+                    data_manage_context.main_stream_current_timestamp.clone(),
+                    data_manage_context.current_video_frame.clone(),
                 )
                 .await
                 {
                     let ins_now = Instant::now();
                     if let Some(frame) = tiny_decoder.pull_one_video_play_frame().await {
-                        let mut cur_frame = current_video_frame.write().await;
+                        let mut cur_frame = data_manage_context.current_video_frame.write().await;
                         let main_stream = tiny_decoder.main_stream();
                         if let MainStream::Video = main_stream {
                             if ins_now - change_instant > Duration::from_millis(0) {
@@ -124,14 +106,14 @@ impl PresentDataManager {
                     }
                 }
                 PresentDataManager::update_current_timestamp(
-                    main_stream_current_timestamp.clone(),
+                    data_manage_context.main_stream_current_timestamp.clone(),
                     audio_cur_ts,
                     &tiny_decoder,
-                    current_video_frame.clone(),
+                    data_manage_context.current_video_frame.clone(),
                 )
                 .await;
             }
-            data_thread_notify.notified().await;
+            data_manage_context.data_thread_notify.notified().await;
         }
     }
     async fn update_current_timestamp(
@@ -190,4 +172,15 @@ impl PresentDataManager {
 
         false
     }
+}
+#[derive(Builder)]
+pub struct DataManageContext {
+    data_thread_notify: Arc<Notify>,
+    tiny_decoder: Arc<RwLock<TinyDecoder>>,
+    used_model: Arc<RwLock<UsedModel>>,
+    ai_subtitle: Arc<RwLock<AISubTitle>>,
+    current_video_frame: Arc<RwLock<Video>>,
+    audio_sink: Arc<Sink>,
+    main_stream_current_timestamp: Arc<RwLock<i64>>,
+    runtime_handle: Handle,
 }
