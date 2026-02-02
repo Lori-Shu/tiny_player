@@ -243,7 +243,7 @@ impl AppUi {
             .build()
             .map_err(|e| PlayerError::Internal(e.to_string()))?;
         let rt = async_rt.handle().clone();
-        let f_dialog = egui_file::FileDialog::open_file(None);
+        let f_dialog = egui_file::FileDialog::open_file();
         let (color_image, dyn_img) = {
             if let ImageSource::Bytes { bytes, .. } = DEFAULT_BG_IMG {
                 let dynimg = image::load_from_memory(&bytes)
@@ -316,7 +316,7 @@ impl AppUi {
             async_rt,
             opened_file: None,
             open_file_dialog: Some(f_dialog),
-            scan_folder_dialog: Some(egui_file::FileDialog::select_folder(None)),
+            scan_folder_dialog: Some(egui_file::FileDialog::select_folder()),
             bg_dyn_img: dyn_img,
             _subtitle: subtitle,
             subtitle_text: String::new(),
